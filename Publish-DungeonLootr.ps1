@@ -21,7 +21,10 @@ $ataSrcCandidates = @(
   'C:\Users\Revi\Documents\playertools\PlayerTools\AtaraxiaLibrary.lua'
 )
 $ataPtRepo = 'C:\Users\Revi\Documents\playertools\PlayerTools\AtaraxiaLibrary.lua'
+# scripts\ is the editor tree; workspace\ is what the executor's readfile() sees,
+# so a local reload only picks up a publish if both get the payload.
 $potassiumPayload = 'C:\Users\Revi\AppData\Local\Potassium\scripts\dungeon-lootr'
+$potassiumWorkspace = 'C:\Users\Revi\AppData\Local\Potassium\workspace\dungeon-lootr'
 $utf8 = New-Object System.Text.UTF8Encoding $false
 
 function Write-Utf8NoBom([string]$Path, [string]$Text) {
@@ -108,6 +111,10 @@ Write-Utf8NoBom (Join-Path $payloadDir 'version.json') $verJson
 New-Item -ItemType Directory -Force -Path $potassiumPayload | Out-Null
 Copy-Item -Force (Join-Path $payloadDir '*') $potassiumPayload
 Write-Host "==> Synced Potassium scripts/dungeon-lootr"
+if (Test-Path $potassiumWorkspace) {
+  Copy-Item -Force (Join-Path $payloadDir '*') $potassiumWorkspace
+  Write-Host "==> Synced Potassium workspace/dungeon-lootr (live executor tree)"
+}
 
 $pkgPath = Join-Path $repoRoot 'package.json'
 if (Test-Path $pkgPath) {

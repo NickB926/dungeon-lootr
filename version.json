@@ -1,6 +1,6 @@
 {
-    "version":  "1.0.3",
-    "message":  "Auto parry: CanAttack cues for fodder, no arming on unnamed clips, cooldown-aware retry",
+    "version":  "1.0.4",
+    "message":  "Publisher also syncs the live executor workspace tree",
     "files":  [
                   "dungeon-lootr/launch.lua",
                   "dungeon-lootr/DungeonLootr.lua",
