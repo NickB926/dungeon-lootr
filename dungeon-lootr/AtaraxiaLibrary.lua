@@ -2495,14 +2495,65 @@ function Library:CreateWindow(info)
 		size2 = UDim2.new(1, -120, 0, 24),
 		pos = UDim2.fromOffset(16, 6),
 	})
-	-- Never put the long Nietzsche quote in the chrome — tiny Gotham drops glyphs ("gaze"→"gaes").
-	mkLabel(header, 'PlayerTools · custom chrome', {
-		font = Enum.Font.SourceSans,
-		size = 14,
-		color = C.muted,
-		size2 = UDim2.new(1, -120, 0, 16),
-		pos = UDim2.fromOffset(16, 30),
-	})
+	do
+		local sub = tostring(info.Footer or '')
+		if sub == '' then
+			sub = tostring(info.Title or 'Ataraxia') .. ' · custom chrome'
+		end
+		-- Never put a long quote in the chrome — tiny fonts drop glyphs.
+		if #sub > 48 then
+			sub = string.sub(sub, 1, 45) .. '…'
+		end
+		mkLabel(header, sub, {
+			font = Enum.Font.SourceSans,
+			size = 14,
+			color = C.muted,
+			size2 = UDim2.new(1, -120, 0, 16),
+			pos = UDim2.fromOffset(16, 30),
+		})
+	end
+
+	-- Per-script version (bottom-left): CreateWindow{ Version = "1.2.3" } or
+	-- {Folder}/version.json ("version" field). Each helper shows its own stamp.
+	do
+		local verText = nil
+		if type(info.Version) == 'string' and info.Version ~= '' then
+			verText = info.Version
+		else
+			local folder = tostring(info.Folder or '')
+			local path = nil
+			if folder ~= '' and type(isfile) == 'function' and isfile(folder .. '/version.json') then
+				path = folder .. '/version.json'
+			end
+			if path and type(readfile) == 'function' then
+				local ok, body = pcall(readfile, path)
+				if ok and type(body) == 'string' and body ~= '' then
+					local okJ, data = pcall(function()
+						return game:GetService('HttpService'):JSONDecode(body)
+					end)
+					if okJ and type(data) == 'table' and data.version ~= nil then
+						verText = tostring(data.version)
+					end
+				end
+			end
+		end
+		if verText and verText ~= '' then
+			if not string.match(verText, '^[vV]') then
+				verText = 'v' .. verText
+			end
+			local verLbl = mkLabel(main, verText, {
+				font = Enum.Font.SourceSans,
+				size = 12,
+				color = C.muted,
+				size2 = UDim2.fromOffset(160, 16),
+				pos = UDim2.new(0, 10, 1, -20),
+				z = 50,
+			})
+			verLbl.Name = 'ScriptVersion'
+			self.VersionLabel = verLbl
+			self.Version = verText
+		end
+	end
 
 	local function chrome(text, x, danger, fn)
 		local b = Instance.new('TextButton')
