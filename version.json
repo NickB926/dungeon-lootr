@@ -1,6 +1,6 @@
 {
-    "version":  "1.0.6",
-    "message":  "Auto parry: bosses exempt from the CanAttack gate again (telegraph lead restored)",
+    "version":  "1.0.7",
+    "message":  "Auto parry: boss owns the cooldown, fodder cues no longer spend it mid-boss",
     "files":  [
                   "dungeon-lootr/launch.lua",
                   "dungeon-lootr/DungeonLootr.lua",

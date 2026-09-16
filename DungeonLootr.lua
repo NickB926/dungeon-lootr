@@ -136,6 +136,8 @@ local rt = {
 	parryDelay = 0,
 	parryScan = 0,
 	dodgeOnlyUntil = 0,
+	bossNearAt = 0,
+	bossCueAt = 0,
 	dodgeFire = 0,
 	muteVfx = 0,
 	noclip = 0,
@@ -2470,6 +2472,7 @@ local function armParry(delay, mode)
 		end
 	end
 	if mode == 'boss-hit' then
+		rt.bossCueAt = now
 		rt.parryDelay = now
 		rt.parryArmed = math.max(rt.parryArmed or 0, now + 0.32)
 		rt.parryCue = 'hit'
@@ -2477,6 +2480,7 @@ local function armParry(delay, mode)
 	end
 	local fireAt = now + math.max(0, delay)
 	if mode == 'boss-wind' then
+		rt.bossCueAt = now
 		if (rt.parryArmed or 0) <= now then
 			rt.parryDelay = fireAt
 		elseif fireAt < (rt.parryDelay or 0) and fireAt >= now then
@@ -2486,6 +2490,13 @@ local function armParry(delay, mode)
 		end
 		rt.parryArmed = math.max(rt.parryArmed or 0, (rt.parryDelay or fireAt) + math.max(0.28, delay * 0.2))
 		rt.parryCue = 'wind'
+		return
+	end
+	-- A boss in the fight owns the parry. Fodder chip is ~150 a hit while boss
+	-- swings run 400+, and once fodder cues could arm (they never used to) they
+	-- held the 1.8s cooldown down through every boss wind-up. Dodge still covers
+	-- the fodder hit, and panicDodge still covers low HP.
+	if now - (rt.bossNearAt or 0) < 1.0 and now - (rt.bossCueAt or 0) < 3.0 then
 		return
 	end
 	if rt.parryDelay <= now or fireAt < rt.parryDelay then
@@ -4047,6 +4058,7 @@ local function autoParryTick()
 		rt.bossAnim = rt.bossAnim or {}
 		for npc in pairs(enemyWatches) do
 			if npc.Parent and isBossEnemy(npc) and enemyInRange(npc) then
+				rt.bossNearAt = now
 				local an = rt.bossAnim[npc]
 				if not an or an.Parent == nil then
 					local ctrl = npc:FindFirstChildOfClass('AnimationController')
