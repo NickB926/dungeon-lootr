@@ -1,6 +1,6 @@
 {
-    "version":  "1.0.5",
-    "message":  "Auto parry: telegraph/State cues require the CanAttack window",
+    "version":  "1.0.6",
+    "message":  "Auto parry: bosses exempt from the CanAttack gate again (telegraph lead restored)",
     "files":  [
                   "dungeon-lootr/launch.lua",
                   "dungeon-lootr/DungeonLootr.lua",

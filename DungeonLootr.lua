@@ -3539,11 +3539,12 @@ local function watchEnemy(npc)
 		if not enemyInRange(npc) then
 			return
 		end
-		-- CanAttack is this game's real attack window. When a mob exposes it,
-		-- telegraph flicker / State strings / leftover anim markers must not arm on
-		-- their own — that was the last source of parries fired at nothing. The
-		-- grace covers cues that land just after the window closes.
-		if npc:GetAttribute('CanAttack') ~= nil
+		-- Fodder only: CanAttack is its real attack window, so telegraph flicker /
+		-- State strings / leftover anim markers must not arm on their own. Bosses
+		-- are exempt — their Telegraph_Root lights up well before CanAttack opens,
+		-- and that lead is exactly what bossParryDelay is timing against.
+		if not bossy
+			and npc:GetAttribute('CanAttack') ~= nil
 			and npc:GetAttribute('CanAttack') ~= true
 			and os.clock() - lastCanEdge > 0.5
 		then
@@ -4081,10 +4082,9 @@ local function autoParryTick()
 					end)
 				end
 				-- Rising edge only — continuous lit telegraphs were false-parrying.
-				-- Still needs the attack window: the telegraph flicker alone kept
-				-- firing F several seconds away from any swing.
-				local rose = rt.telegraphRose(npc)
-				if rose and (npc:GetAttribute('CanAttack') == nil or npc:GetAttribute('CanAttack') == true) then
+				-- No CanAttack requirement here: a boss telegraph precedes its attack
+				-- window, so gating on it left bosses unparried entirely.
+				if rt.telegraphRose(npc) then
 					local delay = (npc:GetAttribute('IsSpecialBoss') == true) and 0.16 or bossParryDelay()
 					armParry(delay, 'boss-wind')
 				end
