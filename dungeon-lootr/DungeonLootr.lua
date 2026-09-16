@@ -3531,11 +3531,22 @@ local function watchEnemy(npc)
 	enemyWatches[npc] = bag
 	local bossy = isBossEnemy(npc)
 	local lastCue = 0
+	local lastCanEdge = 0
 	local function windDelay()
 		return bossy and bossParryDelay() or 0.08
 	end
 	local function maybeArm(delay, kind)
 		if not enemyInRange(npc) then
+			return
+		end
+		-- CanAttack is this game's real attack window. When a mob exposes it,
+		-- telegraph flicker / State strings / leftover anim markers must not arm on
+		-- their own — that was the last source of parries fired at nothing. The
+		-- grace covers cues that land just after the window closes.
+		if npc:GetAttribute('CanAttack') ~= nil
+			and npc:GetAttribute('CanAttack') ~= true
+			and os.clock() - lastCanEdge > 0.5
+		then
 			return
 		end
 		if bossy then
@@ -3745,6 +3756,7 @@ local function watchEnemy(npc)
 				return
 			end
 			local now = os.clock()
+			lastCanEdge = now
 			-- Fodder at max parry range cannot reach us; only bosses get the full
 			-- ring. 26 studs covers the archers (they fire from ~11-18).
 			if not bossy then
@@ -4069,7 +4081,10 @@ local function autoParryTick()
 					end)
 				end
 				-- Rising edge only — continuous lit telegraphs were false-parrying.
-				if rt.telegraphRose(npc) then
+				-- Still needs the attack window: the telegraph flicker alone kept
+				-- firing F several seconds away from any swing.
+				local rose = rt.telegraphRose(npc)
+				if rose and (npc:GetAttribute('CanAttack') == nil or npc:GetAttribute('CanAttack') == true) then
 					local delay = (npc:GetAttribute('IsSpecialBoss') == true) and 0.16 or bossParryDelay()
 					armParry(delay, 'boss-wind')
 				end

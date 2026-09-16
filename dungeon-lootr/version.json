@@ -1,6 +1,6 @@
 {
-    "version":  "1.0.4",
-    "message":  "Publisher also syncs the live executor workspace tree",
+    "version":  "1.0.5",
+    "message":  "Auto parry: telegraph/State cues require the CanAttack window",
     "files":  [
                   "dungeon-lootr/launch.lua",
                   "dungeon-lootr/DungeonLootr.lua",
