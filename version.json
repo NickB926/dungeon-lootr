@@ -1,6 +1,6 @@
 {
-    "version":  "1.0.2",
-    "message":  "Per-script version label in UI (bottom-left)",
+    "version":  "1.0.3",
+    "message":  "Auto parry: CanAttack cues for fodder, no arming on unnamed clips, cooldown-aware retry",
     "files":  [
                   "dungeon-lootr/launch.lua",
                   "dungeon-lootr/DungeonLootr.lua",

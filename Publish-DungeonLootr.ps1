@@ -14,15 +14,26 @@ param(
 $ErrorActionPreference = 'Stop'
 $repoRoot = 'C:\Users\Revi\Documents\dungeon-lootr'
 $payloadDir = Join-Path $repoRoot 'dungeon-lootr'
+# Canonical library = the live Potassium copy (that is what Publish-PlayerTools ships).
+# The playertools repo copy is only publish staging, so it lags between publishes.
 $ataSrcCandidates = @(
-  'C:\Users\Revi\Documents\playertools\PlayerTools\AtaraxiaLibrary.lua',
-  'C:\Users\Revi\AppData\Local\Potassium\scripts\PlayerTools\AtaraxiaLibrary.lua'
+  'C:\Users\Revi\AppData\Local\Potassium\scripts\PlayerTools\AtaraxiaLibrary.lua',
+  'C:\Users\Revi\Documents\playertools\PlayerTools\AtaraxiaLibrary.lua'
 )
+$ataPtRepo = 'C:\Users\Revi\Documents\playertools\PlayerTools\AtaraxiaLibrary.lua'
 $potassiumPayload = 'C:\Users\Revi\AppData\Local\Potassium\scripts\dungeon-lootr'
 $utf8 = New-Object System.Text.UTF8Encoding $false
 
 function Write-Utf8NoBom([string]$Path, [string]$Text) {
   [System.IO.File]::WriteAllText($Path, $Text, $utf8)
+}
+
+function Get-TextHash([string]$Path) {
+  if (-not (Test-Path $Path)) { return '' }
+  $text = [System.Text.Encoding]::UTF8.GetString([System.IO.File]::ReadAllBytes($Path))
+  $text = ($text -replace "`r`n", "`n").TrimEnd("`n")
+  $stream = New-Object System.IO.MemoryStream (, [System.Text.Encoding]::UTF8.GetBytes($text))
+  return (Get-FileHash -InputStream $stream -Algorithm SHA256).Hash
 }
 
 function Bump-PatchVersion([string]$v) {
@@ -82,6 +93,12 @@ $ataSrc = $ataSrcCandidates | Where-Object { Test-Path $_ } | Select-Object -Fir
 if (-not $ataSrc) { throw 'AtaraxiaLibrary.lua not found (PlayerTools)' }
 Copy-Item -Force $ataSrc (Join-Path $payloadDir 'AtaraxiaLibrary.lua')
 Write-Host "==> Bundled AtaraxiaLibrary from $ataSrc"
+
+# Both feeds must ship the same library. If PlayerTools has not published the
+# current one yet, Dungeon Lootr would be ahead and DL's UI would differ.
+if ((Get-TextHash $ataSrc) -ne (Get-TextHash $ataPtRepo)) {
+  Write-Warning 'Library differs from the playertools repo copy - run the PlayerTools publisher too, or the two feeds ship different Ataraxia versions.'
+}
 
 $verJson = ($ver | ConvertTo-Json -Depth 5) + [Environment]::NewLine
 Write-Utf8NoBom $verPath $verJson

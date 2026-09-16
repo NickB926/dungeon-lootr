@@ -135,6 +135,7 @@ local rt = {
 	parryArmed = 0,
 	parryDelay = 0,
 	parryScan = 0,
+	dodgeOnlyUntil = 0,
 	dodgeFire = 0,
 	muteVfx = 0,
 	noclip = 0,
@@ -2284,6 +2285,9 @@ end
 
 -- Locomotion / recover / hitstun must not arm a parry. Unnamed tracks used to
 -- count as attacks, which is why parry fired after swings that already landed.
+-- Returns (isAttack, guessed). Every mob in this game names its clips
+-- "Animation" / "Animation1", so a guess carries no real signal — callers must
+-- corroborate a guess with CanAttack before arming.
 local function isAttackAnim(track, loose)
 	local anim = track and track.Animation
 	local name = string.lower(tostring(
@@ -2292,7 +2296,7 @@ local function isAttackAnim(track, loose)
 			or ''
 	))
 	if name == '' then
-		return loose == true
+		return loose == true, loose == true
 	end
 	if name:find('walk', 1, true)
 		or name:find('run', 1, true)
@@ -2323,7 +2327,7 @@ local function isAttackAnim(track, loose)
 		or name:find('dance', 1, true)
 		or name:find('buff', 1, true)
 	then
-		return false
+		return false, false
 	end
 	local named = name:find('attack', 1, true)
 		or name:find('slash', 1, true)
@@ -2348,7 +2352,7 @@ local function isAttackAnim(track, loose)
 		or name:find('aoe', 1, true)
 		or name:find('roar', 1, true)
 	if named then
-		return true
+		return true, false
 	end
 	-- Boss clips are often unnamed rbxassetid ids. After the locomotion reject
 	-- above, treat longer non-looped clips as swings. Short loops are idle/walk.
@@ -2359,14 +2363,14 @@ local function isAttackAnim(track, loose)
 			looped = track.Looped == true
 		end)
 		if looped then
-			return false
+			return false, false
 		end
 		if len < 0.55 or len > 4.5 then
-			return false
+			return false, false
 		end
-		return true
+		return true, true
 	end
-	return false
+	return false, false
 end
 
 -- Specials / bosses hit in the first third of the clip. Waiting until
@@ -2449,10 +2453,21 @@ end
 local function armParry(delay, mode)
 	delay = tonumber(delay) or 0
 	local now = os.clock()
-	-- Just spent F (or still in parry i-frame): ignore fresh arms so we do not
-	-- burn the next window on leftover telegraph / anim noise.
-	if now - (rt.parryFire or 0) < 0.55 then
+	local sinceFire = now - (rt.parryFire or 0)
+	-- Frame debounce only.
+	if sinceFire < 0.12 then
 		return
+	end
+	-- Past the debounce, the server attributes are the truth: a successful parry
+	-- clears Parry_Cooldown_Active early, and a flat post-fire lockout made us sit
+	-- out the rest of a combo instead of using the refund.
+	if sinceFire < 0.55 then
+		local ch = character()
+		if LocalPlayer:GetAttribute('Parry_Cooldown_Active') == true
+			or (ch and ch:GetAttribute('Parry') == true)
+		then
+			return
+		end
 	end
 	if mode == 'boss-hit' then
 		rt.parryDelay = now
@@ -2908,7 +2923,10 @@ local function parryReady()
 	if not hum or hum.Health <= 0 then
 		return false
 	end
-	if os.clock() - rt.parryFire < 0.35 then
+	-- Frame debounce only. Parry_Cooldown_Active and char Parry above are the real
+	-- gate, and the game refunds the cooldown on a successful parry — a longer
+	-- lockout here threw that refund away.
+	if os.clock() - rt.parryFire < 0.12 then
 		return false
 	end
 	return true
@@ -3621,7 +3639,14 @@ local function watchEnemy(npc)
 		end
 	end)
 	local function onAttackAnim(track)
-		if not isAttackAnim(track, bossy) then
+		local isAttack, guessed = isAttackAnim(track, bossy)
+		if not isAttack then
+			return
+		end
+		-- A guess is just "non-looped clip of plausible length" — these mobs play
+		-- plenty of those with no attack behind them, and that is what fired F at
+		-- nothing. Only trust a guess while the mob is in its attack window.
+		if guessed and npc:GetAttribute('CanAttack') ~= true then
 			return
 		end
 		if bossy and track.GetMarkerReachedSignal then
@@ -3704,18 +3729,58 @@ local function watchEnemy(npc)
 			maybeArm(bossy and bossParryDelay() or 0.08, 'state')
 		end
 	end)
-	-- Raid bosses (Dark Professor): CanAttack true = wind-up, falling edge ≈ hit.
-	-- Far more reliable than leftover SpellTelegraph discs / idle anim noise.
-	if bossy then
+	-- CanAttack is the only attack cue these mobs actually expose: fodder carries no
+	-- Telegraph_Root, State sits on 'Aggro' straight through the swing, and every
+	-- clip is named 'Animation' / 'Animation1'. Live probe: rising edge = wind-up
+	-- start, falling edge lands within ~0.35s of the damage. This hook used to be
+	-- boss-only, so every fodder swing was invisible and parry never armed for it.
+	do
 		local lastCan = npc:GetAttribute('CanAttack')
+		local lastCanArm = 0
 		bag[#bag + 1] = npc:GetAttributeChangedSignal('CanAttack'):Connect(function()
 			local v = npc:GetAttribute('CanAttack')
 			local prev = lastCan
 			lastCan = v
+			if not enemyInRange(npc) then
+				return
+			end
+			local now = os.clock()
+			-- Fodder at max parry range cannot reach us; only bosses get the full
+			-- ring. 26 studs covers the archers (they fire from ~11-18).
+			if not bossy then
+				local root = enemyRoot(npc)
+				local me = myRootPart()
+				if root and me then
+					local dx = root.Position.X - me.Position.X
+					local dz = root.Position.Z - me.Position.Z
+					if math.sqrt(dx * dx + dz * dz) > 26 then
+						return
+					end
+				end
+			end
+			if npc:GetAttribute('Unblockable') == true then
+				-- Unblockable swings cannot be parried; leave the window to the dash.
+				rt.dodgeOnlyUntil = math.max(rt.dodgeOnlyUntil or 0, now + 0.9)
+			end
 			if v == true and prev ~= true then
-				maybeArm(windDelay(), 'tel')
+				if now - lastCanArm < 0.25 then
+					return
+				end
+				lastCanArm = now
+				if bossy then
+					armParry(windDelay(), 'boss-wind')
+				else
+					-- Fodder wind-ups run ~0.06-0.5s, so fire almost at once and let
+					-- the hold cover the impact.
+					armParry(0.04)
+				end
 			elseif v == false and prev == true then
-				maybeArm(0.02, 'hit')
+				-- Falling edge is the impact. Retime onto it if we have not fired.
+				if bossy then
+					armParry(0, 'boss-hit')
+				else
+					armParry(0)
+				end
 			end
 		end)
 	end
@@ -3979,10 +4044,13 @@ local function autoParryTick()
 				if an then
 					pcall(function()
 						for _, track in ipairs(an:GetPlayingAnimationTracks()) do
-							if isAttackAnim(track, true) then
+							local isAttack, guessed = isAttackAnim(track, true)
+							if isAttack then
 								-- Prefer CanAttack-gated timing when the boss exposes it.
+								-- An unnamed clip is only a guess, so it needs CanAttack
+								-- true; a name-matched clip may arm on its own.
 								local can = npc:GetAttribute('CanAttack')
-								if can == false then
+								if can == false or (guessed and can ~= true) then
 									-- Not in an attack window — skip anim noise.
 								else
 									local len = track.Length or 0
@@ -4020,7 +4088,7 @@ local function autoParryTick()
 		if not wantDodge or not rt.dodgeReady() then
 			return false
 		end
-		if wantParry and parryReady() then
+		if wantParry and parryReady() and now >= (rt.dodgeOnlyUntil or 0) then
 			return false
 		end
 		local pct = rt.hpPct()
@@ -4056,9 +4124,18 @@ local function autoParryTick()
 		or char:GetAttribute('Parry') == true
 		or LocalPlayer:GetAttribute('iFrame') == true
 	) then
+		-- Already immune, so spending F here is wasted. Keep the arm alive instead
+		-- of returning into an expiry: auto skill holds SkillIFrame for ~half the
+		-- fight, and the window used to lapse behind it, which is why real swings
+		-- went unparried. Capped off the cue so a stale arm cannot fire at nothing.
+		local cap = (rt.parryDelay or now) + 0.45
+		if now < cap then
+			rt.parryArmed = math.max(rt.parryArmed, math.min(now + 0.1, cap))
+		end
 		return
 	end
-	if wantParry and parryReady() then
+	-- An Unblockable swing ignores parry entirely, so hand that window to the dash.
+	if wantParry and parryReady() and now >= (rt.dodgeOnlyUntil or 0) then
 		rt.parryFire = now
 		pcall(parryRemote)
 		spendWindow()
