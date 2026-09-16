@@ -1,0 +1,12 @@
+{
+    "version":  "1.0.1",
+    "message":  "Initial GitHub feed - Dungeon Lootr + Ataraxia",
+    "files":  [
+                  "dungeon-lootr/launch.lua",
+                  "dungeon-lootr/DungeonLootr.lua",
+                  "dungeon-lootr/LootHUD.lua",
+                  "dungeon-lootr/Updater.lua",
+                  "dungeon-lootr/AtaraxiaLibrary.lua",
+                  "dungeon-lootr/version.json"
+              ]
+}

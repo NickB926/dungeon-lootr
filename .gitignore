@@ -1,0 +1,4 @@
+.desktop-launch.log
+.desktop-launch.lock
+*.log
+.tmp*
