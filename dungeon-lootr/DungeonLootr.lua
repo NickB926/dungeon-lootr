@@ -9402,26 +9402,76 @@ local Replay = (function()
 		return hud and hud:FindFirstChild('Warning') or nil
 	end
 
-	-- Checkpoint confirm after an Endless floor: HUD.Warning with green Continue.
-	local function endlessWarningShowing()
+	-- Checkpoint confirm: Endless floors and Boss Rush wave 100 both use HUD.Warning
+	-- with green Confirm (not Completion_Info). Do not match chest / summon dialogs.
+	local function continueWarningShowing()
 		local w = hudWarning()
 		if not w or w.Visible ~= true then
 			return false
 		end
 		local msg = w:FindFirstChild('Warning_Message', true)
 		local tx = string.lower(tostring(msg and msg.Text or ''))
+		if tx:find('chest', 1, true)
+			or tx:find('summon', 1, true)
+			or tx:find('platinum', 1, true)
+			or tx:find('open all', 1, true)
+		then
+			return false
+		end
 		return tx:find('checkpoint', 1, true)
 			or tx:find('regenerat', 1, true)
 			or tx:find('extract', 1, true)
-			or (tx:find('continue', 1, true) and tx:find('dungeon', 1, true))
+			or tx:find('continue', 1, true)
+			or tx:find('replay', 1, true)
+			or tx:find('milestone', 1, true)
+			or tx:find('wave', 1, true)
+			or tx:find('boss rush', 1, true)
+	end
+
+	local function clickContinueWarning()
+		local w = hudWarning()
+		if clickBtn(w and w:FindFirstChild('Confirm')) then
+			return true
+		end
+		if not w then
+			return false
+		end
+		for _, d in ipairs(w:GetDescendants()) do
+			if d:IsA('GuiButton') then
+				local t = string.lower(tostring(d.Name or ''))
+				local lab = d:FindFirstChildWhichIsA('TextLabel', true)
+				local tx = string.lower(tostring(lab and lab.Text or ''))
+				if t:find('confirm', 1, true)
+					or t:find('continue', 1, true)
+					or t:find('replay', 1, true)
+					or tx:find('continue', 1, true)
+					or tx:find('replay', 1, true)
+					or tx == 'yes'
+				then
+					if clickBtn(d) then
+						return true
+					end
+				end
+			end
+		end
+		return false
+	end
+
+	local function inRushNow()
+		if type(inBossRushFarm) == 'function' and inBossRushFarm() then
+			return true
+		end
+		local d = string.lower(tostring(
+			LocalPlayer:GetAttribute('CurrentDungeon') or rt.runDungeonId or ''
+		))
+		return d:find('bossrush', 1, true) ~= nil
+			or d:find('boss_rush', 1, true) ~= nil
+			or d:find('boss rush', 1, true) ~= nil
 	end
 
 	local function continueEndless()
-		if endlessWarningShowing() then
-			local w = hudWarning()
-			if clickBtn(w and w:FindFirstChild('Confirm')) then
-				return true
-			end
+		if continueWarningShowing() and clickContinueWarning() then
+			return true
 		end
 		local pg = LocalPlayer:FindFirstChild('PlayerGui')
 		local main = pg and pg:FindFirstChild('Main')
@@ -9488,6 +9538,23 @@ local Replay = (function()
 				return true
 			end
 		end
+		if inRushNow() then
+			if continueWarningShowing() and clickContinueWarning() then
+				return true
+			end
+			local rushRf = RunLoops.knitRF('BossRushService', 'RequestReplay')
+			if rushRf then
+				local okRush, resRush = pcall(function()
+					return rushRf:InvokeServer()
+				end)
+				if okRush and resRush ~= false then
+					return true
+				end
+			end
+			if clickReplayButton() then
+				return true
+			end
+		end
 		local rf = RunLoops.knitRF('DungeonRunService', 'RequestReplay')
 		if not rf then
 			if not silent then
@@ -9514,7 +9581,9 @@ local Replay = (function()
 	end
 
 	function api.tick()
-		if not on('DLAutoReplay') and not on('DLLoopSpecific') then
+		local wantReplay = on('DLAutoReplay') or on('DLLoopSpecific')
+		local rushContinue = on('DLAutoFarm') and inRushNow()
+		if not wantReplay and not rushContinue then
 			runCompleteAt = nil
 			replayArmedAt = nil
 			replayTries = 0
@@ -9525,18 +9594,37 @@ local Replay = (function()
 			replayArmedAt = nil
 			return
 		end
-		-- Endless checkpoint WARNING is not Completion_Info — press green Continue.
-		if loopingEndless() and endlessWarningShowing() then
+		-- Endless floor / Boss Rush wave 100: HUD.Warning Confirm, not Completion_Info.
+		if continueWarningShowing() and (loopingEndless() or inRushNow() or wantReplay) then
 			local now = os.clock()
 			if now - lastReplayAt < 1.2 then
 				return
 			end
 			lastReplayAt = now
 			task.spawn(function()
-				if continueEndless() then
-					Library:Notify('Endless continue')
+				local ok = clickContinueWarning()
+				if not ok and loopingEndless() then
+					ok = continueEndless()
+				end
+				if not ok and inRushNow() then
+					local rf = RunLoops.knitRF('BossRushService', 'RequestReplay')
+					if rf then
+						local okRf, resRf = pcall(function()
+							return rf:InvokeServer()
+						end)
+						ok = okRf and resRf ~= false
+					end
+					if not ok then
+						ok = clickReplayButton()
+					end
+				end
+				if ok then
+					Library:Notify(inRushNow() and 'Boss rush continue' or 'Endless continue')
 				end
 			end)
+			return
+		end
+		if not wantReplay then
 			return
 		end
 		local showing = completionShowing()
@@ -12826,30 +12914,38 @@ pcall(function()
 	for _, pair in ipairs({
 		{ 'DungeonRunService', 'DungeonComplete' },
 		{ 'DungeonService', 'DungeonComplete' },
+		{ 'BossRushService', 'DungeonComplete' },
 	}) do
 		local ev = knitRE(pair[1], pair[2])
 		if ev then
 			track(ev.OnClientEvent:Connect(markEnded))
 		end
 	end
-	local rs = knitRE('DungeonRunService', 'ReplayStarting')
-	if rs then
-		track(rs.OnClientEvent:Connect(function()
-			replayArmedAt = nil
-			replayTries = 0
-		end))
+	for _, pair in ipairs({
+		{ 'DungeonRunService', 'ReplayStarting' },
+		{ 'BossRushService', 'ReplayStarting' },
+	}) do
+		local rs = knitRE(pair[1], pair[2])
+		if rs then
+			track(rs.OnClientEvent:Connect(function()
+				replayArmedAt = nil
+				replayTries = 0
+			end))
+		end
 	end
-	local lives = knitRE('DungeonRunService', 'LivesUpdate')
-	if lives then
-		track(lives.OnClientEvent:Connect(function(a)
-			local n = tonumber(a)
-			if type(a) == 'table' then
-				n = tonumber(a.Lives or a.Remaining or a.lives or a.Count)
-			end
-			if n == 0 then
-				markEnded()
-			end
-		end))
+	for _, svc in ipairs({ 'DungeonRunService', 'BossRushService' }) do
+		local lives = knitRE(svc, 'LivesUpdate')
+		if lives then
+			track(lives.OnClientEvent:Connect(function(a)
+				local n = tonumber(a)
+				if type(a) == 'table' then
+					n = tonumber(a.Lives or a.Remaining or a.lives or a.Count)
+				end
+				if n == 0 then
+					markEnded()
+				end
+			end))
+		end
 	end
 	local st = knitRE('DungeonRunService', 'StateUpdate')
 	if st then

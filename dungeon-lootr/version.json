@@ -1,6 +1,6 @@
 {
-    "version":  "1.0.25",
-    "message":  "Dump ultimate whenever auto farm is on, even if Auto skill is off",
+    "version":  "1.0.26",
+    "message":  "Press Boss Rush wave 100 continue confirm like Endless",
     "files":  [
                   "dungeon-lootr/launch.lua",
                   "dungeon-lootr/DungeonLootr.lua",
