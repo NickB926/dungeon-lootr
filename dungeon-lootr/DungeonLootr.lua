@@ -10776,9 +10776,9 @@ end)()
 
 -- Level-up skill points. StatService is the same surface the game's own stat panel
 -- uses: GetSkillPoints reports { Unspent = n, Allocated = { STR = n, ... } },
--- AllocatePoint(name) spends one and AllocatePoints(name, count) batches. The service
--- also exposes SetStat / SetStatPoints, which write values outright rather than
--- spending earned points, so those are deliberately left alone.
+-- AllocatePoint(name) spends one and AllocatePoints(name, count) batches.
+-- Respec is the Inventory → Stat Upgrades RESET button. SetStat / SetStatPoints
+-- write values outright rather than spending earned points, so those stay unused.
 local Stats = (function()
 	local ReplicatedStorage = game:GetService('ReplicatedStorage')
 	local POLL = 5
@@ -10909,6 +10909,65 @@ local Stats = (function()
 		end
 		labelAt = 0
 		return spent
+	end
+
+	function api.allocated(fresh)
+		local p = api.points(fresh)
+		if not p or type(p.Allocated) ~= 'table' then
+			return 0
+		end
+		local n = 0
+		for _, name in ipairs(api.NAMES) do
+			n += tonumber(p.Allocated[name]) or 0
+		end
+		return n
+	end
+
+	-- Inventory → Stat Upgrades → RESET. Refunds allocated points to Unspent.
+	function api.respec(silent)
+		local folder = remotes()
+		local rem = folder and folder:FindFirstChild('Respec')
+		if not rem then
+			if not silent then
+				Library:Notify('StatService.Respec missing')
+			end
+			return false, 'missing'
+		end
+		local used = api.allocated(true)
+		if used <= 0 then
+			if not silent then
+				Library:Notify('No allocated points to reset')
+			end
+			return false, 'none'
+		end
+		local ok, res = pcall(function()
+			return rem:InvokeServer()
+		end)
+		if not ok then
+			if not silent then
+				Library:Notify('Reset failed: ' .. tostring(res))
+			end
+			return false, tostring(res)
+		end
+		if res == false or (type(res) == 'table' and res.Success == false) then
+			local why = 'server refused'
+			if type(res) == 'table' then
+				why = tostring(res.Error or res.Reason or res.Message or why)
+			end
+			if not silent then
+				Library:Notify('Reset refused: ' .. why)
+			end
+			return false, why
+		end
+		cache, cacheAt, labelAt = nil, 0, 0
+		local after = api.unspent(true)
+		if not silent then
+			Library:Notify(('Reset stats · %d unspent'):format(after))
+		end
+		if on('DLAutoStat') then
+			task.spawn(api.spendAll, true)
+		end
+		return true, after
 	end
 
 	function api.setLabel(obj)
@@ -12757,6 +12816,9 @@ StatBox:AddButton('Spend all points now', function()
 	-- Spawned: allocating yields on the remote, which would stall the button.
 	task.spawn(Stats.spendAll, false)
 end)
+StatBox:AddButton('Reset stat points', function()
+	task.spawn(Stats.respec, false)
+end)
 StatBox:AddToggle('DLAutoStat', {
 	Text = 'Auto spend skill points',
 	Default = false,
@@ -12774,7 +12836,7 @@ StatBox:AddToggle('DLAutoStat', {
 	Library:Notify('Auto skill points on')
 	task.spawn(Stats.spendAll, true)
 end)
-StatBox:AddLabel('Spends earned points only. Respec is left alone.')
+StatBox:AddLabel('Reset is Inventory → Stat Upgrades → RESET. Auto spend will reallocate after a reset.')
 
 local MenuBox = MenuTab:AddLeftGroupbox('Script')
 MenuBox:AddLabel('Home hides/shows this window (same as PlayerTools).')

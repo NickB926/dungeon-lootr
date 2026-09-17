@@ -1,6 +1,6 @@
 {
-    "version":  "1.0.33",
-    "message":  "Remove class slot switcher",
+    "version":  "1.0.34",
+    "message":  "Add Reset stat points on the Skill points panel (StatService.Respec)",
     "files":  [
                   "dungeon-lootr/launch.lua",
                   "dungeon-lootr/DungeonLootr.lua",
