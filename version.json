@@ -1,5 +1,5 @@
 {
-    "version":  "1.0.24",
+    "version":  "1.0.25",
     "message":  "Dump ultimate whenever auto farm is on, even if Auto skill is off",
     "files":  [
                   "dungeon-lootr/launch.lua",
