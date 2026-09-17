@@ -12398,6 +12398,9 @@ StatBox:AddLabel('Spends earned points only. Respec is left alone.')
 
 local MenuBox = MenuTab:AddLeftGroupbox('Script')
 MenuBox:AddLabel('Home hides/shows this window (same as PlayerTools).')
+if type(Library.AddNotifyToggle) == 'function' then
+	Library:AddNotifyToggle(MenuBox)
+end
 MenuBox:AddButton('Hide menu', function()
 	Library:Toggle(false)
 end)

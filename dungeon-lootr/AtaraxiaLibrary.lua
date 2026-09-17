@@ -130,6 +130,9 @@ end
 function Library:PlayTabAnimation() end
 
 function Library:Notify(text, duration)
+	if NotifyPref.isOn() ~= true then
+		return
+	end
 	duration = tonumber(duration) or 5
 	-- Own ScreenGui: the in-window toast holder is 40px and clips multiline text.
 	local pg = LocalPlayer and LocalPlayer:FindFirstChildOfClass('PlayerGui')
@@ -908,6 +911,76 @@ end
 
 function Library:IsHideGameplayPaused()
 	return NoPause.isOn()
+end
+
+---------------------------------------------------------------------------
+-- Notification mute. Library:Notify no-ops when off.
+-- Persists in Ataraxia/notifications (default on). Shared across games.
+---------------------------------------------------------------------------
+local NotifyPref = (function()
+	local api = {}
+	local FILE = 'Ataraxia/notifications'
+	local enabled = true
+
+	local function readFile()
+		if type(isfile) == 'function' and type(readfile) == 'function' then
+			local ok, exists = pcall(isfile, FILE)
+			if ok and exists then
+				local rok, body = pcall(readfile, FILE)
+				if rok and tostring(body):lower():find('false', 1, true) then
+					return false
+				end
+			end
+		end
+		return true
+	end
+
+	local function writeFile(on)
+		if type(writefile) ~= 'function' then
+			return
+		end
+		pcall(function()
+			if type(makefolder) == 'function' and type(isfolder) == 'function' and not isfolder('Ataraxia') then
+				makefolder('Ataraxia')
+			end
+		end)
+		pcall(writefile, FILE, on and 'true' or 'false')
+	end
+
+	enabled = readFile()
+
+	function api.isOn()
+		return enabled == true
+	end
+
+	function api.set(on)
+		enabled = on ~= false
+		writeFile(enabled)
+		return enabled
+	end
+
+	return api
+end)()
+
+function Library:SetNotifyEnabled(on)
+	return NotifyPref.set(on)
+end
+
+function Library:IsNotifyEnabled()
+	return NotifyPref.isOn()
+end
+
+function Library:AddNotifyToggle(box)
+	if not box or type(box.AddToggle) ~= 'function' then
+		return
+	end
+	return box:AddToggle('ATA_Notifications', {
+		Text = 'Show notifications',
+		Default = NotifyPref.isOn(),
+		Tooltip = 'Ataraxia toasts (Library:Notify). Off is saved in Ataraxia/notifications for every game.',
+	}):OnChanged(function(v)
+		Library:SetNotifyEnabled(v == true)
+	end)
 end
 
 local function fireChanged(obj, value)
