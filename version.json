@@ -1,6 +1,6 @@
 {
-    "version":  "1.0.13",
-    "message":  "Auto parry: second press waits for the follow-up swing, not a dash",
+    "version":  "1.0.14",
+    "message":  "Auto parry: wait for the swing clip instead of pressing the instant F appears",
     "files":  [
                   "dungeon-lootr/launch.lua",
                   "dungeon-lootr/DungeonLootr.lua",

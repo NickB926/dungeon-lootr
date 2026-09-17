@@ -2632,14 +2632,20 @@ function rt.noteFCueAnim(npc, track)
 		return
 	end
 	if rt.fCueLit(npc) then
-		-- Long channel (Broken Reality ~2.3s clip) while the letter stays up.
-		-- First press already happened on F; refunded presses cover the rest.
-		if len >= 1.05 and now - (rt.fOnAt or 0) < 6 then
+		if now - (rt.fOnAt or 0) > 6 then
+			return
+		end
+		-- F is the telegraph. The swing clip starts ~0.35s later; pressing the
+		-- instant the letter shows expires before the long channel's 89s.
+		if len >= 1.05 then
 			rt.fLongUntil = now + len
-			if now - (rt.fParriedAt or 0) < 2.2 then
-				rt.fFollowParryAt = now + 0.50
-				rt.fFollowParryUntil = now + len + 0.2
-			end
+			rt.fFollowParryAt = now + 0.40
+			rt.fFollowParryUntil = now + len + 0.2
+			return
+		end
+		if len < 0.35 then
+			rt.fFollowParryAt = now
+			rt.fFollowParryUntil = now + 0.55
 		end
 		return
 	end
@@ -3945,7 +3951,12 @@ local function watchEnemy(npc)
 					rt.dodgeOnlyUntil = math.max(rt.dodgeOnlyUntil or 0, os.clock() + 0.9)
 					return
 				end
-				armParry(0, 'boss-hit', npc.Name .. '/F', false, true)
+				-- Do not press yet. 60s probe: every F+0.07 press was early;
+				-- the swing clip starts ~F+0.35 (short 0.28s / long 2.28s).
+				-- Fallback if Animator misses the clip.
+				local now = os.clock()
+				rt.fFollowParryAt = now + 0.50
+				rt.fFollowParryUntil = now + 0.85
 			elseif lastFire == true then
 				-- Do not press on a blind timer: that was the too-early 2nd.
 				-- Short combo plays the follow-up clip ~0.36s after F hides;
