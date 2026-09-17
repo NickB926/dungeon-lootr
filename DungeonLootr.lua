@@ -289,6 +289,15 @@ local function on(idx)
 	return t and t.Value == true
 end
 
+-- Missing from old profiles = previous always-on farm behavior.
+local function wantOpenGates()
+	local t = Toggles and Toggles.DLOpenGates
+	if t == nil then
+		return true
+	end
+	return t.Value == true
+end
+
 local function character()
 	local models = workspace:FindFirstChild('PlayerModels')
 	local fromFolder = models and models:FindFirstChild(LocalPlayer.Name)
@@ -593,7 +602,7 @@ local function statsText()
 	if routeLabel then
 		lines[#lines + 1] = 'chest route  ·  ' .. routeLabel
 	elseif on('DLChestAnywhere') then
-		lines[#lines + 1] = 'auto chest route on'
+		lines[#lines + 1] = wantOpenGates() and 'auto chest route on' or 'auto chest  ·  skip locked'
 	end
 	if Toggles.DLDpsMeter == nil or on('DLDpsMeter') then
 		local dpsLine = rt.dpsLine and rt.dpsLine()
@@ -1877,6 +1886,9 @@ KeyDoor = (function()
 
 	-- Snap to KeyModel + fire. No walk-through — NextArea handles crossing.
 	function api.unlockDoor(door)
+		if not wantOpenGates() then
+			return false
+		end
 		if not door or not door.Parent then
 			return false
 		end
@@ -2054,9 +2066,14 @@ local function chestClaimCandidate(model)
 		local prompt = chestPrompt(model)
 		local idx = tonumber(model:GetAttribute('RoomIndex'))
 		local gated = idx and rt.chestRoomOpen and rt.chestRoomOpen[idx]
-		-- Server enables ChestPrompt only after the key door is open. Waiting
-		-- for chestRoomOpen[1003] never fired — those IDs are not Room_N.
-		if not gated and not (prompt and prompt.Enabled == true) then
+		if not wantOpenGates() then
+			-- Gate stays shut — do not route to locked-room chests.
+			if not (prompt and prompt.Enabled == true) then
+				return false
+			end
+		elseif not gated and not (prompt and prompt.Enabled == true) then
+			-- Server enables ChestPrompt only after the key door is open. Waiting
+			-- for chestRoomOpen[1003] never fired — those IDs are not Room_N.
 			return false
 		end
 	end
@@ -2181,7 +2198,7 @@ local function collectChestRoute(silent, roomOnly)
 			end
 		end
 	end
-	if not keyStillOut then
+	if not keyStillOut and wantOpenGates() then
 		for _, gen in ipairs(workspace:GetChildren()) do
 			if gen.Name:sub(1, 10) == 'Generated_' then
 				for _, child in ipairs(gen:GetChildren()) do
@@ -2267,7 +2284,12 @@ local function collectChestRoute(silent, roomOnly)
 			else
 				if model:GetAttribute('LockedRoom') == true then
 					local idx = tonumber(model:GetAttribute('RoomIndex'))
-					if not (idx and rt.chestRoomOpen[idx]) then
+					local prompt = chestPrompt(model)
+					local open = prompt and prompt.Enabled == true
+					if wantOpenGates() then
+						open = open or (idx and rt.chestRoomOpen[idx])
+					end
+					if not open then
 						rt.chestSkip[model] = os.clock() + 400
 						continue
 					end
@@ -2418,7 +2440,9 @@ local function lootClearedRoom(roomIdx, dungeon)
 		return false
 	end
 	pcall(function()
-		KeyDoor.unlockForRoom(roomIdx)
+		if wantOpenGates() then
+			KeyDoor.unlockForRoom(roomIdx)
+		end
 	end)
 	if not dungeon then
 		for _, root in ipairs(workspace:GetChildren()) do
@@ -6179,7 +6203,7 @@ local NextArea = (function()
 			ghostDoor(door)
 		end
 		-- Key prompts sit on KeyModel beside the gate — stand there first, then fire.
-		if prompt and prompt.Enabled and isKeyPrompt(prompt) then
+		if prompt and prompt.Enabled and isKeyPrompt(prompt) and wantOpenGates() then
 			local blob = (tostring(prompt.ActionText) .. ' ' .. tostring(prompt.ObjectText)):lower()
 			local skipSpecial = blob:find('special boss', 1, true)
 				or blob:find('platinum', 1, true)
@@ -12030,25 +12054,6 @@ local MenuTab = Window:AddTab('Menu', 'settings')
 local RunBox = RunTab:AddLeftGroupbox('ESP')
 local HudBox = RunTab:AddRightGroupbox('HUD')
 RunBox:AddToggle('DLEspChests', { Text = 'Chests', Default = true })
-RunBox:AddButton('Collect all chests', function()
-	collectChestRoute(false)
-end)
-RunBox:AddToggle('DLChestAnywhere', {
-	Text = 'Auto collect chests',
-	Default = false,
-	Tooltip = 'Farm: Nightmare waits until the floor boss is next, then sweeps. Endless loots each room as soon as that pack is dead. Manual Collect still works anytime.',
-}):OnChanged(function(v)
-	Library:Notify(v and 'Auto chest route on' or 'Auto chest route off')
-end)
-RunBox:AddSlider('DLChestEvery', {
-	Text = 'Route every (s)',
-	Default = 45,
-	Min = 5,
-	Max = 120,
-	Rounding = 0,
-	Suffix = 's',
-	Tooltip = 'Only used when auto farm is off. Farm waits until the last mob is the boss, then sweeps chests in one pass.',
-})
 RunBox:AddToggle('DLEspPotions', { Text = 'Potion stations', Default = true })
 RunBox:AddToggle('DLEspKeys', { Text = 'Locked rooms / keys', Default = true })
 RunBox:AddToggle('DLEspLoot', { Text = 'Ground loot', Default = true })
@@ -12063,6 +12068,35 @@ RunBox:AddToggle('DLEspEnemies', {
 	end
 	Library:Notify(v and 'Enemy tracers on' or 'Enemy tracers off')
 end)
+
+local ChestBox = RunTab:AddLeftGroupbox('Chests')
+ChestBox:AddToggle('DLChestAnywhere', {
+	Text = 'Auto collect chests',
+	Default = false,
+	Tooltip = 'Farm: Nightmare waits until the floor boss is next, then sweeps. Endless loots each room as soon as that pack is dead. Manual Collect still works anytime. Locked-room chests are skipped unless Open locked gates is on.',
+}):OnChanged(function(v)
+	Library:Notify(v and 'Auto chest route on' or 'Auto chest route off')
+end)
+ChestBox:AddToggle('DLOpenGates', {
+	Text = 'Open locked gates',
+	Default = true,
+	Tooltip = 'Farm fires Use Key on Gold/Silver gates after a room clears. Off: do not unlock, and auto collect skips those locked-room chests.',
+}):OnChanged(function(v)
+	Library:Notify(v and 'Open locked gates on' or 'Open locked gates off')
+end)
+ChestBox:AddButton('Collect all chests', function()
+	collectChestRoute(false)
+end)
+ChestBox:AddSlider('DLChestEvery', {
+	Text = 'Route every (s)',
+	Default = 45,
+	Min = 5,
+	Max = 120,
+	Rounding = 0,
+	Suffix = 's',
+	Tooltip = 'Only used when auto farm is off. Farm waits until the last mob is the boss, then sweeps chests in one pass.',
+})
+ChestBox:AddLabel('Open gates is Use Key. Off leaves locked rooms alone.')
 HudBox:AddToggle('DLShowHud', {
 	Text = 'Overlay HUD',
 	Default = true,

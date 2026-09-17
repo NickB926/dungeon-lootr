@@ -1,6 +1,6 @@
 {
-    "version":  "1.0.34",
-    "message":  "Add Reset stat points on the Skill points panel (StatService.Respec)",
+    "version":  "1.0.35",
+    "message":  "Separate Open locked gates toggle; move auto collect chests out of ESP; skip locked-room chests when gates are off",
     "files":  [
                   "dungeon-lootr/launch.lua",
                   "dungeon-lootr/DungeonLootr.lua",
