@@ -1,6 +1,6 @@
 {
-    "version":  "1.0.31",
-    "message":  "Persist Overlay HUD off across reloads; do not flash it on load",
+    "version":  "1.0.32",
+    "message":  "Remove class slot switcher",
     "files":  [
                   "dungeon-lootr/launch.lua",
                   "dungeon-lootr/DungeonLootr.lua",
