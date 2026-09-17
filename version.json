@@ -1,6 +1,6 @@
 {
-    "version":  "1.0.23",
-    "message":  "Fire ult before skill spam starves it; keep auto farm in the air across reloads",
+    "version":  "1.0.24",
+    "message":  "Dump ultimate whenever auto farm is on, even if Auto skill is off",
     "files":  [
                   "dungeon-lootr/launch.lua",
                   "dungeon-lootr/DungeonLootr.lua",

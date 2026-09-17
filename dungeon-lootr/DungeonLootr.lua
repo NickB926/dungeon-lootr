@@ -4686,7 +4686,8 @@ local function fireSkill(slot)
 end
 
 local function autoSkillTick()
-	if not on('DLAutoSkill') then
+	local wantUlt = on('DLAutoSkill') or on('DLAutoFarm')
+	if not wantUlt then
 		return
 	end
 	if LocalPlayer:GetAttribute('InNoCombatZone') == true then
@@ -4706,8 +4707,12 @@ local function autoSkillTick()
 		return
 	end
 	-- Ultimate first. Skill 1–4 used to set lastSkillFire every tick and starve G.
-	if type(rt.tryFarmUlt) == 'function' then
+	-- Farm-on also dumps G so it still pops if Auto skill was left off.
+	if wantUlt and type(rt.tryFarmUlt) == 'function' then
 		pcall(rt.tryFarmUlt)
+	end
+	if not on('DLAutoSkill') then
+		return
 	end
 	if os.clock() - lastSkillFire < 0.1 then
 		return
@@ -6318,7 +6323,7 @@ local function holdOnCrystalPack()
 end
 
 rt.tryFarmUlt = function()
-	if not on('DLAutoSkill') then
+	if not on('DLAutoSkill') and not on('DLAutoFarm') then
 		return false
 	end
 	local ultCharge = tonumber(LocalPlayer:GetAttribute('UltimateCharge')) or 0
