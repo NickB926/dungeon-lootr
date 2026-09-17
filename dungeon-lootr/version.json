@@ -1,6 +1,6 @@
 {
-    "version":  "1.0.28",
-    "message":  "Switch owned class slots from the menu without returning to lobby",
+    "version":  "1.0.29",
+    "message":  "HUD DPS meter: rolling 5s plus fight-average outgoing damage",
     "files":  [
                   "dungeon-lootr/launch.lua",
                   "dungeon-lootr/DungeonLootr.lua",

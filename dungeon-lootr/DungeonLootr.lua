@@ -594,6 +594,12 @@ local function statsText()
 	elseif on('DLChestAnywhere') then
 		lines[#lines + 1] = 'auto chest route on'
 	end
+	if Toggles.DLDpsMeter == nil or on('DLDpsMeter') then
+		local dpsLine = rt.dpsLine and rt.dpsLine()
+		if type(dpsLine) == 'string' and dpsLine ~= '' then
+			lines[#lines + 1] = dpsLine
+		end
+	end
 	return table.concat(lines, '\n'), className, dungeon, diff, hp, maxHp, level
 end
 
@@ -891,7 +897,7 @@ hudFrame.BackgroundColor3 = Color3.fromRGB(10, 12, 16)
 hudFrame.BackgroundTransparency = 0.18
 hudFrame.BorderSizePixel = 0
 hudFrame.Position = UDim2.fromOffset(16, 72)
-	hudFrame.Size = UDim2.fromOffset(248, 254)
+	hudFrame.Size = UDim2.fromOffset(248, 272)
 hudFrame.Parent = hudGui
 Instance.new('UICorner', hudFrame).CornerRadius = UDim.new(0, 8)
 local stroke = Instance.new('UIStroke')
@@ -933,6 +939,133 @@ local function refreshHud()
 		('Ground  %s    Mobs  %s'):format(fmtNum(lastGround), fmtNum(lastEnemies)),
 	}, '\n')
 end
+
+-- Outgoing DPS from Player Damage_Dealt / Hit_Count. Rolling 5s plus average
+-- over active fight time (idle gaps are not counted, so walking between packs
+-- does not drag the average down).
+rt.dpsLine = (function()
+	local WINDOW = 5
+	local IDLE = 6
+	local lastTotal = 0
+	local lastHits = 0
+	local lastAt = 0
+	local lastHitAt = 0
+	local fightDmg = 0
+	local fightHits = 0
+	local activeTime = 0
+	local samples = {}
+	local hudAt = 0
+	local primed = false
+
+	local function fmtDps(n)
+		if type(n) ~= 'number' or n ~= n or n < 0 then
+			return '—'
+		end
+		if n >= 1e6 then
+			return string.format('%.1fm', n / 1e6)
+		end
+		if n >= 1000 then
+			return string.format('%.1fk', n / 1000)
+		end
+		if n >= 100 then
+			return tostring(math.floor(n + 0.5))
+		end
+		return string.format('%.1f', n)
+	end
+
+	local function resetFight()
+		samples = {}
+		fightDmg = 0
+		fightHits = 0
+		activeTime = 0
+		lastHitAt = 0
+	end
+
+	local function snapshot()
+		return tonumber(LocalPlayer:GetAttribute('Damage_Dealt')) or lastTotal, tonumber(LocalPlayer:GetAttribute('Hit_Count')) or lastHits
+	end
+
+	local function note(total, hits)
+		total = tonumber(total) or lastTotal
+		hits = tonumber(hits) or lastHits
+		local now = os.clock()
+		if not primed then
+			lastTotal, lastHits, lastAt = total, hits, now
+			primed = true
+			return
+		end
+		if total < lastTotal then
+			resetFight()
+			lastTotal, lastHits, lastAt = total, hits, now
+			return
+		end
+		local delta = total - lastTotal
+		local hitDelta = math.max(0, hits - lastHits)
+		lastTotal, lastHits, lastAt = total, hits, now
+		if delta <= 0 then
+			return
+		end
+		if lastHitAt > 0 and now - lastHitAt < IDLE then
+			activeTime += now - lastHitAt
+		end
+		fightDmg += delta
+		fightHits += hitDelta
+		lastHitAt = now
+		samples[#samples + 1] = { t = now, d = delta }
+		while samples[1] and now - samples[1].t > WINDOW + 1 do
+			table.remove(samples, 1)
+		end
+	end
+
+	local function line()
+		note(snapshot())
+		local now = os.clock()
+		local sum = 0
+		for i = 1, #samples do
+			local s = samples[i]
+			if now - s.t <= WINDOW then
+				sum += s.d
+			end
+		end
+		local live = lastHitAt > 0 and now - lastHitAt <= IDLE
+		local dps = live and (sum / WINDOW) or 0
+		local span = activeTime
+		if live and lastHitAt > 0 then
+			span += math.min(now - lastHitAt, IDLE)
+		end
+		local avg = span >= 0.6 and (fightDmg / span) or 0
+		if dps < 1 and avg < 1 then
+			return nil
+		end
+		if live and dps >= 1 and avg >= 1 then
+			local extra = ''
+			if fightHits > 0 then
+				extra = ('  ·  hit  %s'):format(fmtDps(fightDmg / fightHits))
+			end
+			return ('dps  %s/s  ·  avg  %s/s%s'):format(fmtDps(dps), fmtDps(avg), extra)
+		end
+		if avg >= 1 then
+			return ('avg  %s/s'):format(fmtDps(avg))
+		end
+		return ('dps  %s/s'):format(fmtDps(dps))
+	end
+
+	note(snapshot())
+	track(LocalPlayer:GetAttributeChangedSignal('Damage_Dealt'):Connect(function()
+		note(snapshot())
+		local now = os.clock()
+		if now - hudAt < 0.12 then
+			return
+		end
+		hudAt = now
+		pcall(refreshHud)
+	end))
+	track(LocalPlayer:GetAttributeChangedSignal('Hit_Count'):Connect(function()
+		note(snapshot())
+	end))
+
+	return line
+end)()
 
 local function applyFullbright(v)
 	if v then
@@ -12003,6 +12136,13 @@ RunBox:AddToggle('DLEspEnemies', {
 	Library:Notify(v and 'Enemy tracers on' or 'Enemy tracers off')
 end)
 HudBox:AddToggle('DLShowHud', { Text = 'Overlay HUD', Default = true })
+HudBox:AddToggle('DLDpsMeter', {
+	Text = 'DPS meter',
+	Default = true,
+	Tooltip = 'Rolling 5s outgoing DPS plus fight average from Damage_Dealt. Average ignores idle gaps between packs.',
+}):OnChanged(function()
+	pcall(refreshHud)
+end)
 HudBox:AddLabel('Home = menu   ·   HUD stays up while the window is hidden')
 
 local CombatBox = RunTab:AddRightGroupbox('Combat')
