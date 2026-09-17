@@ -2245,7 +2245,25 @@ local function inEndlessFarm()
 			or rt.runDifficulty
 			or ''
 	)
-	return d == 'Endless'
+	if string.lower(d):find('endless', 1, true) then
+		return true
+	end
+	-- Some Endless floors leave CurrentDifficultyMode nil. The HUD container is
+	-- the same signal the game uses for Depth / Enemies Left.
+	local now = os.clock()
+	if rt.endlessHudAt and now - rt.endlessHudAt < 1.25 then
+		return rt.endlessHud == true
+	end
+	rt.endlessHudAt = now
+	rt.endlessHud = false
+	local pg = LocalPlayer:FindFirstChild('PlayerGui')
+	local main = pg and pg:FindFirstChild('Main')
+	local hud = main and main:FindFirstChild('HUD')
+	local cont = hud and hud:FindFirstChild('Endless_Container')
+	if cont and cont:IsA('GuiObject') and cont.Visible == true then
+		rt.endlessHud = true
+	end
+	return rt.endlessHud == true
 end
 
 local function lootClearedRoom(roomIdx, dungeon)
@@ -4736,16 +4754,18 @@ local function bossRushNpcFolder()
 end
 
 local function inBossRushFarm()
-	local f = bossRushNpcFolder()
-	if f and #f:GetChildren() > 0 then
-		rt.bossRushUntil = os.clock() + 45
-		return true
-	end
-	if (rt.bossRushUntil or 0) > os.clock() then
-		return true
+	-- Folder leftovers (corpses, spawners) used to keep this true after leaving
+	-- rush, so Endless stood still at Next Area instead of walking rooms.
+	if inEndlessFarm() then
+		return false
 	end
 	local d = string.lower(tostring(LocalPlayer:GetAttribute('CurrentDungeon') or ''))
-	return d:find('rush', 1, true) ~= nil
+	if d == '' then
+		return false
+	end
+	return d:find('bossrush', 1, true) ~= nil
+		or d:find('boss_rush', 1, true) ~= nil
+		or d:find('boss rush', 1, true) ~= nil
 end
 
 local function inDungeonFarm()
@@ -5919,6 +5939,58 @@ local NextArea = (function()
 				end
 			end
 		end
+		-- Courtyard / "Next Area" arches often sit on the Generated_ root, not
+		-- inside Room_N.Connectors. Only walk those siblings when connectors
+		-- did not already find a nearby pad.
+		if dungeon and (not bestPos or bestDist > 70) then
+			for _, child in ipairs(dungeon:GetChildren()) do
+				local n = tostring(child.Name)
+				if not n:match('^Room_') then
+					local ln = n:lower()
+					local gateLike = ln:find('next', 1, true)
+						or ln:find('gate', 1, true)
+						or ln:find('exit', 1, true)
+						or ln:find('continue', 1, true)
+						or ln:find('portal', 1, true)
+						or ln:find('door', 1, true)
+						or ln:find('area', 1, true)
+					if gateLike or child:FindFirstChildWhichIsA('ProximityPrompt')
+						or child:FindFirstChildWhichIsA('BillboardGui')
+					then
+						for _, d in ipairs(child:GetDescendants()) do
+							considerPrompt(d)
+							considerText(d)
+							considerContinue(d)
+						end
+					end
+				end
+			end
+		end
+		-- Billboard on the arch the player is standing under (90-stud radius).
+		if not bestPos or bestDist > 40 then
+			local okParts, parts = pcall(function()
+				return workspace:GetPartBoundsInRadius(fromPos, 90)
+			end)
+			if okParts and type(parts) == 'table' then
+				local n = math.min(#parts, 80)
+				for i = 1, n do
+					local part = parts[i]
+					if part then
+						for _, ch in ipairs(part:GetChildren()) do
+							considerPrompt(ch)
+							considerText(ch)
+							considerContinue(ch)
+							if ch:IsA('BillboardGui') or ch:IsA('SurfaceGui') then
+								for _, t in ipairs(ch:GetDescendants()) do
+									considerText(t)
+									considerPrompt(t)
+								end
+							end
+						end
+					end
+				end
+			end
+		end
 		rt.gateAt = now
 		rt.gateFrom = fromPos
 		rt.gatePos = bestPos
@@ -6089,10 +6161,14 @@ local function eachFarmNpc(fn)
 			end
 		end
 	end
-	local rush = bossRushNpcFolder()
-	if rush then
-		for _, npc in ipairs(rush:GetChildren()) do
-			take(npc)
+	-- Only while CurrentDungeon is actually Boss Rush. Leftover folder children
+	-- in Endless / raids used to steal the target and freeze room walking.
+	if inBossRushFarm() then
+		local rush = bossRushNpcFolder()
+		if rush then
+			for _, npc in ipairs(rush:GetChildren()) do
+				take(npc)
+			end
 		end
 	end
 end
@@ -7368,7 +7444,8 @@ local function farmLoop()
 				Pin.at(rt.aoeGoal, true)
 			end
 			local target = pickFarmTarget()
-			if inBossRushFarm() and not target then
+			-- Wait only in a real rush arena (no Generated_ rooms to walk).
+			if inBossRushFarm() and not target and not activeDungeonRoot() then
 				farmLabel = 'boss rush · waiting'
 				task.wait(0.25)
 			elseif target then

@@ -1,6 +1,6 @@
 {
-    "version":  "1.0.18",
-    "message":  "Fix notifications toggle so the menu still loads",
+    "version":  "1.0.19",
+    "message":  "Stop auto farm freezing in Endless when BossRush leftovers are still in workspace",
     "files":  [
                   "dungeon-lootr/launch.lua",
                   "dungeon-lootr/DungeonLootr.lua",
