@@ -1,6 +1,6 @@
 {
-    "version":  "1.0.22",
-    "message":  "Pop ultimate as soon as it is charged instead of waiting for a boss",
+    "version":  "1.0.23",
+    "message":  "Fire ult before skill spam starves it; keep auto farm in the air across reloads",
     "files":  [
                   "dungeon-lootr/launch.lua",
                   "dungeon-lootr/DungeonLootr.lua",

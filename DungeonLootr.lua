@@ -21,6 +21,7 @@ end
 if type(getgenv().DLLootHudUnload) == 'function' then
 	pcall(getgenv().DLLootHudUnload)
 end
+local resumeFarm = getgenv().DLResumeFarm == true
 
 -- Reloading while a loop or a position hold was mid-flight used to orphan it: the old
 -- thread keeps running, the new instance has no handle on it, and the character ends
@@ -50,8 +51,9 @@ if type(getgenv().DLConns) == 'table' then
 end
 getgenv().DLConns = {}
 
--- Drop a position hold left behind by a previous instance.
-if getgenv().DLPinConn then
+-- Drop a position hold left behind by a previous instance — unless this is a
+-- farm reload, where yanking the pin + collision is what dumps you on the floor.
+if getgenv().DLPinConn and not resumeFarm then
 	pcall(function()
 		getgenv().DLPinConn:Disconnect()
 	end)
@@ -1335,6 +1337,10 @@ local Pin = (function()
 
 	local function step()
 		if not currentInstance() then
+			-- Reload handoff: keep the last station until the new copy binds.
+			if getgenv().DLResumeFarm then
+				return
+			end
 			api.stop()
 			return
 		end
@@ -1360,6 +1366,9 @@ local Pin = (function()
 		end
 		pcall(function()
 			local here = myRoot.Position
+			if os.clock() < (rt.ultLockUntil or 0) then
+				return
+			end
 			local drift = (here - goal).Magnitude
 			local dodging = os.clock() < (rt.aoeUntil or 0)
 			local tight = snapExact or dodging
@@ -4651,7 +4660,14 @@ local function fireSkill(slot)
 	local hold = false
 	if type(slot) == 'number' then
 		hold = LocalPlayer:GetAttribute('Skill' .. slot .. '_HasHold') == true
+	elseif type(slot) == 'string' then
+		hold = LocalPlayer:GetAttribute('Skill' .. slot .. '_HasHold') == true
 	end
+	-- Bare FireServer(slot) first: extra boolean args are ignored by 1–4 but
+	-- used to make Ultimate (E / G) no-op.
+	pcall(function()
+		rem:FireServer(slot)
+	end)
 	local ok = pcall(function()
 		rem:FireServer(slot, true)
 	end)
@@ -4686,15 +4702,17 @@ local function autoSkillTick()
 	if not hum or hum.Health <= 0 then
 		return
 	end
+	if rt.refillBusy or rt.refillUrgent then
+		return
+	end
+	-- Ultimate first. Skill 1–4 used to set lastSkillFire every tick and starve G.
+	if type(rt.tryFarmUlt) == 'function' then
+		pcall(rt.tryFarmUlt)
+	end
 	if os.clock() - lastSkillFire < 0.1 then
 		return
 	end
-	if routeBusy or rt.refillBusy or rt.refillUrgent then
-		return
-	end
-	-- Ultimate (G) pops as soon as it is charged — do not hold it for a
-	-- boss / nearby pack. Regular skills still need a live target below.
-	if type(rt.tryFarmUlt) == 'function' and rt.tryFarmUlt() then
+	if routeBusy then
 		return
 	end
 	-- Only while standing on a live target. farmBusy stays true during chest
@@ -6311,7 +6329,7 @@ rt.tryFarmUlt = function()
 			or ultCharge >= ultMax
 			or (ultMax > 0 and ultCharge / ultMax >= 0.95)
 		)
-	if not ultReady or os.clock() - (rt.lastUltFire or 0) <= 1.2 then
+	if not ultReady or os.clock() - (rt.lastUltFire or 0) <= 0.4 then
 		return false
 	end
 	local crystals = listRaidCrystals()
@@ -6329,9 +6347,29 @@ rt.tryFarmUlt = function()
 		return false
 	end
 	rt.lastUltFire = os.clock()
-	lastSkillFire = os.clock()
+	rt.ultLockUntil = os.clock() + 0.4
 	pcall(fireSkill, 'E')
+	pcall(fireSkill, 'G')
 	pcall(fireSkill, 'Ultimate')
+	pcall(function()
+		local vim = game:GetService('VirtualInputManager')
+		vim:SendKeyEvent(true, Enum.KeyCode.G, false, game)
+		task.delay(0.08, function()
+			pcall(function()
+				vim:SendKeyEvent(false, Enum.KeyCode.G, false, game)
+			end)
+		end)
+	end)
+	pcall(function()
+		if type(keypress) == 'function' then
+			keypress(0x47)
+			task.delay(0.08, function()
+				if type(keyrelease) == 'function' then
+					keyrelease(0x47)
+				end
+			end)
+		end
+	end)
 	pcall(function()
 		local pg = LocalPlayer:FindFirstChild('PlayerGui')
 		local ult = pg
@@ -6341,9 +6379,10 @@ rt.tryFarmUlt = function()
 			and pg.Main.HUD.Actions:FindFirstChild('Bottom')
 			and pg.Main.HUD.Actions.Bottom:FindFirstChild('Bars')
 			and pg.Main.HUD.Actions.Bottom.Bars:FindFirstChild('Ultimate')
-		local btn = ult and ult:FindFirstChild('MobileInput', true)
+		local btn = ult and (ult:FindFirstChild('MobileInput', true) or ult:FindFirstChildWhichIsA('GuiButton', true))
 		if btn and type(firesignal) == 'function' then
-			firesignal(btn.MouseButton1Click)
+			pcall(firesignal, btn.MouseButton1Click)
+			pcall(firesignal, btn.Activated)
 		end
 	end)
 	return true
@@ -7651,6 +7690,11 @@ local function farmLoop()
 	end
 	farmBusy = false
 	farmLabel = nil
+	-- Reload stole this copy's epoch so the new farm can take over. Do not
+	-- drop noclip / pin / Return-on-stop or the character lands on the floor.
+	if not currentInstance() or getgenv().DLResumeFarm then
+		return
+	end
 	-- Release the pin only after farmBusy is false (stop() stations while farming).
 	Pin.stop()
 	pcall(function()
@@ -12489,6 +12533,20 @@ buildMenu()
 -- hook before load so the snapshot of defaults is taken untouched
 Config.hook()
 Config.load()
+pcall(function()
+	local resume = getgenv().DLResumeFarm == true or on('DLAutoFarm')
+	if resume then
+		if Toggles.DLAutoFarm and Toggles.DLAutoFarm.Value ~= true then
+			Toggles.DLAutoFarm:SetValue(true)
+		end
+		noclipOn = true
+		pcall(setCharNoclip, true)
+		pcall(RunLoops.startFarm)
+	end
+	task.defer(function()
+		getgenv().DLResumeFarm = nil
+	end)
+end)
 pcall(rt.applyOcclusion, on('DLInvisicam'))
 -- Library hide stays on even if an old profile saved DLNoPause=false.
 pcall(function()
@@ -12656,6 +12714,8 @@ hbEspConn = track(RunService.Heartbeat:Connect(function(dt)
 end))
 
 getgenv().DLUnload = function()
+	local resumeFarm = on('DLAutoFarm') == true
+	getgenv().DLResumeFarm = resumeFarm
 	pcall(Config.finish)
 	pcall(applyFullbright, false)
 	pcall(rt.applyOcclusion, false)
@@ -12663,23 +12723,32 @@ getgenv().DLUnload = function()
 	clearEnemyWatches()
 	rt.parryArmed = 0
 	rt.parryDelay = 0
+	-- Steal the epoch before touching the farm toggle. Turning the toggle off
+	-- used to run farmLoop cleanup (noclip off + Return-on-stop) and then save
+	-- farm as off, so a reload dumped you on the floor with auto farm dead.
+	if currentInstance() then
+		getgenv().DLEpoch = nil
+	end
 	pcall(function()
-		-- Drop the toggle first so the farm loop's farmActive() check exits it.
-		if Toggles.DLAutoFarm then
+		if not resumeFarm and Toggles.DLAutoFarm then
 			Toggles.DLAutoFarm:SetValue(false)
 		end
 	end)
-	pcall(Pin.stop)
+	if not resumeFarm then
+		pcall(Pin.stop)
+	end
 	-- Leave Ataraxia's pause hide armed (same as Anti-AFK). Stopping it here
 	-- is why the banner came back on every helper reload.
 	routeBusy = false
 	routeLabel = nil
-	farmBusy = false
-	farmLabel = nil
-	farmThread = nil
-	rt.potionBusy = false
-	noclipOn = false
-	pcall(setCharNoclip, false)
+	if not resumeFarm then
+		farmBusy = false
+		farmLabel = nil
+		farmThread = nil
+		rt.potionBusy = false
+		noclipOn = false
+		pcall(setCharNoclip, false)
+	end
 	pcall(function()
 		RunService:UnbindFromRenderStep(WALK_BIND)
 	end)
