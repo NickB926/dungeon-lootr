@@ -1,5 +1,5 @@
 {
-    "version":  "1.0.35",
+    "version":  "1.0.36",
     "message":  "Separate Open locked gates toggle; move auto collect chests out of ESP; skip locked-room chests when gates are off",
     "files":  [
                   "dungeon-lootr/launch.lua",
