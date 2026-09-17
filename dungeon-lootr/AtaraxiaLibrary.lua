@@ -130,7 +130,7 @@ end
 function Library:PlayTabAnimation() end
 
 function Library:Notify(text, duration)
-	if NotifyPref.isOn() ~= true then
+	if type(self.IsNotifyEnabled) == 'function' and self:IsNotifyEnabled() ~= true then
 		return
 	end
 	duration = tonumber(duration) or 5
