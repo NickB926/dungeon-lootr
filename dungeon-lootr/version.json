@@ -1,6 +1,6 @@
 {
-    "version":  "1.0.30",
-    "message":  "Fix class switcher: queue in dungeon, swap on lobby, honor SwitchSlot Success",
+    "version":  "1.0.31",
+    "message":  "Persist Overlay HUD off across reloads; do not flash it on load",
     "files":  [
                   "dungeon-lootr/launch.lua",
                   "dungeon-lootr/DungeonLootr.lua",

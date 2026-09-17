@@ -896,6 +896,7 @@ hudGui.DisplayOrder = 99990
 if type(protectgui) == 'function' then
 	pcall(protectgui, hudGui)
 end
+hudGui.Enabled = false
 hudGui.Parent = pg
 local hudFrame = Instance.new('Frame')
 hudFrame.BackgroundColor3 = Color3.fromRGB(10, 12, 16)
@@ -933,8 +934,8 @@ hudBody.Parent = hudFrame
 
 local function refreshHud()
 	local show = on('DLShowHud')
-	hudGui.Enabled = show ~= false
-	if show == false then
+	hudGui.Enabled = show == true
+	if not show then
 		return
 	end
 	local core = select(1, statsText())
@@ -12199,7 +12200,13 @@ RunBox:AddToggle('DLEspEnemies', {
 	end
 	Library:Notify(v and 'Enemy tracers on' or 'Enemy tracers off')
 end)
-HudBox:AddToggle('DLShowHud', { Text = 'Overlay HUD', Default = true })
+HudBox:AddToggle('DLShowHud', {
+	Text = 'Overlay HUD',
+	Default = true,
+	Tooltip = 'Saved with the rest of the profile. Off stays off across reloads.',
+}):OnChanged(function()
+	pcall(refreshHud)
+end)
 HudBox:AddToggle('DLDpsMeter', {
 	Text = 'DPS meter',
 	Default = true,
@@ -13021,6 +13028,7 @@ buildMenu()
 -- hook before load so the snapshot of defaults is taken untouched
 Config.hook()
 Config.load()
+pcall(refreshHud)
 task.spawn(function()
 	pcall(RunLoops.refreshClassSlots)
 end)
