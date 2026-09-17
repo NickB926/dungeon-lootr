@@ -9349,30 +9349,52 @@ local Replay = (function()
 		return false
 	end
 
-	local function clickReplayButton()
+	local function guiChainVisible(inst)
+		local n = inst
+		while n and n ~= game do
+			if n:IsA('GuiObject') and n.Visible == false then
+				return false
+			end
+			if n:IsA('CanvasGroup') and (tonumber(n.GroupTransparency) or 0) >= 0.9 then
+				return false
+			end
+			n = n.Parent
+		end
+		return inst ~= nil
+	end
+
+	local function findReplayButton()
+		local pg = LocalPlayer:FindFirstChild('PlayerGui')
+		local main = pg and pg:FindFirstChild('Main')
+		local hud = main and main:FindFirstChild('HUD')
+		if not hud then
+			return nil
+		end
+		local best
+		local function consider(btn)
+			if not btn or not btn:IsA('GuiButton') or not guiChainVisible(btn) then
+				return
+			end
+			best = best or btn
+		end
+		consider(hud:FindFirstChild('ReplayButton', true))
 		local frame = completionFrame()
-		local btn = frame and frame:FindFirstChild('ReplayButton', true)
-		if not btn or not btn:IsA('GuiButton') then
-			return false
-		end
-		if type(firesignal) == 'function' then
-			local ok = pcall(firesignal, btn.MouseButton1Click)
-			if ok then
-				return true
+		consider(frame and frame:FindFirstChild('ReplayButton', true))
+		for _, d in ipairs(hud:GetDescendants()) do
+			if d:IsA('GuiButton') then
+				local n = string.lower(d.Name)
+				local lab = d:FindFirstChildWhichIsA('TextLabel', true)
+				local tx = string.lower(tostring(lab and lab.Text or ''))
+				if n:find('replay', 1, true) or tx:find('replay', 1, true) then
+					consider(d)
+				end
 			end
 		end
-		local ok, conns = pcall(getconnections, btn.MouseButton1Click)
-		if not ok then
-			return false
-		end
-		local fired = false
-		for _, c in ipairs(conns) do
-			if c.Function then
-				task.spawn(c.Function)
-				fired = true
-			end
-		end
-		return fired
+		return best
+	end
+
+	local function rushReplayShowing()
+		return findReplayButton() ~= nil
 	end
 
 	local function clickBtn(btn)
@@ -9393,6 +9415,10 @@ local Replay = (function()
 			end
 		end
 		return false
+	end
+
+	local function clickReplayButton()
+		return clickBtn(findReplayButton())
 	end
 
 	local function hudWarning()
@@ -9539,7 +9565,7 @@ local Replay = (function()
 			end
 		end
 		if inRushNow() then
-			if continueWarningShowing() and clickContinueWarning() then
+			if clickReplayButton() then
 				return true
 			end
 			local rushRf = RunLoops.knitRF('BossRushService', 'RequestReplay')
@@ -9550,9 +9576,6 @@ local Replay = (function()
 				if okRush and resRush ~= false then
 					return true
 				end
-			end
-			if clickReplayButton() then
-				return true
 			end
 		end
 		local rf = RunLoops.knitRF('DungeonRunService', 'RequestReplay')
@@ -9594,19 +9617,16 @@ local Replay = (function()
 			replayArmedAt = nil
 			return
 		end
-		-- Endless floor / Boss Rush wave 100: HUD.Warning Confirm, not Completion_Info.
-		if continueWarningShowing() and (loopingEndless() or inRushNow() or wantReplay) then
+		-- Boss Rush: red REPLAY on Completion_Info (Mythic), not green Warning Confirm.
+		if inRushNow() and rushReplayShowing() then
 			local now = os.clock()
 			if now - lastReplayAt < 1.2 then
 				return
 			end
 			lastReplayAt = now
 			task.spawn(function()
-				local ok = clickContinueWarning()
-				if not ok and loopingEndless() then
-					ok = continueEndless()
-				end
-				if not ok and inRushNow() then
+				local ok = clickReplayButton()
+				if not ok then
 					local rf = RunLoops.knitRF('BossRushService', 'RequestReplay')
 					if rf then
 						local okRf, resRf = pcall(function()
@@ -9614,12 +9634,23 @@ local Replay = (function()
 						end)
 						ok = okRf and resRf ~= false
 					end
-					if not ok then
-						ok = clickReplayButton()
-					end
 				end
 				if ok then
-					Library:Notify(inRushNow() and 'Boss rush continue' or 'Endless continue')
+					Library:Notify('Boss rush replay')
+				end
+			end)
+			return
+		end
+		-- Endless floor checkpoint: HUD.Warning green Confirm.
+		if loopingEndless() and continueWarningShowing() then
+			local now = os.clock()
+			if now - lastReplayAt < 1.2 then
+				return
+			end
+			lastReplayAt = now
+			task.spawn(function()
+				if continueEndless() then
+					Library:Notify('Endless continue')
 				end
 			end)
 			return

@@ -1,6 +1,6 @@
 {
-    "version":  "1.0.26",
-    "message":  "Press Boss Rush wave 100 continue confirm like Endless",
+    "version":  "1.0.27",
+    "message":  "Click the red Boss Rush REPLAY button instead of green Confirm",
     "files":  [
                   "dungeon-lootr/launch.lua",
                   "dungeon-lootr/DungeonLootr.lua",
