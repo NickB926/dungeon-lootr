@@ -1,6 +1,6 @@
 {
-    "version":  "1.0.8",
-    "message":  "Auto parry: press F when the red letter appears over the boss",
+    "version":  "1.0.9",
+    "message":  "Auto parry: ignore dash F, second press only on a new swing after cooldown refunds",
     "files":  [
                   "dungeon-lootr/launch.lua",
                   "dungeon-lootr/DungeonLootr.lua",

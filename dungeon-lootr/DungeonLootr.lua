@@ -164,6 +164,8 @@ local rt = {
 	learnedUntil = 0,
 	fCueUntil = 0,
 	fFollowDodgeAt = 0,
+	fParriedAt = 0,
+	fOnAt = 0,
 	dodgeFire = 0,
 	muteVfx = 0,
 	noclip = 0,
@@ -2584,6 +2586,13 @@ function rt.fCueLit(npc)
 	return pn ~= nil and pn:GetAttribute('Fire') == true
 end
 
+-- DashIFrameUntil is game time() of when the dash i-frame ends. A dash is not
+-- an attack; Broken Reality still lights the red F during it.
+function rt.npcDashing(npc)
+	local untilT = tonumber(npc and npc:GetAttribute('DashIFrameUntil'))
+	return untilT ~= nil and untilT > time()
+end
+
 local function armParry(delay, mode, why, learned, forced)
 	delay = tonumber(delay) or 0
 	local now = os.clock()
@@ -3843,15 +3852,21 @@ local function watchEnemy(npc)
 				if not enemyInRange(npc) then
 					return
 				end
+				rt.fOnAt = os.clock()
+				if rt.npcDashing(npc) then
+					rt.pdbg('skip F — %s is dashing', npc.Name)
+					return
+				end
 				if npc:GetAttribute('Unblockable') == true then
 					rt.dodgeOnlyUntil = math.max(rt.dodgeOnlyUntil or 0, os.clock() + 0.9)
+					return
 				end
 				armParry(0, 'boss-hit', npc.Name .. '/F', false, true)
 			elseif lastFire == true then
-				-- F hid. Broken Reality's follow-up lands ~0.8s later and cannot
-				-- be parried; a successful dodge refunds, so spend Q on it.
+				-- F hid. Only dodge the follow-up if this letter was a real swing
+				-- we parried, not a dash that also painted F.
 				local now = os.clock()
-				if now - (rt.parryFire or 0) < 2.2 then
+				if now - (rt.fParriedAt or 0) < 2.2 and now - (rt.fOnAt or 0) < 2.5 then
 					rt.fFollowDodgeAt = now + 0.35
 				end
 			end
@@ -4000,9 +4015,17 @@ local function watchEnemy(npc)
 				-- Unblockable swings cannot be parried; leave the window to the dash.
 				rt.dodgeOnlyUntil = math.max(rt.dodgeOnlyUntil or 0, now + 0.9)
 			end
-			-- The red F is the parry window on these mobs. CanAttack is only a
-			-- 0.12s pulse that happens well before the F appears.
+			-- Same red F can cover a second swing after the parry cooldown refunds.
+			-- Only arm off a fresh CanAttack pulse while F is still up — re-arming
+			-- the instant CD came back was the extra tap after a good parry.
 			if rt.parryNotif(npc) then
+				if v == true and prev ~= true
+					and rt.fCueLit(npc)
+					and not rt.npcDashing(npc)
+					and parryReady()
+				then
+					armParry(0, 'boss-hit', npc.Name .. '/F-can', false, true)
+				end
 				return
 			end
 			if v == true and prev ~= true then
@@ -4396,27 +4419,28 @@ local function autoParryTick()
 		return
 	end
 	local char = character()
+	-- An Unblockable swing ignores parry entirely, so hand that window to the dash.
+	-- SkillIFrame is auto-skill immunity and sits up for half the fight; it used
+	-- to eat a ready F the moment cooldown refunded. Real i-frames / an active
+	-- parry window still skip.
 	if char and (
-		char:GetAttribute('iFrame') == true
-		or char:GetAttribute('SkillIFrame') == true
+		char:GetAttribute('Parry') == true
+		or char:GetAttribute('iFrame') == true
 		or char:GetAttribute('HitIFrame') == true
-		or char:GetAttribute('Parry') == true
 		or LocalPlayer:GetAttribute('iFrame') == true
 	) then
-		-- Already immune, so spending F here is wasted. Keep the arm alive instead
-		-- of returning into an expiry: auto skill holds SkillIFrame for ~half the
-		-- fight, and the window used to lapse behind it, which is why real swings
-		-- went unparried. Capped off the cue so a stale arm cannot fire at nothing.
 		local cap = (rt.parryDelay or now) + 0.45
-		if now < cap then
+		if rt.parryCue ~= 'F' and now < cap then
 			rt.parryArmed = math.max(rt.parryArmed, math.min(now + 0.1, cap))
 		end
 		return
 	end
-	-- An Unblockable swing ignores parry entirely, so hand that window to the dash.
 	if wantParry and parryReady() and now >= (rt.dodgeOnlyUntil or 0) then
 		rt.pdbg('FIRE cue=%s cueAge=%.2fs armLeft=%.2fs', tostring(rt.parryCue), now - (rt.parryDelay or now), (rt.parryArmed or now) - now)
 		rt.parryFire = now
+		if rt.parryCue == 'F' then
+			rt.fParriedAt = now
+		end
 		pcall(parryRemote)
 		spendWindow()
 		return
