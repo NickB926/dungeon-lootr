@@ -1,6 +1,6 @@
 {
-    "version":  "1.0.9",
-    "message":  "Auto parry: ignore dash F, second press only on a new swing after cooldown refunds",
+    "version":  "1.0.10",
+    "message":  "Auto parry: dash skip was stuck on, F only ignores dashes with no CanAttack pulse",
     "files":  [
                   "dungeon-lootr/launch.lua",
                   "dungeon-lootr/DungeonLootr.lua",

@@ -2586,11 +2586,13 @@ function rt.fCueLit(npc)
 	return pn ~= nil and pn:GetAttribute('Fire') == true
 end
 
--- DashIFrameUntil is game time() of when the dash i-frame ends. A dash is not
--- an attack; Broken Reality still lights the red F during it.
-function rt.npcDashing(npc)
-	local untilT = tonumber(npc and npc:GetAttribute('DashIFrameUntil'))
-	return untilT ~= nil and untilT > time()
+-- Real swings pulse CanAttack ~0.25s before the red F. Dashes light F too but
+-- never pulse CanAttack. DashIFrameUntil stays minutes in the future after a
+-- dash, so treating "until > time()" as dashing made every F look like a dash
+-- and parry stopped entirely.
+function rt.recentCanAttack(npc, window)
+	local t = rt.canRise[npc]
+	return type(t) == 'number' and (os.clock() - t) <= (window or 0.55)
 end
 
 local function armParry(delay, mode, why, learned, forced)
@@ -3853,8 +3855,9 @@ local function watchEnemy(npc)
 					return
 				end
 				rt.fOnAt = os.clock()
-				if rt.npcDashing(npc) then
-					rt.pdbg('skip F — %s is dashing', npc.Name)
+				-- Dash F has no recent CanAttack pulse. Attack F does.
+				if not rt.recentCanAttack(npc, 0.6) then
+					rt.pdbg('skip F — %s no CanAttack pulse (dash)', npc.Name)
 					return
 				end
 				if npc:GetAttribute('Unblockable') == true then
@@ -4019,12 +4022,11 @@ local function watchEnemy(npc)
 			-- Only arm off a fresh CanAttack pulse while F is still up — re-arming
 			-- the instant CD came back was the extra tap after a good parry.
 			if rt.parryNotif(npc) then
-				if v == true and prev ~= true
-					and rt.fCueLit(npc)
-					and not rt.npcDashing(npc)
-					and parryReady()
-				then
-					armParry(0, 'boss-hit', npc.Name .. '/F-can', false, true)
+				if v == true and prev ~= true then
+					rt.noteCanRise(npc)
+					if rt.fCueLit(npc) and parryReady() then
+						armParry(0, 'boss-hit', npc.Name .. '/F-can', false, true)
+					end
 				end
 				return
 			end
