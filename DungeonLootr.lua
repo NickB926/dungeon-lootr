@@ -193,6 +193,7 @@ local rt = {
 	softlockAt = 0,
 	softlockN = 0,
 	chestSkip = {},
+	classQueue = tonumber(getgenv().DLClassQueue),
 }
 local enemyWatches = {}
 local enemyCache = {}
@@ -599,6 +600,10 @@ local function statsText()
 		if type(dpsLine) == 'string' and dpsLine ~= '' then
 			lines[#lines + 1] = dpsLine
 		end
+	end
+	if rt.classQueue then
+		local qn = rt.classSlotData and rt.classSlotData.Slots and rt.classSlotData.Slots[rt.classQueue]
+		lines[#lines + 1] = 'class  queued  ' .. tostring(qn or ('slot ' .. tostring(rt.classQueue)))
 	end
 	return table.concat(lines, '\n'), className, dungeon, diff, hp, maxHp, level
 end
@@ -8092,17 +8097,19 @@ local function refreshClassSlots()
 		pcall(function()
 			drop:SetValues(#labels > 0 and labels or { '(no slots)' })
 			local current
-			local active = data and tonumber(data.ActiveIndex)
-			if active and type(map) == 'table' then
+			local prefer = tonumber(rt.classQueue) or (data and tonumber(data.ActiveIndex))
+			if prefer and type(map) == 'table' then
 				for label, idx in pairs(map) do
-					if idx == active and type(label) == 'string' and label:find(' · ', 1, true) then
+					if idx == prefer and type(label) == 'string' and label:find(' · ', 1, true) then
 						current = label
 						break
 					end
 				end
 			end
 			if current and type(drop.SetValue) == 'function' then
+				rt.classSlotQuiet = true
 				drop:SetValue(current)
+				rt.classSlotQuiet = false
 			end
 		end)
 	end
@@ -8124,7 +8131,31 @@ local function parseClassSlot(value)
 	return n
 end
 
-local function switchClassSlot(idx)
+local function inDungeonRun()
+	return LocalPlayer:GetAttribute('InDungeon') == true or LocalPlayer:GetAttribute('DungeonRun') == true
+end
+
+local function parseSlotResult(res)
+	if type(res) == 'table' then
+		if res.Success == true then
+			return true, res.ClassName
+		end
+		return false, res.Error or res.Reason or res.Message or 'refused'
+	end
+	if res == false or res == nil then
+		return false, 'refused'
+	end
+	return true, nil
+end
+
+local function queueClassSlot(idx, name)
+	rt.classQueue = idx
+	getgenv().DLClassQueue = idx
+	pcall(refreshHud)
+	return true, 'Queued ' .. tostring(name or ('slot ' .. idx)) .. ' — swaps in lobby'
+end
+
+local function switchClassSlot(idx, fromFlush)
 	idx = tonumber(idx)
 	if not idx then
 		return false, 'Pick a class slot first'
@@ -8135,37 +8166,63 @@ local function switchClassSlot(idx)
 	end
 	local data = getSlotData()
 	local name = data and data.Slots and data.Slots[idx]
+	if type(name) ~= 'string' or name == '' then
+		return false, 'No class in slot ' .. tostring(idx)
+	end
 	if data and tonumber(data.ActiveIndex) == idx then
-		return true, 'Already on ' .. tostring(name or ('slot ' .. idx))
+		rt.classQueue = nil
+		getgenv().DLClassQueue = nil
+		pcall(refreshHud)
+		return true, 'Already on ' .. name
 	end
 	local ok, res = pcall(function()
 		return rf:InvokeServer(idx)
 	end)
 	if not ok then
-		ok, res = pcall(function()
-			return rf:InvokeServer(idx, true)
-		end)
-	end
-	if not ok and type(name) == 'string' then
-		ok, res = pcall(function()
-			return rf:InvokeServer(name)
-		end)
-	end
-	if not ok then
 		return false, tostring(res)
 	end
-	if res == false then
-		return false, 'Server refused (class may be locked to lobby)'
+	local good, got = parseSlotResult(res)
+	if good then
+		rt.classQueue = nil
+		getgenv().DLClassQueue = nil
+		task.delay(0.35, function()
+			pcall(refreshClassSlots)
+			pcall(refreshHud)
+		end)
+		return true, 'Switched to ' .. tostring(got or name)
 	end
-	task.delay(0.35, function()
-		pcall(refreshClassSlots)
-	end)
-	return true, 'Switched to ' .. tostring(name or ('slot ' .. idx))
+	if not fromFlush and inDungeonRun() then
+		return queueClassSlot(idx, name)
+	end
+	return false, 'Switch refused' .. ((got and got ~= 'refused') and (': ' .. tostring(got)) or ' (need lobby)')
 end
 
 local function switchSelectedClass()
 	local v = Options.DLClassSlot and Options.DLClassSlot.Value
 	return switchClassSlot(parseClassSlot(v))
+end
+
+local function flushClassQueue()
+	local idx = tonumber(rt.classQueue or getgenv().DLClassQueue)
+	if not idx then
+		return false
+	end
+	if inDungeonRun() then
+		return false
+	end
+	if rt.classSwitching then
+		return true
+	end
+	rt.classSwitching = true
+	local ok, msg = switchClassSlot(idx, true)
+	rt.classSwitching = false
+	if ok then
+		Library:Notify(tostring(msg))
+		pcall(refreshHud)
+		return true
+	end
+	Library:Notify('Class switch: ' .. tostring(msg or 'failed'))
+	return false
 end
 
 local function findRollRemote()
@@ -8630,6 +8687,7 @@ return {
 	refreshClassSlots = refreshClassSlots,
 	switchClassSlot = switchClassSlot,
 	switchSelectedClass = switchSelectedClass,
+	flushClassQueue = flushClassQueue,
 	redeemAllCodes = redeemAllCodes,
 	knitRF = knitRF,
 	findRollRemote = findRollRemote,
@@ -10493,6 +10551,12 @@ local DungeonStart = (function()
 		if os.clock() - lastStart < cool then
 			return
 		end
+		if tonumber(rt.classQueue or getgenv().DLClassQueue) then
+			pcall(RunLoops.flushClassQueue)
+			if tonumber(rt.classQueue or getgenv().DLClassQueue) then
+				return
+			end
+		end
 		if armedAt == 0 then
 			armedAt = os.clock()
 			return
@@ -12322,8 +12386,17 @@ local classSlotDrop = ClassBox:AddDropdown('DLClassSlot', {
 	Text = 'Owned slot',
 	Values = { '(refresh)' },
 	AllowNull = true,
-	Tooltip = 'Classes already on your summon slots. SwitchSlot is the same remote as the class menu — it does not need lobby.',
-})
+	Tooltip = 'Owned summon slots. The server only swaps in lobby — pick one here and it queues until you leave the dungeon.',
+}):OnChanged(function(v)
+	if rt.classSlotQuiet then
+		return
+	end
+	if type(v) ~= 'string' or v == '' or v == '(refresh)' or v == '(no slots)' then
+		return
+	end
+	local ok, msg = RunLoops.switchSelectedClass()
+	Library:Notify(tostring(msg or (ok and 'Switched' or 'Switch failed')))
+end)
 rt.classSlotDrop = classSlotDrop
 ClassBox:AddButton('Refresh slots', function()
 	local labels = RunLoops.refreshClassSlots()
@@ -12333,7 +12406,7 @@ ClassBox:AddButton('Switch class', function()
 	local ok, msg = RunLoops.switchSelectedClass()
 	Library:Notify(tostring(msg or (ok and 'Switched' or 'Switch failed')))
 end)
-ClassBox:AddLabel('Works in a dungeon. Uses slots you already own.')
+ClassBox:AddLabel('Queues in a dungeon, swaps when you hit lobby.')
 
 local FarmBox = RunTab:AddLeftGroupbox('Auto farm')
 FarmBox:AddToggle('DLAutoFarm', {
@@ -13299,6 +13372,14 @@ track(LocalPlayer:GetAttributeChangedSignal('InDungeon'):Connect(function()
 		end
 	else
 		pcall(DungeonStart.onLobby)
+		-- Room hops can drop InDungeon for a beat; wait so we don't
+		-- fire SwitchSlot mid-run or spam refused notifies.
+		task.delay(0.85, function()
+			if LocalPlayer:GetAttribute('InDungeon') == true then
+				return
+			end
+			pcall(RunLoops.flushClassQueue)
+		end)
 	end
 end))
 for _, attr in ipairs({ 'CurrentDungeon', 'CurrentDifficultyMode' }) do

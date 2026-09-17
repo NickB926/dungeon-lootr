@@ -1,6 +1,6 @@
 {
-    "version":  "1.0.29",
-    "message":  "HUD DPS meter: rolling 5s plus fight-average outgoing damage",
+    "version":  "1.0.30",
+    "message":  "Fix class switcher: queue in dungeon, swap on lobby, honor SwitchSlot Success",
     "files":  [
                   "dungeon-lootr/launch.lua",
                   "dungeon-lootr/DungeonLootr.lua",
