@@ -4692,13 +4692,14 @@ local function autoSkillTick()
 	if routeBusy or rt.refillBusy or rt.refillUrgent then
 		return
 	end
+	-- Ultimate (G) pops as soon as it is charged — do not hold it for a
+	-- boss / nearby pack. Regular skills still need a live target below.
+	if type(rt.tryFarmUlt) == 'function' and rt.tryFarmUlt() then
+		return
+	end
 	-- Only while standing on a live target. farmBusy stays true during chest
 	-- sweeps / room hops, so that flag is not "on a mob".
 	if not rt.farmFighting and not anyEnemyInRange() then
-		return
-	end
-	-- Ultimate (G): see rt.tryFarmUlt (crystal-pack aware; defined with raid helpers).
-	if type(rt.tryFarmUlt) == 'function' and rt.tryFarmUlt() then
 		return
 	end
 	-- Dump every ready skill this tick (old code fired one then returned — felt slow).
@@ -6316,29 +6317,15 @@ rt.tryFarmUlt = function()
 	local crystals = listRaidCrystals()
 	local npc = rt.farmFightNpc
 	local onCrystals = #crystals > 0 and (rt.crystalPack == true or (npc and isRaidCrystal(npc)))
-	local bossNow = rt.farmFighting
-		and npc
-		and enemyAlive(npc)
-		and (
-			npc:GetAttribute('IsBoss') == true
-			or npc:GetAttribute('IsMiniBoss') == true
-			or npc:GetAttribute('IsSpecialBoss') == true
-			or npc:GetAttribute('IsSpecial') == true
-		)
-	local fireUlt = false
+	-- Dark Professor: G on his body wastes the wipe. Hold until the 4 crystals
+	-- are out, then dump from the pack center. Everything else fires immediately.
 	if onCrystals then
-		-- Wait until we're in the middle so one G hits all 4.
 		local mid = crystalCentroid(crystals)
 		local me = routeRoot()
-		if mid and me and (me.Position - mid).Magnitude <= 16 then
-			fireUlt = true
+		if not (mid and me and (me.Position - mid).Magnitude <= 16) then
+			return false
 		end
-	elseif bossNow and savesUltForCrystals(npc) then
-		fireUlt = false
-	elseif bossNow then
-		fireUlt = true
-	end
-	if not fireUlt then
+	elseif npc and enemyAlive(npc) and savesUltForCrystals(npc) then
 		return false
 	end
 	rt.lastUltFire = os.clock()
@@ -11769,7 +11756,7 @@ CombatBox:AddSlider('DLParryRange', {
 CombatBox:AddToggle('DLAutoSkill', {
 	Text = 'Auto skill',
 	Default = false,
-	Tooltip = 'Fires skills 1–4. Ultimate (G) on floor bosses / minis / specials — but Dark Professor holds G until the 4 crystals spawn, then dumps from the center of the pack.',
+	Tooltip = 'Fires skills 1–4 on a live target. Ultimate (G) pops as soon as it is charged — does not wait for a mob or boss. Dark Professor still holds G until the 4 crystals spawn, then dumps from the pack center.',
 }):OnChanged(function(v)
 	Library:Notify(v and 'Auto skill on' or 'Auto skill off')
 end)
