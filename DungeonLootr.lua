@@ -164,6 +164,9 @@ local rt = {
 	learnedUntil = 0,
 	fCueUntil = 0,
 	fFollowDodgeAt = 0,
+	fFollowParryAt = 0,
+	fFollowParryUntil = 0,
+	fSkipFollow = false,
 	fParriedAt = 0,
 	fOnAt = 0,
 	dodgeFire = 0,
@@ -3858,22 +3861,31 @@ local function watchEnemy(npc)
 					return
 				end
 				rt.fOnAt = os.clock()
-				-- Only a dash that just started should skip. Requiring a recent
-				-- CanAttack skipped half the real Fs: this boss often paints F
-				-- first, hits ~0.50s later, and pulses CanAttack after that.
-				if os.clock() - lastDashAt < 0.25 then
+				-- Dash F lands with the dash itself. A real swing after a relocate
+				-- still has a CanAttack pulse; dash F does not.
+				if os.clock() - lastDashAt < 0.35 and not rt.recentCanAttack(npc, 0.6) then
 					rt.pdbg('skip F — %s dashed', npc.Name)
+					rt.fSkipFollow = true
 					return
 				end
+				rt.fSkipFollow = false
 				if npc:GetAttribute('Unblockable') == true then
 					rt.dodgeOnlyUntil = math.max(rt.dodgeOnlyUntil or 0, os.clock() + 0.9)
 					return
 				end
 				armParry(0, 'boss-hit', npc.Name .. '/F', false, true)
 			elseif lastFire == true then
+				-- 2nd hit is ~0.85s after F hides, not the CanAttack during F
+				-- (that pulse is ~1.2s early and burns CD). Hold a window for the
+				-- refunded parry even if the boss dashes in between.
+				if rt.fSkipFollow then
+					rt.fSkipFollow = false
+					return
+				end
 				local now = os.clock()
-				if now - (rt.fParriedAt or 0) < 2.2 and now - (rt.fOnAt or 0) < 2.5 then
-					rt.fFollowDodgeAt = now + 0.35
+				if now - (rt.fParriedAt or 0) < 2.5 then
+					rt.fFollowParryAt = now + 0.22
+					rt.fFollowParryUntil = now + 0.95
 				end
 			end
 		end
@@ -4027,9 +4039,6 @@ local function watchEnemy(npc)
 			if rt.parryNotif(npc) then
 				if v == true and prev ~= true then
 					rt.noteCanRise(npc)
-					if rt.fCueLit(npc) and parryReady() then
-						armParry(0, 'boss-hit', npc.Name .. '/F-can', false, true)
-					end
 				end
 				return
 			end
@@ -4406,6 +4415,28 @@ local function autoParryTick()
 		pcall(rt.fireDodge)
 		spendWindow()
 		return true
+	end
+	local followP = rt.fFollowParryAt or 0
+	local followUntil = rt.fFollowParryUntil or 0
+	if followP > 0 and now >= followP and now < followUntil then
+		if wantParry and parryReady() then
+			rt.pdbg('FIRE cue=F2 (after letter hid)')
+			rt.parryFire = now
+			rt.fParriedAt = now
+			rt.fFollowParryAt = 0
+			rt.fFollowParryUntil = 0
+			rt.fFollowDodgeAt = 0
+			pcall(parryRemote)
+			spendWindow()
+			return
+		end
+		if wantDodge and now >= followP + 0.35 and rt.dodgeReady(true) then
+			rt.dodgeFire = now
+			rt.fFollowParryAt = 0
+			rt.fFollowDodgeAt = 0
+			pcall(rt.fireDodge)
+			return
+		end
 	end
 	local followAt = rt.fFollowDodgeAt or 0
 	if wantDodge and followAt > 0 and now >= followAt and now < followAt + 0.8 then
