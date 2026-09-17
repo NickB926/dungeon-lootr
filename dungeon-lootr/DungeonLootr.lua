@@ -26,11 +26,29 @@ end
 -- thread keeps running, the new instance has no handle on it, and the character ends
 -- up held in place by a writer nobody can stop. Every long-lived loop checks this
 -- epoch and exits as soon as a newer instance claims it.
-local EPOCH = (tonumber(getgenv().DLEpoch) or 0) + 1
+--
+-- Identity, not a counter. A number can be cleared by an older build's unload, and
+-- then every stale copy recomputes the same 1 and believes it is still current — a
+-- live session had 13 copies all convinced they owned the character, each firing
+-- parry on its own logic. A fresh table can never collide.
+local EPOCH = {}
 getgenv().DLEpoch = EPOCH
 local function currentInstance()
 	return getgenv().DLEpoch == EPOCH
 end
+
+-- The single DLUnload slot only ever cleaned up whichever copy registered last, so
+-- any load that overwrote the slot before its predecessor unloaded orphaned that
+-- copy's connections for the rest of the session. Keep the handles in a global the
+-- next load can always reach.
+if type(getgenv().DLConns) == 'table' then
+	for _, c in ipairs(getgenv().DLConns) do
+		pcall(function()
+			c:Disconnect()
+		end)
+	end
+end
+getgenv().DLConns = {}
 
 -- Drop a position hold left behind by a previous instance.
 if getgenv().DLPinConn then
@@ -93,6 +111,10 @@ local conns = {}
 local marks = {}
 local function track(c)
 	conns[#conns + 1] = c
+	local reg = getgenv().DLConns
+	if type(reg) == 'table' then
+		reg[#reg + 1] = c
+	end
 	return c
 end
 
@@ -138,6 +160,10 @@ local rt = {
 	dodgeOnlyUntil = 0,
 	bossNearAt = 0,
 	bossCueAt = 0,
+	parryLock = 0,
+	learnedUntil = 0,
+	fCueUntil = 0,
+	fFollowDodgeAt = 0,
 	dodgeFire = 0,
 	muteVfx = 0,
 	noclip = 0,
@@ -415,6 +441,16 @@ rt.bindCharHp = function(char)
 	if not hum then
 		return
 	end
+	-- Damage we take is the only ground truth for when a swing actually lands, so
+	-- it is what the parry timing is learned from.
+	local lastHp = hum.Health
+	track(hum.HealthChanged:Connect(function(h)
+		local drop = lastHp - h
+		lastHp = h
+		if drop > 1 then
+			pcall(rt.learnHitLag)
+		end
+	end))
 	track(hum.HealthChanged:Connect(function()
 		if not on('DLAutoFlee') or os.clock() < (rt.hpFleeAt or 0) then
 			return
@@ -2452,30 +2488,150 @@ end
 -- hit). 'boss-hit' fires immediately — telegraph ending / anim almost done.
 -- Pushing fireAt into the parry-CD future is what made us tap F after the swing
 -- already connected on fodder; bosses need the opposite.
-local function armParry(delay, mode)
+-- Set getgenv().DLParryDebug = true to trace which cue armed each press.
+function rt.pdbg(fmt, ...)
+	if getgenv().DLParryDebug then
+		print('[parry] ' .. string.format(fmt, ...))
+	end
+end
+
+-- Measured on the live client: F opens the window 82ms later and holds it 645ms.
+rt.PARRY_OPEN = 0.082
+rt.PARRY_HOLD = 0.645
+
+-- Learned attack timing.
+--
+-- CanAttack is a short pulse (~0.12s), not the wind-up, and the hit lands a fixed
+-- lag after it — per attack, not per mob. Broken Reality lands one swing at
+-- rise+0.88 and the other at rise+1.35, so no single hardcoded lead covers both:
+-- the old 0.45s default opened the window before the late swing and closed again
+-- before it arrived. Learn the lag from the damage we actually take and place the
+-- press so one window brackets every hit we have seen from that mob.
+rt.canRise = {}
+rt.hitLag = {}
+
+function rt.noteCanRise(npc)
+	rt.canRise[npc] = os.clock()
+end
+
+function rt.learnHitLag()
+	local now = os.clock()
+	local best, bestT = nil, nil
+	for npc, t in pairs(rt.canRise) do
+		if not npc.Parent or now - t > 3 then
+			rt.canRise[npc] = nil
+		elseif not bestT or t > bestT then
+			best, bestT = npc, t
+		end
+	end
+	if not best then
+		return
+	end
+	local lag = now - bestT
+	-- Under 0.15s is the hit we already ate before the cue; over 2.5s is unrelated.
+	if lag < 0.15 or lag > 2.5 then
+		return
+	end
+	local name = tostring(best.Name)
+	local list = rt.hitLag[name]
+	if not list then
+		list = {}
+		rt.hitLag[name] = list
+	end
+	list[#list + 1] = lag
+	if #list > 10 then
+		table.remove(list, 1)
+	end
+	rt.pdbg('learn %s hit at rise+%.2f (n=%d)', name, lag, #list)
+end
+
+-- Press delay that keeps the whole observed spread inside one window:
+-- press <= earliestHit - open, and press >= latestHit - (open + hold).
+function rt.learnedLead(name)
+	local list = rt.hitLag[tostring(name)]
+	if not list or #list < 3 then
+		return nil
+	end
+	local lo, hi = math.huge, -math.huge
+	local sorted = {}
+	for _, v in ipairs(list) do
+		lo = math.min(lo, v)
+		hi = math.max(hi, v)
+		sorted[#sorted + 1] = v
+	end
+	-- Margins stay tiny on purpose. Broken Reality's two swings land at rise+0.80
+	-- and rise+1.42, a 0.62s spread against a 0.645s window: the press that covers
+	-- both is a ~25ms sliver, and a 0.03s margin on each side was enough to discard
+	-- it and fall back to covering only the early swing.
+	local earliest = hi - (rt.PARRY_OPEN + rt.PARRY_HOLD) + 0.01
+	local latest = lo - rt.PARRY_OPEN - 0.01
+	if earliest > latest then
+		-- Spread is wider than one window, so no press covers everything. Centre on
+		-- the median swing rather than guessing at the extremes.
+		table.sort(sorted)
+		local mid = sorted[math.ceil(#sorted / 2)]
+		return math.clamp(mid - (rt.PARRY_OPEN + rt.PARRY_HOLD * 0.5), 0.02, 1.4)
+	end
+	return math.clamp((earliest + latest) * 0.5, 0.02, 1.4)
+end
+
+function rt.parryNotif(npc)
+	return npc and npc:FindFirstChild('Parry_Notification', true)
+end
+
+function rt.fCueLit(npc)
+	local pn = rt.parryNotif(npc)
+	return pn ~= nil and pn:GetAttribute('Fire') == true
+end
+
+local function armParry(delay, mode, why, learned, forced)
 	delay = tonumber(delay) or 0
 	local now = os.clock()
+	rt.pdbg('arm mode=%s delay=%.2f src=%s%s', tostring(mode or 'fodder'), delay, tostring(why or '?'), learned and ' LEARNED' or (forced and ' F' or ''))
 	local sinceFire = now - (rt.parryFire or 0)
 	-- Frame debounce only.
 	if sinceFire < 0.12 then
 		return
 	end
-	-- Past the debounce, the server attributes are the truth: a successful parry
-	-- clears Parry_Cooldown_Active early, and a flat post-fire lockout made us sit
-	-- out the rest of a combo instead of using the refund.
-	if sinceFire < 0.55 then
-		local ch = character()
-		if LocalPlayer:GetAttribute('Parry_Cooldown_Active') == true
-			or (ch and ch:GetAttribute('Parry') == true)
-		then
+	-- The red F over a boss is Parry_Notification.Fire. That is the real window,
+	-- so it still arms even if a leftover learned lock or a just-spent cooldown
+	-- would have eaten the cue — the tick then parries if ready, else dodges.
+	if not forced then
+		-- Past the debounce, the server attributes are the truth: a successful parry
+		-- clears Parry_Cooldown_Active early, and a flat post-fire lockout made us sit
+		-- out the rest of a combo instead of using the refund.
+		if sinceFire < 0.55 then
+			local ch = character()
+			if LocalPlayer:GetAttribute('Parry_Cooldown_Active') == true
+				or (ch and ch:GetAttribute('Parry') == true)
+			then
+				return
+			end
+		end
+		-- A learned arm already knows when this swing lands. Every later cue for the
+		-- same swing is noise by comparison — telegraph flicker, anim markers, and the
+		-- telegraph fade that only happens *after* the hit — and letting them re-time
+		-- the press is what pulled F off the swing it was waiting for.
+		if learned then
+			rt.parryLock = now + delay
+			rt.learnedUntil = now + delay + rt.PARRY_HOLD + 0.2
+		elseif now < (rt.parryLock or 0) or now < (rt.learnedUntil or 0) then
+			rt.pdbg('skip %s src=%s (learned press owns this swing)', tostring(mode or 'fodder'), tostring(why or '?'))
 			return
 		end
+	else
+		rt.fCueUntil = now + 0.85
+		rt.parryLock = 0
+		rt.learnedUntil = 0
 	end
 	if mode == 'boss-hit' then
 		rt.bossCueAt = now
-		rt.parryDelay = now
-		rt.parryArmed = math.max(rt.parryArmed or 0, now + 0.32)
-		rt.parryCue = 'hit'
+		-- 0, not `now`: autoParryTick snapshots the clock before we arm, so
+		-- setting delay to this call's clock made `now < parryDelay` forever and
+		-- F only pressed after the red letter hid.
+		rt.parryDelay = 0
+		rt.parryArmed = math.max(rt.parryArmed or 0, now + 0.55)
+		rt.parryCue = forced and 'F' or 'hit'
 		return
 	end
 	local fireAt = now + math.max(0, delay)
@@ -2533,7 +2689,7 @@ local function parryRemote()
 	return false
 end
 
-rt.dodgeReady = function()
+rt.dodgeReady = function(allowSkill)
 	if LocalPlayer:GetAttribute('Dodge_Cooldown_Active') == true then
 		return false
 	end
@@ -2551,8 +2707,10 @@ rt.dodgeReady = function()
 		return false
 	end
 	-- Already invuln: spending the dash CD here just leaves the next hit uncovered.
+	-- Follow-up after a red-F parry is allowed through SkillIFrame: auto skill holds
+	-- that flag for half the fight and was eating every scheduled Q.
 	if char:GetAttribute('iFrame') == true
-		or char:GetAttribute('SkillIFrame') == true
+		or (not allowSkill and char:GetAttribute('SkillIFrame') == true)
 		or char:GetAttribute('HitIFrame') == true
 		or LocalPlayer:GetAttribute('iFrame') == true
 		or char:GetAttribute('Parry') == true
@@ -2562,7 +2720,9 @@ rt.dodgeReady = function()
 	if rt.hpPct() <= 0 then
 		return false
 	end
-	if os.clock() - (rt.dodgeFire or 0) < 0.28 then
+	-- Same idea as parry: a successful dodge refunds Dodge_Cooldown_Active, so a
+	-- long local lockout was throwing the next dash away. Frame debounce only.
+	if os.clock() - (rt.dodgeFire or 0) < 0.12 then
 		return false
 	end
 	return true
@@ -3550,6 +3710,21 @@ local function watchEnemy(npc)
 		if not enemyInRange(npc) then
 			return
 		end
+		-- Bosses (and anything else) that paint the red F over their head expose
+		-- Parry_Notification.Fire as the actual parry window. Telegraph / anim /
+		-- CanAttack on those mobs only ever fired too early.
+		if rt.parryNotif(npc) then
+			return
+		end
+		-- A mob we have timed is driven by its CanAttack rise alone. Its other cues
+		-- only ever dragged the press off the measured time: the telegraph fade in
+		-- particular trails the hit, so it spent F right as the cooldown returned
+		-- and left the cooldown covering the next swing's press. One wasted press
+		-- desyncs every cycle after it.
+		if rt.learnedLead(npc.Name) then
+			rt.pdbg('ignore %s/%s (timed mob: CanAttack rise only)', npc.Name, tostring(kind))
+			return
+		end
 		-- Fodder only: CanAttack is its real attack window, so telegraph flicker /
 		-- State strings / leftover anim markers must not arm on their own. Bosses
 		-- are exempt — their Telegraph_Root lights up well before CanAttack opens,
@@ -3563,9 +3738,9 @@ local function watchEnemy(npc)
 		end
 		if bossy then
 			if kind == 'hit' then
-				armParry(0, 'boss-hit')
+				armParry(0, 'boss-hit', npc.Name .. '/' .. tostring(kind))
 			else
-				armParry(delay ~= nil and delay or windDelay(), 'boss-wind')
+				armParry(delay ~= nil and delay or windDelay(), 'boss-wind', npc.Name .. '/' .. tostring(kind))
 			end
 			return
 		end
@@ -3585,7 +3760,7 @@ local function watchEnemy(npc)
 			end
 		end
 		lastCue = now
-		armParry(delay ~= nil and delay or 0.08)
+		armParry(delay ~= nil and delay or 0.08, nil, npc.Name .. '/' .. tostring(kind))
 	end
 
 	-- Telegraph_Root is the game's own wind-up cue. Boss parts are often parented
@@ -3655,10 +3830,49 @@ local function watchEnemy(npc)
 		end)
 	end
 	hookTelegraphRoot(npc:FindFirstChild('Telegraph_Root', true), false)
-	-- Parry_Notification is the after-the-fact "parried!" FX, not a wind-up.
+	-- The red F over a boss is Parry_Notification.Fire: it goes true ~0.25s after
+	-- the CanAttack pulse and the hit lands ~0.50s after that, which is inside the
+	-- 645ms parry window. Pressing on that flag is what the game is asking for.
+	local function hookParryNotif(part)
+		if not part or part:GetAttribute('Fire') == nil then
+			return
+		end
+		local lastFire = part:GetAttribute('Fire')
+		local function onFire(v)
+			if v == true then
+				if not enemyInRange(npc) then
+					return
+				end
+				if npc:GetAttribute('Unblockable') == true then
+					rt.dodgeOnlyUntil = math.max(rt.dodgeOnlyUntil or 0, os.clock() + 0.9)
+				end
+				armParry(0, 'boss-hit', npc.Name .. '/F', false, true)
+			elseif lastFire == true then
+				-- F hid. Broken Reality's follow-up lands ~0.8s later and cannot
+				-- be parried; a successful dodge refunds, so spend Q on it.
+				local now = os.clock()
+				if now - (rt.parryFire or 0) < 2.2 then
+					rt.fFollowDodgeAt = now + 0.35
+				end
+			end
+		end
+		if lastFire == true then
+			onFire(true)
+		end
+		bag[#bag + 1] = part:GetAttributeChangedSignal('Fire'):Connect(function()
+			local v = part:GetAttribute('Fire')
+			if v ~= lastFire then
+				onFire(v)
+			end
+			lastFire = v
+		end)
+	end
+	hookParryNotif(npc:FindFirstChild('Parry_Notification', true))
 	bag[#bag + 1] = npc.DescendantAdded:Connect(function(d)
 		if d.Name == 'Telegraph_Root' then
 			hookTelegraphRoot(d, true)
+		elseif d.Name == 'Parry_Notification' then
+			hookParryNotif(d)
 		end
 	end)
 	local function onAttackAnim(track)
@@ -3786,24 +4000,34 @@ local function watchEnemy(npc)
 				-- Unblockable swings cannot be parried; leave the window to the dash.
 				rt.dodgeOnlyUntil = math.max(rt.dodgeOnlyUntil or 0, now + 0.9)
 			end
+			-- The red F is the parry window on these mobs. CanAttack is only a
+			-- 0.12s pulse that happens well before the F appears.
+			if rt.parryNotif(npc) then
+				return
+			end
 			if v == true and prev ~= true then
 				if now - lastCanArm < 0.25 then
 					return
 				end
 				lastCanArm = now
-				if bossy then
-					armParry(windDelay(), 'boss-wind')
+				rt.noteCanRise(npc)
+				local lead = rt.learnedLead(npc.Name)
+				if lead then
+					-- Timed off this mob's own measured hit lag.
+					armParry(lead, bossy and 'boss-wind' or nil, npc.Name .. '/can-rise', true)
+				elseif bossy then
+					armParry(windDelay(), 'boss-wind', npc.Name .. '/can-rise')
 				else
-					-- Fodder wind-ups run ~0.06-0.5s, so fire almost at once and let
-					-- the hold cover the impact.
-					armParry(0.04)
+					-- No samples yet: fodder wind-ups run ~0.06-0.5s, so fire almost at
+					-- once and let the hold cover the impact.
+					armParry(0.04, nil, npc.Name .. '/can-rise')
 				end
 			elseif v == false and prev == true then
 				-- Falling edge is the impact. Retime onto it if we have not fired.
 				if bossy then
-					armParry(0, 'boss-hit')
+					armParry(0, 'boss-hit', npc.Name .. '/can-fall')
 				else
-					armParry(0)
+					armParry(0, nil, npc.Name .. '/can-fall')
 				end
 			end
 		end)
@@ -3981,16 +4205,23 @@ local function scanParryThreats()
 		end
 		rt.parryTelSeen[inst] = true
 		local bossNear = false
+		local fCueNear = false
 		for npc in pairs(enemyWatches) do
-			if isBossEnemy(npc) and enemyInRange(npc) then
-				bossNear = true
+			if enemyInRange(npc) and rt.parryNotif(npc) then
+				fCueNear = true
 				break
 			end
+			if isBossEnemy(npc) and enemyInRange(npc) then
+				bossNear = true
+			end
+		end
+		if fCueNear then
+			return
 		end
 		if bossNear then
-			armParry(bossParryDelay(), 'boss-wind')
+			armParry(bossParryDelay(), 'boss-wind', 'projectile:' .. part.Name)
 		else
-			armParry(delay)
+			armParry(delay, nil, 'projectile:' .. part.Name)
 		end
 	end
 	local function sweepFolder(folder, delay)
@@ -4059,6 +4290,15 @@ local function autoParryTick()
 		for npc in pairs(enemyWatches) do
 			if npc.Parent and isBossEnemy(npc) and enemyInRange(npc) then
 				rt.bossNearAt = now
+			end
+			-- One press per red-F appearance. Re-arming while Fire stayed true
+			-- spent the refunded cooldown on a second tap and left the follow-up
+			-- swing uncovered.
+			-- Timed / F-cue mobs are not armed from leftover anim or telegraph poll.
+			if npc.Parent and isBossEnemy(npc) and enemyInRange(npc)
+				and not rt.parryNotif(npc)
+				and not rt.learnedLead(npc.Name)
+			then
 				local an = rt.bossAnim[npc]
 				if not an or an.Parent == nil then
 					local ctrl = npc:FindFirstChildOfClass('AnimationController')
@@ -4083,9 +4323,9 @@ local function autoParryTick()
 									if len > 0.28 then
 										local wait, nowHit = rt.bossAnimHitWait(len, tpos)
 										if nowHit then
-											armParry(0, 'boss-hit')
+											armParry(0, 'boss-hit', npc.Name .. '/poll-anim ' .. tostring(track.Name))
 										elseif wait < 2.2 then
-											armParry(wait, 'boss-wind')
+											armParry(wait, 'boss-wind', npc.Name .. '/poll-anim ' .. tostring(track.Name))
 										end
 									end
 								end
@@ -4098,7 +4338,7 @@ local function autoParryTick()
 				-- window, so gating on it left bosses unparried entirely.
 				if rt.telegraphRose(npc) then
 					local delay = (npc:GetAttribute('IsSpecialBoss') == true) and 0.16 or bossParryDelay()
-					armParry(delay, 'boss-wind')
+					armParry(delay, 'boss-wind', npc.Name .. '/poll-tel')
 				end
 			end
 		end
@@ -4106,6 +4346,9 @@ local function autoParryTick()
 	local function spendWindow()
 		rt.parryDelay = now + 0.05
 		rt.parryArmed = now + 0.05
+		rt.parryLock = 0
+		rt.learnedUntil = 0
+		rt.fCueUntil = 0
 		rt.parryScan = now
 		pcall(scanParryThreats)
 	end
@@ -4136,6 +4379,15 @@ local function autoParryTick()
 		spendWindow()
 		return true
 	end
+	local followAt = rt.fFollowDodgeAt or 0
+	if wantDodge and followAt > 0 and now >= followAt and now < followAt + 0.8 then
+		if rt.dodgeReady(true) then
+			rt.dodgeFire = now
+			rt.fFollowDodgeAt = 0
+			pcall(rt.fireDodge)
+			return
+		end
+	end
 	if now < rt.parryDelay then
 		return
 	end
@@ -4163,6 +4415,7 @@ local function autoParryTick()
 	end
 	-- An Unblockable swing ignores parry entirely, so hand that window to the dash.
 	if wantParry and parryReady() and now >= (rt.dodgeOnlyUntil or 0) then
+		rt.pdbg('FIRE cue=%s cueAge=%.2fs armLeft=%.2fs', tostring(rt.parryCue), now - (rt.parryDelay or now), (rt.parryArmed or now) - now)
 		rt.parryFire = now
 		pcall(parryRemote)
 		spendWindow()
@@ -11984,7 +12237,19 @@ pcall(function()
 	end
 end)
 
-track(RunService.Heartbeat:Connect(function(dt)
+local hbCombatConn
+hbCombatConn = track(RunService.Heartbeat:Connect(function(dt)
+	-- A superseded copy must stop touching the character, not just stop deciding:
+	-- stacked copies each kept firing parry, which held the 1.8s cooldown down so
+	-- the live copy never had it when a real swing came.
+	if not currentInstance() then
+		if hbCombatConn then
+			pcall(function()
+				hbCombatConn:Disconnect()
+			end)
+		end
+		return
+	end
 	-- Walk speed is already pinned on RenderStepped; duplicating it here cost a
 	-- full character lookup every frame for no gain.
 	-- Potion / flee must run every frame-ish: the combat throttle used to skip
@@ -12062,7 +12327,16 @@ pcall(function()
 end)
 
 rt.hbAcc = 0
-track(RunService.Heartbeat:Connect(function(dt)
+local hbEspConn
+hbEspConn = track(RunService.Heartbeat:Connect(function(dt)
+	if not currentInstance() then
+		if hbEspConn then
+			pcall(function()
+				hbEspConn:Disconnect()
+			end)
+		end
+		return
+	end
 	rt.hbAcc += dt
 	-- ESP / HUD: farm already knows its targets; avoid mark churn mid-run.
 	local every = 0.55
@@ -12176,6 +12450,12 @@ getgenv().DLUnload = function()
 	getgenv().DLFixMovement = nil
 	getgenv().DLSetFarm = nil
 	getgenv().DLFarmStatus = nil
+	-- Release the claim so anything of ours still on a signal evicts itself on its
+	-- next tick, and drop the handles we just disconnected.
+	if currentInstance() then
+		getgenv().DLEpoch = nil
+	end
+	getgenv().DLConns = {}
 end
 getgenv().DLLootHudUnload = getgenv().DLUnload
 getgenv().DLCollectChests = function()

@@ -1,6 +1,6 @@
 {
-    "version":  "1.0.7",
-    "message":  "Auto parry: boss owns the cooldown, fodder cues no longer spend it mid-boss",
+    "version":  "1.0.8",
+    "message":  "Auto parry: press F when the red letter appears over the boss",
     "files":  [
                   "dungeon-lootr/launch.lua",
                   "dungeon-lootr/DungeonLootr.lua",
