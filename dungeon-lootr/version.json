@@ -1,5 +1,5 @@
 {
-    "version":  "1.0.21",
+    "version":  "1.0.22",
     "message":  "Pop ultimate as soon as it is charged instead of waiting for a boss",
     "files":  [
                   "dungeon-lootr/launch.lua",
