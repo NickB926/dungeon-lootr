@@ -1,5 +1,5 @@
 {
-    "version":  "1.0.17",
+    "version":  "1.0.18",
     "message":  "Fix notifications toggle so the menu still loads",
     "files":  [
                   "dungeon-lootr/launch.lua",
