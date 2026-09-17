@@ -169,6 +169,10 @@ local rt = {
 	fSkipFollow = false,
 	fParriedAt = 0,
 	fOnAt = 0,
+	fLetterHeld = 0,
+	fAwaitFollow = 0,
+	fLongUntil = 0,
+	fNoFollow = false,
 	dodgeFire = 0,
 	muteVfx = 0,
 	noclip = 0,
@@ -2598,6 +2602,63 @@ function rt.recentCanAttack(npc, window)
 	return type(t) == 'number' and (os.clock() - t) <= (window or 0.55)
 end
 
+function rt.noteFCueAnim(npc, track)
+	if not npc or not track then
+		return
+	end
+	local name = string.lower(tostring(track.Name or ''))
+	local len, looped = 0, false
+	pcall(function()
+		local a = track.Animation
+		if a and a.Name ~= '' then
+			name = string.lower(tostring(a.Name))
+		end
+		len = track.Length or 0
+		looped = track.Looped == true
+	end)
+	local now = os.clock()
+	if name:find('walk', 1, true) or name:find('run', 1, true) or name:find('idle', 1, true) then
+		if not rt.fCueLit(npc) then
+			rt.fFollowParryAt = 0
+			rt.fAwaitFollow = 0
+			rt.fNoFollow = true
+		end
+		return
+	end
+	if rt.fNoFollow and not rt.fCueLit(npc) then
+		return
+	end
+	if looped or len < 0.22 or len > 4.2 then
+		return
+	end
+	if rt.fCueLit(npc) then
+		-- Long channel (Broken Reality ~2.3s clip) while the letter stays up.
+		-- First press already happened on F; refunded presses cover the rest.
+		if len >= 1.05 and now - (rt.fOnAt or 0) < 6 then
+			rt.fLongUntil = now + len
+			if now - (rt.fParriedAt or 0) < 2.2 then
+				rt.fFollowParryAt = now + 0.50
+				rt.fFollowParryUntil = now + len + 0.2
+			end
+		end
+		return
+	end
+	-- Letter hid. Short follow-up clip starts ~0.36s later (hit ~F-off+0.85);
+	-- the long letter's 56 lands ~F-off+1.50 on a similar-length clip.
+	if (rt.fAwaitFollow or 0) > 0 or (now - (rt.fParriedAt or 0) < 6.5 and now - (rt.fOnAt or 0) < 7) then
+		local longLetter = (rt.fLetterHeld or 0) >= 2.8
+		local delay = longLetter and 0.68 or 0.16
+		rt.fFollowParryAt = now + delay
+		rt.fFollowParryUntil = now + delay + 0.78
+		rt.fAwaitFollow = 0
+		if longLetter then
+			rt.fLongUntil = math.max(rt.fLongUntil or 0, now + 1.9)
+			rt.fFollowParryUntil = now + 1.95
+		end
+		rt.pdbg('F2 arm after clip len=%.2f held=%.2f delay=%.2f', len, rt.fLetterHeld or 0, delay)
+	end
+end
+
 local function armParry(delay, mode, why, learned, forced)
 	delay = tonumber(delay) or 0
 	local now = os.clock()
@@ -3847,6 +3908,14 @@ local function watchEnemy(npc)
 	local lastDashAt = 0
 	bag[#bag + 1] = npc:GetAttributeChangedSignal('DashIFrameUntil'):Connect(function()
 		lastDashAt = os.clock()
+		-- Dash is not an attack. If we were waiting to 2nd-parry after F hid,
+		-- the follow-up is a relocate instead — skip it. A new F after they
+		-- stop is the next swing.
+		if not rt.fCueLit(npc) then
+			rt.fFollowParryAt = 0
+			rt.fAwaitFollow = 0
+			rt.fNoFollow = true
+		end
 	end)
 	-- The red F over a boss is Parry_Notification.Fire: hit lands ~0.50s after it
 	-- lights. Pressing on that flag is what the game is asking for.
@@ -3861,31 +3930,35 @@ local function watchEnemy(npc)
 					return
 				end
 				rt.fOnAt = os.clock()
-				-- Dash F lands with the dash itself. A real swing after a relocate
-				-- still has a CanAttack pulse; dash F does not.
-				if os.clock() - lastDashAt < 0.35 and not rt.recentCanAttack(npc, 0.6) then
+				-- Only skip F that lights with the dash itself. After a relocate
+				-- the next F is a real swing (often 1s later, F before CanAttack).
+				if os.clock() - lastDashAt < 0.12 and not rt.recentCanAttack(npc, 0.6) then
 					rt.pdbg('skip F — %s dashed', npc.Name)
 					rt.fSkipFollow = true
 					return
 				end
 				rt.fSkipFollow = false
+				rt.fAwaitFollow = 0
+				rt.fLongUntil = 0
+				rt.fNoFollow = false
 				if npc:GetAttribute('Unblockable') == true then
 					rt.dodgeOnlyUntil = math.max(rt.dodgeOnlyUntil or 0, os.clock() + 0.9)
 					return
 				end
 				armParry(0, 'boss-hit', npc.Name .. '/F', false, true)
 			elseif lastFire == true then
-				-- 2nd hit is ~0.85s after F hides, not the CanAttack during F
-				-- (that pulse is ~1.2s early and burns CD). Hold a window for the
-				-- refunded parry even if the boss dashes in between.
+				-- Do not press on a blind timer: that was the too-early 2nd.
+				-- Short combo plays the follow-up clip ~0.36s after F hides;
+				-- a dash/walk instead means they moved — wait for the next F.
 				if rt.fSkipFollow then
 					rt.fSkipFollow = false
 					return
 				end
 				local now = os.clock()
-				if now - (rt.fParriedAt or 0) < 2.5 then
-					rt.fFollowParryAt = now + 0.22
-					rt.fFollowParryUntil = now + 0.95
+				rt.fLetterHeld = now - (rt.fOnAt or now)
+				if now - (rt.fParriedAt or 0) < 6.5 then
+					rt.fAwaitFollow = now
+					rt.fFollowParryAt = 0
 				end
 			end
 		end
@@ -3909,6 +3982,10 @@ local function watchEnemy(npc)
 		end
 	end)
 	local function onAttackAnim(track)
+		if rt.parryNotif(npc) then
+			rt.noteFCueAnim(npc, track)
+			return
+		end
 		local isAttack, guessed = isAttackAnim(track, bossy)
 		if not isAttack then
 			return
@@ -4420,17 +4497,21 @@ local function autoParryTick()
 	local followUntil = rt.fFollowParryUntil or 0
 	if followP > 0 and now >= followP and now < followUntil then
 		if wantParry and parryReady() then
-			rt.pdbg('FIRE cue=F2 (after letter hid)')
+			rt.pdbg('FIRE cue=F2')
 			rt.parryFire = now
 			rt.fParriedAt = now
-			rt.fFollowParryAt = 0
-			rt.fFollowParryUntil = 0
 			rt.fFollowDodgeAt = 0
+			if now < (rt.fLongUntil or 0) then
+				rt.fFollowParryAt = now + 0.72
+			else
+				rt.fFollowParryAt = 0
+				rt.fFollowParryUntil = 0
+			end
 			pcall(parryRemote)
 			spendWindow()
 			return
 		end
-		if wantDodge and now >= followP + 0.35 and rt.dodgeReady(true) then
+		if wantDodge and (rt.fLongUntil or 0) <= now and now >= followUntil - 0.12 and rt.dodgeReady(true) then
 			rt.dodgeFire = now
 			rt.fFollowParryAt = 0
 			rt.fFollowDodgeAt = 0

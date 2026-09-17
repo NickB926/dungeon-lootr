@@ -1,6 +1,6 @@
 {
-    "version":  "1.0.12",
-    "message":  "Auto parry: second press waits until after F hides (follow-up is 0.85s later)",
+    "version":  "1.0.13",
+    "message":  "Auto parry: second press waits for the follow-up swing, not a dash",
     "files":  [
                   "dungeon-lootr/launch.lua",
                   "dungeon-lootr/DungeonLootr.lua",
