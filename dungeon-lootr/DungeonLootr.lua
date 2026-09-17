@@ -7906,6 +7906,135 @@ local function summoningRF(name)
 	return nil
 end
 
+local function getSlotData()
+	local rf = summoningRF('GetSlotData')
+	if not rf then
+		return nil
+	end
+	local ok, data = pcall(function()
+		return rf:InvokeServer()
+	end)
+	if ok and type(data) == 'table' then
+		return data
+	end
+	return nil
+end
+
+local function listOwnedClassSlots()
+	local labels, map = {}, {}
+	local data = getSlotData()
+	if not data or type(data.Slots) ~= 'table' then
+		return labels, map, data
+	end
+	local idxs = {}
+	for i, name in pairs(data.Slots) do
+		if type(i) == 'number' and type(name) == 'string' and name ~= '' then
+			idxs[#idxs + 1] = i
+		end
+	end
+	table.sort(idxs)
+	for _, i in ipairs(idxs) do
+		local name = data.Slots[i]
+		local aspect = data.SlotAspects and data.SlotAspects[i]
+		local label = tostring(i) .. ' · ' .. name
+		if type(aspect) == 'string' and aspect ~= '' then
+			label = label .. '  (' .. aspect .. ')'
+		end
+		if tonumber(data.ActiveIndex) == i then
+			label = label .. '  ·  on'
+		end
+		labels[#labels + 1] = label
+		map[label] = i
+		map[name] = map[name] or i
+	end
+	return labels, map, data
+end
+
+local function refreshClassSlots()
+	local labels, map, data = listOwnedClassSlots()
+	rt.classSlotMap = map
+	rt.classSlotData = data
+	local drop = rt.classSlotDrop
+	if drop and type(drop.SetValues) == 'function' then
+		pcall(function()
+			drop:SetValues(#labels > 0 and labels or { '(no slots)' })
+			local current
+			local active = data and tonumber(data.ActiveIndex)
+			if active and type(map) == 'table' then
+				for label, idx in pairs(map) do
+					if idx == active and type(label) == 'string' and label:find(' · ', 1, true) then
+						current = label
+						break
+					end
+				end
+			end
+			if current and type(drop.SetValue) == 'function' then
+				drop:SetValue(current)
+			end
+		end)
+	end
+	return labels, map, data
+end
+
+local function parseClassSlot(value)
+	if type(value) == 'number' then
+		return value
+	end
+	if type(value) ~= 'string' or value == '' then
+		return nil
+	end
+	local map = rt.classSlotMap
+	if type(map) == 'table' and map[value] then
+		return tonumber(map[value])
+	end
+	local n = tonumber(value:match('^%s*(%d+)'))
+	return n
+end
+
+local function switchClassSlot(idx)
+	idx = tonumber(idx)
+	if not idx then
+		return false, 'Pick a class slot first'
+	end
+	local rf = summoningRF('SwitchSlot')
+	if not rf then
+		return false, 'SummoningService.SwitchSlot missing'
+	end
+	local data = getSlotData()
+	local name = data and data.Slots and data.Slots[idx]
+	if data and tonumber(data.ActiveIndex) == idx then
+		return true, 'Already on ' .. tostring(name or ('slot ' .. idx))
+	end
+	local ok, res = pcall(function()
+		return rf:InvokeServer(idx)
+	end)
+	if not ok then
+		ok, res = pcall(function()
+			return rf:InvokeServer(idx, true)
+		end)
+	end
+	if not ok and type(name) == 'string' then
+		ok, res = pcall(function()
+			return rf:InvokeServer(name)
+		end)
+	end
+	if not ok then
+		return false, tostring(res)
+	end
+	if res == false then
+		return false, 'Server refused (class may be locked to lobby)'
+	end
+	task.delay(0.35, function()
+		pcall(refreshClassSlots)
+	end)
+	return true, 'Switched to ' .. tostring(name or ('slot ' .. idx))
+end
+
+local function switchSelectedClass()
+	local v = Options.DLClassSlot and Options.DLClassSlot.Value
+	return switchClassSlot(parseClassSlot(v))
+end
+
 local function findRollRemote()
 	if rollRF and rollRF.Parent then
 		return rollRF
@@ -8364,6 +8493,10 @@ return {
 	trySummonSpecial = trySummonSpecial,
 	confirmSpecialSummon = confirmSpecialSummon,
 	listClassNames = listClassNames,
+	listOwnedClassSlots = listOwnedClassSlots,
+	refreshClassSlots = refreshClassSlots,
+	switchClassSlot = switchClassSlot,
+	switchSelectedClass = switchSelectedClass,
 	redeemAllCodes = redeemAllCodes,
 	knitRF = knitRF,
 	findRollRemote = findRollRemote,
@@ -10586,7 +10719,7 @@ end
 local Config = (function()
 	local Cfg = Library.Config
 	Library:SetFolder('dungeon-lootr')
-	Cfg.IgnoreIndexes({ DLPlayerList = true, DLSpectate = true })
+	Cfg.IgnoreIndexes({ DLPlayerList = true, DLSpectate = true, DLClassSlot = true })
 
 	local api = {}
 
@@ -12044,6 +12177,24 @@ RollBox:AddToggle('DLAutoRoll', {
 end)
 RollBox:AddLabel('Lobby · Normal + Lucky · stops on Exotic by default')
 
+local ClassBox = RunTab:AddLeftGroupbox('Class')
+local classSlotDrop = ClassBox:AddDropdown('DLClassSlot', {
+	Text = 'Owned slot',
+	Values = { '(refresh)' },
+	AllowNull = true,
+	Tooltip = 'Classes already on your summon slots. SwitchSlot is the same remote as the class menu — it does not need lobby.',
+})
+rt.classSlotDrop = classSlotDrop
+ClassBox:AddButton('Refresh slots', function()
+	local labels = RunLoops.refreshClassSlots()
+	Library:Notify((#labels) .. ' class slots')
+end)
+ClassBox:AddButton('Switch class', function()
+	local ok, msg = RunLoops.switchSelectedClass()
+	Library:Notify(tostring(msg or (ok and 'Switched' or 'Switch failed')))
+end)
+ClassBox:AddLabel('Works in a dungeon. Uses slots you already own.')
+
 local FarmBox = RunTab:AddLeftGroupbox('Auto farm')
 FarmBox:AddToggle('DLAutoFarm', {
 	Text = 'Auto farm enemies',
@@ -12657,6 +12808,9 @@ buildMenu()
 -- hook before load so the snapshot of defaults is taken untouched
 Config.hook()
 Config.load()
+task.spawn(function()
+	pcall(RunLoops.refreshClassSlots)
+end)
 pcall(function()
 	local resume = getgenv().DLResumeFarm == true or on('DLAutoFarm')
 	if resume then
