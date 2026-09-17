@@ -1,6 +1,6 @@
 {
-    "version":  "1.0.10",
-    "message":  "Auto parry: dash skip was stuck on, F only ignores dashes with no CanAttack pulse",
+    "version":  "1.0.11",
+    "message":  "Auto parry: press as soon as the red F appears (hit is 0.5s later)",
     "files":  [
                   "dungeon-lootr/launch.lua",
                   "dungeon-lootr/DungeonLootr.lua",

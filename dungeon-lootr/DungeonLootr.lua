@@ -3841,9 +3841,12 @@ local function watchEnemy(npc)
 		end)
 	end
 	hookTelegraphRoot(npc:FindFirstChild('Telegraph_Root', true), false)
-	-- The red F over a boss is Parry_Notification.Fire: it goes true ~0.25s after
-	-- the CanAttack pulse and the hit lands ~0.50s after that, which is inside the
-	-- 645ms parry window. Pressing on that flag is what the game is asking for.
+	local lastDashAt = 0
+	bag[#bag + 1] = npc:GetAttributeChangedSignal('DashIFrameUntil'):Connect(function()
+		lastDashAt = os.clock()
+	end)
+	-- The red F over a boss is Parry_Notification.Fire: hit lands ~0.50s after it
+	-- lights. Pressing on that flag is what the game is asking for.
 	local function hookParryNotif(part)
 		if not part or part:GetAttribute('Fire') == nil then
 			return
@@ -3855,9 +3858,11 @@ local function watchEnemy(npc)
 					return
 				end
 				rt.fOnAt = os.clock()
-				-- Dash F has no recent CanAttack pulse. Attack F does.
-				if not rt.recentCanAttack(npc, 0.6) then
-					rt.pdbg('skip F — %s no CanAttack pulse (dash)', npc.Name)
+				-- Only a dash that just started should skip. Requiring a recent
+				-- CanAttack skipped half the real Fs: this boss often paints F
+				-- first, hits ~0.50s later, and pulses CanAttack after that.
+				if os.clock() - lastDashAt < 0.25 then
+					rt.pdbg('skip F — %s dashed', npc.Name)
 					return
 				end
 				if npc:GetAttribute('Unblockable') == true then
@@ -3866,8 +3871,6 @@ local function watchEnemy(npc)
 				end
 				armParry(0, 'boss-hit', npc.Name .. '/F', false, true)
 			elseif lastFire == true then
-				-- F hid. Only dodge the follow-up if this letter was a real swing
-				-- we parried, not a dash that also painted F.
 				local now = os.clock()
 				if now - (rt.fParriedAt or 0) < 2.2 and now - (rt.fOnAt or 0) < 2.5 then
 					rt.fFollowDodgeAt = now + 0.35
