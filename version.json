@@ -1,6 +1,6 @@
 {
-    "version":  "1.0.14",
-    "message":  "Auto parry: wait for the swing clip instead of pressing the instant F appears",
+    "version":  "1.0.15",
+    "message":  "Auto farm: pin on Boss Rush bosses in BossRush_NPCs",
     "files":  [
                   "dungeon-lootr/launch.lua",
                   "dungeon-lootr/DungeonLootr.lua",

@@ -4242,6 +4242,12 @@ local function rebuildEnemyCache()
 			consider(npc)
 		end
 	end
+	local rush = workspace:FindFirstChild('BossRush_NPCs')
+	if rush then
+		for _, npc in ipairs(rush:GetChildren()) do
+			consider(npc)
+		end
+	end
 	enemyCacheAt = os.clock()
 end
 
@@ -4723,7 +4729,30 @@ local function attackDelay()
 	return math.max(0.14, 1 / speed)
 end
 
+-- Live Boss Rush fights sit in workspace.BossRush_NPCs, not Generated_*/NPCs.
+-- Farm used to ignore that folder, so auto farm never pinned on those bosses.
+local function bossRushNpcFolder()
+	return workspace:FindFirstChild('BossRush_NPCs')
+end
+
+local function inBossRushFarm()
+	local f = bossRushNpcFolder()
+	if f and #f:GetChildren() > 0 then
+		rt.bossRushUntil = os.clock() + 45
+		return true
+	end
+	if (rt.bossRushUntil or 0) > os.clock() then
+		return true
+	end
+	local d = string.lower(tostring(LocalPlayer:GetAttribute('CurrentDungeon') or ''))
+	return d:find('rush', 1, true) ~= nil
+end
+
 local function inDungeonFarm()
+	if inBossRushFarm() then
+		rt.farmDungeonMiss = nil
+		return true
+	end
 	if LocalPlayer:GetAttribute('InDungeon') == true then
 		rt.farmDungeonMiss = nil
 		return true
@@ -6060,6 +6089,12 @@ local function eachFarmNpc(fn)
 			end
 		end
 	end
+	local rush = bossRushNpcFolder()
+	if rush then
+		for _, npc in ipairs(rush:GetChildren()) do
+			take(npc)
+		end
+	end
 end
 
 local function countFarmSides()
@@ -6358,6 +6393,11 @@ local function pickFarmTarget()
 	local preferRanged = on('DLFarmRanged')
 	local trash, bosses = countFarmSides()
 	local skipFinal = trash > 0
+	-- Boss Rush is a 1v1 arena. Do not skip the rush boss as a "floor boss"
+	-- because leftover Generated_ trash from another run is still in the world.
+	if inBossRushFarm() then
+		skipFinal = false
+	end
 	-- Crystals first (Dark Professor wipe if they finish). Hunt special next
 	-- (Scarlet Knight loop), then raid / room special, then summoned adds.
 	local crystal, crystalD = nearestCrystal()
@@ -7134,7 +7174,10 @@ local function farmKill(npc)
 			addPack = true
 		end
 	end
-	if (tonumber(npc:GetAttribute('HealthOverride')) or 0) >= 1e7 or isRaidBossNpc(npc) then
+	if (tonumber(npc:GetAttribute('HealthOverride')) or 0) >= 1e7
+		or isRaidBossNpc(npc)
+		or (npc.Parent and npc.Parent.Name == 'BossRush_NPCs')
+	then
 		timeout = 1200
 	elseif crystalPack then
 		timeout = 90
@@ -7325,12 +7368,15 @@ local function farmLoop()
 				Pin.at(rt.aoeGoal, true)
 			end
 			local target = pickFarmTarget()
-			if target then
+			if inBossRushFarm() and not target then
+				farmLabel = 'boss rush · waiting'
+				task.wait(0.25)
+			elseif target then
 				farmLabel = ('%s · %d kills'):format(target.Name, farmKills)
 				local dungeon = activeDungeonRoot()
 				local idx = Rooms.indexOf(target)
 				Rooms.markVisited(idx)
-				if isFinalBoss(target) and not rt.bossSweepDone then
+				if isFinalBoss(target) and not rt.bossSweepDone and not inBossRushFarm() then
 					tryChestSweep('chest sweep · then boss')
 					rt.bossSweepDone = true
 				end
