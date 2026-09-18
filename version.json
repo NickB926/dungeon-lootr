@@ -1,5 +1,5 @@
 {
-    "version":  "1.0.49",
+    "version":  "1.0.50",
     "message":  "farm rooms first again; chests only after stars fill",
     "files":  [
                   "dungeon-lootr/launch.lua",
