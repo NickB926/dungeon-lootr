@@ -93,7 +93,7 @@ Library.ToggleKeybind = { Value = 'Home' }
 Library.Animations = Library.Animations or {}
 Library.Animations.TabSwitch = false
 
-local DL_BUILD = '1.0.65'
+local DL_BUILD = '1.0.66'
 getgenv().DLBuild = DL_BUILD
 
 local Window = Library:CreateWindow({
@@ -240,7 +240,10 @@ local function farmSkipped(npc)
 		return true
 	end
 	local untilAt = farmFinished[npc]
-	return untilAt ~= nil and os.clock() < untilAt
+	if untilAt ~= nil and os.clock() < untilAt then
+		return true
+	end
+	return type(rt.npcInCorridor) == 'function' and rt.npcInCorridor(npc) == true
 end
 local runCompleteAt = nil
 local replayArmedAt = nil
@@ -5430,12 +5433,31 @@ local Rooms = (function()
 			return false
 		end
 		local function skinny(x, z)
-			local mn, mx = math.min(x, z), math.max(x, z)
-			return mn <= 42 and mx <= 80
+			local mn = math.min(x, z)
+			-- Long 36xN halls used to fail mx<=80 and get toured as rooms.
+			return mn > 0 and mn <= 42
 		end
 		local zone = room:FindFirstChild('Zone')
 		if zone and zone:IsA('BasePart') and skinny(zone.Size.X, zone.Size.Z) then
 			return true
+		end
+		-- Small Entry+Exit pads (Room_9 ~75x79) are landings, not combat rooms.
+		local con = room:FindFirstChild('Connectors')
+		if zone and zone:IsA('BasePart') and con
+			and con:FindFirstChild('Entry') and con:FindFirstChild('Exit')
+			and not con:FindFirstChild('Side')
+		then
+			local mn, mx = math.min(zone.Size.X, zone.Size.Z), math.max(zone.Size.X, zone.Size.Z)
+			if mn <= 82 and mx <= 88 then
+				if room:GetAttribute('IsLootRoom') ~= true
+					and room:GetAttribute('IsSpecial') ~= true
+					and room:GetAttribute('IsSpecialBoss') ~= true
+					and room:GetAttribute('IsBoss') ~= true
+					and room:GetAttribute('IsHorde') ~= true
+				then
+					return true
+				end
+			end
 		end
 		if room:GetAttribute('IsLootRoom') == true
 			or room:GetAttribute('IsSpecial') == true
@@ -5474,6 +5496,31 @@ local Rooms = (function()
 		local spawns = room:FindFirstChild('Spawns')
 		local part = spawns and (spawns:FindFirstChild('Boss_Spawn') or spawns:FindFirstChild('BossSpawn'))
 		return part ~= nil
+	end
+
+	local function inZoneXZ(zone, pos)
+		if not zone or typeof(pos) ~= 'Vector3' then
+			return false
+		end
+		local lp = zone.CFrame:PointToObjectSpace(pos)
+		return math.abs(lp.X) <= zone.Size.X * 0.5 + 1.5
+			and math.abs(lp.Z) <= zone.Size.Z * 0.5 + 1.5
+	end
+
+	function api.posInCorridor(dungeon, pos)
+		if not dungeon or typeof(pos) ~= 'Vector3' then
+			return false
+		end
+		for _, child in ipairs(dungeon:GetChildren()) do
+			local idx = tonumber(tostring(child.Name):match('^Room_(%d+)$'))
+			if idx and api.isCorridor(dungeon, idx) then
+				local zone = api.zone(dungeon, idx)
+				if zone and inZoneXZ(zone, pos) then
+					return true
+				end
+			end
+		end
+		return false
 	end
 
 	-- Floor boss often has no RoomIndex. It still belongs to the Boss_Spawn room.
@@ -7148,6 +7195,22 @@ end
 -- are not locked — their summoned pack has to be cleared first.
 local farmLock = nil
 
+rt.npcInCorridor = function(npc)
+	if not npc or isFinalBoss(npc) then
+		return false
+	end
+	local d = activeDungeonRoot()
+	if not d then
+		return false
+	end
+	local idx = Rooms.indexOf(npc)
+	if idx and Rooms.isCorridor(d, idx) then
+		return true
+	end
+	local p = enemyRoot(npc)
+	return p ~= nil and Rooms.posInCorridor(d, p.Position) == true
+end
+
 local function pickFarmTarget()
 	local root = routeRoot()
 	if not root then
@@ -8010,6 +8073,16 @@ local function holdOnEnemy(npc)
 		local aimAt = cachedAim or live.Position
 		-- `dir` is locked at hold start. Live-position back orbited the pack.
 		local goal = Vector3.new(aimAt.X, y, aimAt.Z) + Vector3.new(dir.X, 0, dir.Z) * stand
+		local dungeon = activeDungeonRoot()
+		if dungeon and Rooms.posInCorridor(dungeon, goal) then
+			local idx = tonumber(rt.farmRoomFilter) or Rooms.indexOf(npc)
+			if idx and not Rooms.isCorridor(dungeon, idx) then
+				local zone = Rooms.zone(dungeon, idx)
+				if zone then
+					goal = Vector3.new(zone.Position.X, y, zone.Position.Z)
+				end
+			end
+		end
 		return goal, Vector3.new(aimAt.X, y, aimAt.Z)
 	end)
 end
@@ -8330,6 +8403,31 @@ local function roomSweepComplete(dungeon, idx)
 	return true
 end
 
+-- Halls, claimed shrine pads, and empty checkpoints are not rooms to sweep.
+local function skipTourRoom(dungeon, idx)
+	if not dungeon or not idx then
+		return nil
+	end
+	if Rooms.isCorridor(dungeon, idx) then
+		return 'hall'
+	end
+	if rt.roomSweepDone and rt.roomSweepDone[idx] then
+		return 'done'
+	end
+	if type(rt.shrineRoomDone) == 'function' and rt.shrineRoomDone(dungeon, idx) then
+		return 'shrine'
+	end
+	local room = dungeon:FindFirstChild('Room_' .. tostring(idx))
+	if room and room:GetAttribute('IsCheckpoint') == true
+		and Rooms.aliveCount(dungeon, idx) <= 0
+		and not roomHasPendingChest(dungeon, idx)
+		and not roomHasPendingGate(dungeon, idx)
+	then
+		return 'checkpoint'
+	end
+	return nil
+end
+
 local function sweepKindColor(dungeon, idx)
 	if Rooms.isBossRoom(dungeon, idx) then
 		return Color3.fromRGB(255, 72, 118)
@@ -8423,10 +8521,13 @@ local function tickRoomSweepMarks()
 	local maxR = Rooms.maxRoom(dungeon)
 	local keep = {}
 	for i = 1, maxR do
-		if Rooms.isCorridor(dungeon, i) then
+		local why = skipTourRoom(dungeon, i)
+		if why then
 			clearSweepMark(i)
-		elseif rt.roomSweepDone and rt.roomSweepDone[i] then
-			clearSweepMark(i)
+			if why ~= 'hall' and why ~= 'done' then
+				rt.roomSweepDone = rt.roomSweepDone or {}
+				rt.roomSweepDone[i] = true
+			end
 		else
 			keep[i] = true
 			ensureSweepMark(dungeon, i)
@@ -8499,15 +8600,15 @@ local function tourFarmRooms(dungeon)
 		task.wait(0.25)
 		return
 	end
-	while idx <= maxRoom and (
-		Rooms.isCorridor(dungeon, idx)
-		or (rt.roomSweepDone and rt.roomSweepDone[idx])
-		or (type(rt.shrineRoomDone) == 'function' and rt.shrineRoomDone(dungeon, idx))
-	) do
-		if Rooms.isCorridor(dungeon, idx) then
+	while idx <= maxRoom do
+		local why = skipTourRoom(dungeon, idx)
+		if not why then
+			break
+		end
+		if why == 'hall' then
 			farmLabel = ('skip hall Room_%d'):format(idx)
-		elseif type(rt.shrineRoomDone) == 'function' and rt.shrineRoomDone(dungeon, idx) then
-			farmLabel = ('skip shrine Room_%d'):format(idx)
+		elseif why == 'shrine' or why == 'checkpoint' then
+			farmLabel = ('skip %s Room_%d'):format(why, idx)
 			rt.roomSweepDone = rt.roomSweepDone or {}
 			rt.roomSweepDone[idx] = true
 			clearSweepMark(idx)
