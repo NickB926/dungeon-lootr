@@ -5462,14 +5462,30 @@ local Rooms = (function()
 	end
 
 	function api.bossSpawn(dungeon)
-		local maxR = api.maxRoom(dungeon)
-		if maxR < 1 then
+		if not dungeon then
 			return nil
 		end
-		local room = dungeon:FindFirstChild('Room_' .. tostring(maxR))
-		local spawns = room and room:FindFirstChild('Spawns')
-		local part = spawns and spawns:FindFirstChild('Boss_Spawn')
-		return (part and part:IsA('BasePart')) and part or nil
+		local function spawnIn(room)
+			local spawns = room and room:FindFirstChild('Spawns')
+			local part = spawns and (spawns:FindFirstChild('Boss_Spawn') or spawns:FindFirstChild('BossSpawn'))
+			return (part and part:IsA('BasePart')) and part or nil
+		end
+		local maxR = api.maxRoom(dungeon)
+		if maxR >= 1 then
+			local part = spawnIn(dungeon:FindFirstChild('Room_' .. tostring(maxR)))
+			if part then
+				return part
+			end
+		end
+		for _, child in ipairs(dungeon:GetChildren()) do
+			if tostring(child.Name):match('^Room_%d+$') then
+				local part = spawnIn(child)
+				if part then
+					return part
+				end
+			end
+		end
+		return nil
 	end
 
 	-- Stand mid-Zone and fire touch so the server arms CurrentRoom / spawns.
@@ -5787,6 +5803,19 @@ local Rooms = (function()
 			local boss = slot:FindFirstChild('Boss')
 			local completed = slot:FindFirstChild('Completed')
 			if not (boss and boss.Visible) and not (completed and completed.Visible) then
+				return true
+			end
+		end
+		return false
+	end
+
+	-- Last star is the floor boss. nextGapRoom skips IsBoss, so Endless used to
+	-- tour empty Room_1→N and sit in the last hallway instead of the boss pad.
+	function api.bossStarOpen()
+		for _, slot in ipairs(hudSlots()) do
+			local boss = slot:FindFirstChild('Boss')
+			local completed = slot:FindFirstChild('Completed')
+			if boss and boss.Visible == true and not (completed and completed.Visible) then
 				return true
 			end
 		end
@@ -7759,9 +7788,11 @@ local function farmLoop()
 				if inEndlessFarm() and awakeN == 0 then
 					tryChestSweep('chest sweep')
 				end
-				if (phase == 'BossPhase' or phase == 'Boss') then
+				if (phase == 'BossPhase' or phase == 'Boss' or (inEndlessFarm() and awakeN == 0 and Rooms.bossStarOpen())) then
 					-- Open-world keeps CurrentRoom=0 and a streamed-out floor boss
 					-- looks like awakeN=0 — do not hop Room_1→N / Next Area.
+					-- Endless also leaves Phase blank while the boss star is still
+					-- empty, which used to park us in Room_28 doing nothing.
 					local bossTrash = select(1, countFarmSides())
 					if bossTrash == 0 then
 						tryChestSweep('chest sweep · then boss')
@@ -13137,7 +13168,7 @@ end))
 
 getgenv().DLUnload = function()
 	local resumeFarm = on('DLAutoFarm') == true
-	getgenv().DLResumeFarm = resumeFarm
+	getgenv().DLResumeFarm = resumeFarm or getgenv().DLResumeFarm == true
 	pcall(Config.finish)
 	pcall(applyFullbright, false)
 	pcall(rt.applyOcclusion, false)

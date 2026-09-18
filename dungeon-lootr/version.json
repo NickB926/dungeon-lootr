@@ -1,6 +1,6 @@
 {
-    "version":  "1.0.39",
-    "message":  "Skip unhittable leftover fodder instead of looping them",
+    "version":  "1.0.40",
+    "message":  "Go to the floor boss instead of touring empty rooms",
     "files":  [
                   "dungeon-lootr/launch.lua",
                   "dungeon-lootr/DungeonLootr.lua",
