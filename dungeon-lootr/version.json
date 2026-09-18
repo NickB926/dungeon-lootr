@@ -1,6 +1,6 @@
 {
-    "version":  "1.0.66",
-    "message":  "skip empty checkpoints and landing pads; do not chase into halls",
+    "version":  "1.0.67",
+    "message":  "visible room numbers; clear only after chests; do not rewalk swept rooms",
     "files":  [
                   "dungeon-lootr/launch.lua",
                   "dungeon-lootr/DungeonLootr.lua",

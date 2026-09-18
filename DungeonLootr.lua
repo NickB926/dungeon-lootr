@@ -93,7 +93,7 @@ Library.ToggleKeybind = { Value = 'Home' }
 Library.Animations = Library.Animations or {}
 Library.Animations.TabSwitch = false
 
-local DL_BUILD = '1.0.66'
+local DL_BUILD = '1.0.67'
 getgenv().DLBuild = DL_BUILD
 
 local Window = Library:CreateWindow({
@@ -2488,7 +2488,7 @@ local function inEndlessFarm()
 end
 
 local function lootClearedRoom(roomIdx, dungeon)
-	if not roomIdx or not on('DLChestAnywhere') then
+	if not roomIdx then
 		return false
 	end
 	if rt.roomHasLiving(roomIdx) then
@@ -2511,7 +2511,7 @@ local function lootClearedRoom(roomIdx, dungeon)
 		return false
 	end
 	farmLabel = ('looting Room_%d'):format(roomIdx)
-	local deadline = os.clock() + (inEndlessFarm() and 0.7 or 1.1)
+	local deadline = os.clock() + (inEndlessFarm() and 1.2 or 2.2)
 	local emptyPolls = 0
 	while os.clock() < deadline do
 		if not on('DLAutoFarm') then
@@ -2526,12 +2526,20 @@ local function lootClearedRoom(roomIdx, dungeon)
 		local pending = false
 		for _, child in ipairs(dungeon:GetChildren()) do
 			if child:GetAttribute('DungeonChest') == true or child.Name:sub(1, 13) == 'DungeonChest' then
-				if tonumber(child:GetAttribute('RoomIndex')) == roomIdx then
+				local belongs = tonumber(child:GetAttribute('RoomIndex')) == roomIdx
+				if not belongs then
+					local pos = chestStandPos(child)
+					belongs = pos ~= nil and Rooms.posInRoom(dungeon, roomIdx, pos)
+				end
+				if belongs then
 					sawChest = true
 					if chestClaimCandidate(child) then
 						ready = true
 						pending = true
 						break
+					end
+					if not chestIsClaimed(child) then
+						pending = true
 					end
 				end
 			end
@@ -2547,7 +2555,7 @@ local function lootClearedRoom(roomIdx, dungeon)
 		end
 		if not sawChest then
 			emptyPolls += 1
-			if emptyPolls >= 2 then
+			if emptyPolls >= 4 then
 				return false
 			end
 		end
@@ -5410,6 +5418,7 @@ local Rooms = (function()
 		rt.chestDone = {}
 		rt.chestDoneUid = {}
 		rt.roomSweepDone = {}
+		rt.roomSweepDonePos = {}
 	end
 
 	function api.maxRoom(dungeon)
@@ -5521,6 +5530,14 @@ local Rooms = (function()
 			end
 		end
 		return false
+	end
+
+	function api.posInRoom(dungeon, idx, pos)
+		if not dungeon or not idx or typeof(pos) ~= 'Vector3' then
+			return false
+		end
+		local zone = api.zone(dungeon, idx)
+		return zone ~= nil and inZoneXZ(zone, pos)
 	end
 
 	-- Floor boss often has no RoomIndex. It still belongs to the Boss_Spawn room.
@@ -7274,7 +7291,7 @@ local function pickFarmTarget()
 			end
 			local roomOnly = tonumber(rt.farmRoomFilter)
 			local doneIdx = Rooms.indexOf(npc)
-			if not roomOnly and doneIdx and rt.roomSweepDone and rt.roomSweepDone[doneIdx] and not isFinalBoss(npc) then
+			if not roomOnly and doneIdx and roomIsSwept(activeDungeonRoot(), doneIdx) and not isFinalBoss(npc) then
 				return
 			end
 			if roomOnly and not Rooms.npcInRoom(activeDungeonRoot(), npc, roomOnly) then
@@ -8326,6 +8343,11 @@ local function clearSweepMark(idx)
 	end
 	sweepMarks[idx] = nil
 	pcall(function()
+		if m.adorn then
+			m.adorn:Destroy()
+		end
+	end)
+	pcall(function()
 		if m.hl then
 			m.hl:Destroy()
 		end
@@ -8343,13 +8365,58 @@ local function clearAllSweepMarks()
 	end
 end
 
+local function roomPosKey(dungeon, idx)
+	local zone = dungeon and Rooms.zone(dungeon, idx)
+	if not zone then
+		return nil
+	end
+	local p = zone.Position
+	return string.format('z:%.0f:%.0f:%.0f', p.X, p.Y, p.Z)
+end
+
+local function markRoomSwept(dungeon, idx)
+	if not idx then
+		return
+	end
+	rt.roomSweepDone = rt.roomSweepDone or {}
+	rt.roomSweepDone[idx] = true
+	local key = roomPosKey(dungeon, idx)
+	if key then
+		rt.roomSweepDonePos = rt.roomSweepDonePos or {}
+		rt.roomSweepDonePos[key] = true
+	end
+	clearSweepMark(idx)
+end
+
+local function roomIsSwept(dungeon, idx)
+	if not idx then
+		return false
+	end
+	if rt.roomSweepDone and rt.roomSweepDone[idx] then
+		return true
+	end
+	local key = roomPosKey(dungeon, idx)
+	return key ~= nil and rt.roomSweepDonePos and rt.roomSweepDonePos[key] == true
+end
+
+local function chestBelongsToRoom(dungeon, idx, model)
+	if not model or not idx then
+		return false
+	end
+	if tonumber(model:GetAttribute('RoomIndex')) == idx then
+		return true
+	end
+	local pos = chestStandPos(model)
+	return pos ~= nil and Rooms.posInRoom(dungeon, idx, pos)
+end
+
 local function roomHasPendingChest(dungeon, idx)
-	if not dungeon or not idx or not on('DLChestAnywhere') then
+	if not dungeon or not idx then
 		return false
 	end
 	for _, child in ipairs(dungeon:GetChildren()) do
 		if child:GetAttribute('DungeonChest') == true or child.Name:sub(1, 13) == 'DungeonChest' then
-			if tonumber(child:GetAttribute('RoomIndex')) == idx then
+			if chestBelongsToRoom(dungeon, idx, child) then
 				if chestIsClaimed(child) then
 					markChestDone(child)
 					continue
@@ -8411,7 +8478,7 @@ local function skipTourRoom(dungeon, idx)
 	if Rooms.isCorridor(dungeon, idx) then
 		return 'hall'
 	end
-	if rt.roomSweepDone and rt.roomSweepDone[idx] then
+	if roomIsSwept(dungeon, idx) then
 		return 'done'
 	end
 	if type(rt.shrineRoomDone) == 'function' and rt.shrineRoomDone(dungeon, idx) then
@@ -8443,6 +8510,9 @@ local function sweepKindColor(dungeon, idx)
 end
 
 local function sweepMarksOn()
+	if LocalPlayer:GetAttribute('InDungeon') == true or farmBusy then
+		return true
+	end
 	local t = Toggles and Toggles.DLSweepMarks
 	if t == nil then
 		return true
@@ -8473,36 +8543,50 @@ local function ensureSweepMark(dungeon, idx)
 		box.Adornee = adornee
 		box.Color3 = color
 		box.SurfaceColor3 = color
-		box.LineThickness = 0.06
-		box.SurfaceTransparency = 0.72
-		box.Parent = room
+		box.LineThickness = 0.18
+		box.SurfaceTransparency = 0.45
+		box.Parent = adornee
+		local adorn = Instance.new('BoxHandleAdornment')
+		adorn.Name = SWEEP_MARK
+		adorn.Adornee = adornee
+		adorn.AlwaysOnTop = true
+		adorn.ZIndex = 10
+		adorn.Size = adornee.Size
+		adorn.Color3 = color
+		adorn.Transparency = 0.62
+		adorn.Parent = adornee
 		local bb = Instance.new('BillboardGui')
 		bb.Name = SWEEP_MARK
 		bb.AlwaysOnTop = true
-		bb.Size = UDim2.fromOffset(110, 110)
-		bb.StudsOffset = Vector3.new(0, 8, 0)
-		bb.MaxDistance = 4000
+		bb.Size = UDim2.fromOffset(140, 140)
+		bb.StudsOffset = Vector3.new(0, math.max(12, adornee.Size.Y * 0.35), 0)
+		bb.MaxDistance = 8000
 		bb.Adornee = adornee
-		bb.Parent = room
+		bb.Parent = adornee
 		local lab = Instance.new('TextLabel')
-		lab.BackgroundTransparency = 0.15
+		lab.BackgroundTransparency = 0.05
 		lab.BackgroundColor3 = Color3.fromRGB(8, 10, 16)
 		lab.Size = UDim2.fromScale(1, 1)
 		lab.Font = Enum.Font.SourceSansBold
 		lab.TextScaled = true
 		lab.Text = tostring(idx)
 		lab.TextColor3 = color
-		lab.TextStrokeTransparency = 0.2
+		lab.TextStrokeTransparency = 0.1
 		lab.Parent = bb
 		local corner = Instance.new('UICorner')
 		corner.CornerRadius = UDim.new(0.2, 0)
 		corner.Parent = lab
-		m = { hl = box, bb = bb, lab = lab }
+		m = { hl = box, bb = bb, lab = lab, adorn = adorn }
 		sweepMarks[idx] = m
 	end
 	m.hl.Color3 = color
 	m.hl.SurfaceColor3 = color
 	m.hl.Adornee = adornee
+	if m.adorn then
+		m.adorn.Color3 = color
+		m.adorn.Adornee = adornee
+		m.adorn.Size = adornee.Size
+	end
 	m.bb.Adornee = adornee
 	m.lab.Text = tostring(idx)
 	m.lab.TextColor3 = color
@@ -8524,10 +8608,6 @@ local function tickRoomSweepMarks()
 		local why = skipTourRoom(dungeon, i)
 		if why then
 			clearSweepMark(i)
-			if why ~= 'hall' and why ~= 'done' then
-				rt.roomSweepDone = rt.roomSweepDone or {}
-				rt.roomSweepDone[i] = true
-			end
 		else
 			keep[i] = true
 			ensureSweepMark(dungeon, i)
@@ -8570,12 +8650,17 @@ local function tourFarmRooms(dungeon)
 		task.wait(0.25)
 		return
 	end
+	pcall(tickRoomSweepMarks)
 	local dname = dungeon.Name
 	if dname and rt.farmDungeonId ~= dname then
 		rt.farmDungeonId = dname
-		rt.farmRoomIdx = 1
-		rt.farmRoomPhase = 'wait'
-		rt.farmRoomFilter = nil
+		-- Tile re-parent can rename Generated_ without a new floor. Keep the
+		-- sweep so we do not walk already-cleared rooms from 1 again.
+		if not (rt.roomSweepDone and next(rt.roomSweepDone)) then
+			rt.farmRoomIdx = 1
+			rt.farmRoomPhase = 'wait'
+			rt.farmRoomFilter = nil
+		end
 	end
 	local maxRoom = Rooms.maxRoom(dungeon)
 	local idx = tonumber(rt.farmRoomIdx) or 1
@@ -8609,8 +8694,6 @@ local function tourFarmRooms(dungeon)
 			farmLabel = ('skip hall Room_%d'):format(idx)
 		elseif why == 'shrine' or why == 'checkpoint' then
 			farmLabel = ('skip %s Room_%d'):format(why, idx)
-			rt.roomSweepDone = rt.roomSweepDone or {}
-			rt.roomSweepDone[idx] = true
 			clearSweepMark(idx)
 		else
 			farmLabel = ('done Room_%d'):format(idx)
@@ -8692,13 +8775,11 @@ local function tourFarmRooms(dungeon)
 			rt.chestRoomOpen[idx] = true
 		end
 	end
-	if on('DLChestAnywhere') then
+	if roomHasPendingChest(dungeon, idx) or on('DLChestAnywhere') then
 		pcall(lootClearedRoom, idx, dungeon)
 	end
 	if roomSweepComplete(dungeon, idx) then
-		rt.roomSweepDone = rt.roomSweepDone or {}
-		rt.roomSweepDone[idx] = true
-		clearSweepMark(idx)
+		markRoomSwept(dungeon, idx)
 		rt.farmRoomIdx = idx + 1
 		rt.farmRoomPhase = 'wait'
 		rt.farmRoomFilter = nil
@@ -14131,6 +14212,9 @@ pcall(function()
 		if Toggles.DLNoPause and Toggles.DLNoPause.Value ~= true then
 			Toggles.DLNoPause:SetValue(true)
 		end
+		if Toggles.DLSweepMarks and Toggles.DLSweepMarks.Value ~= true then
+			Toggles.DLSweepMarks:SetValue(true)
+		end
 	elseif on('DLNoPause') then
 		rt.Pause.start()
 	end
@@ -14167,6 +14251,10 @@ hbCombatConn = track(RunService.Heartbeat:Connect(function(dt)
 	-- Skills / farm watchdog must not sit behind the combat throttle.
 	pcall(autoSkillTick)
 	pcall(RunLoops.autoFarmTick)
+	if farmBusy and os.clock() - (rt.sweepMarkAt or 0) > 0.45 then
+		rt.sweepMarkAt = os.clock()
+		pcall(tickRoomSweepMarks)
+	end
 	local now = os.clock()
 	local hot = now < (rt.parryArmed or 0) or now < (rt.parryDelay or 0)
 	if not hot then
