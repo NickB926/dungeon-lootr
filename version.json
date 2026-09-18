@@ -1,6 +1,6 @@
 {
-    "version":  "1.0.55",
-    "message":  "stop hopping rooms when a leftover pack is elsewhere",
+    "version":  "1.0.56",
+    "message":  "sequential farm: shrine, special, then each room wait/kill/gate/chest",
     "files":  [
                   "dungeon-lootr/launch.lua",
                   "dungeon-lootr/DungeonLootr.lua",

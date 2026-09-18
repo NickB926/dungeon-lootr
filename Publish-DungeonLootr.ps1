@@ -187,4 +187,4 @@ try {
 Write-Host ''
 Write-Host "==> Published $($ver.version)  (was $oldVersion) - pushed to GitHub"
 Write-Host 'Friend / reinstall:'
-Write-Host 'loadstring(game:HttpGet("https://raw.githubusercontent.com/NickB926/dungeon-lootr/main/bootstrap.lua"))()'
+Write-Host 'loadstring(game:HttpGet("https://raw.githubusercontent.com/NickB926/dungeon-lootr/main/bootstrap.lua?"..tostring(tick())))()'

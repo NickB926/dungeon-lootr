@@ -93,7 +93,7 @@ Library.ToggleKeybind = { Value = 'Home' }
 Library.Animations = Library.Animations or {}
 Library.Animations.TabSwitch = false
 
-local DL_BUILD = '1.0.55'
+local DL_BUILD = '1.0.56'
 getgenv().DLBuild = DL_BUILD
 
 local Window = Library:CreateWindow({
@@ -5051,6 +5051,7 @@ local Rooms = (function()
 	local WAKE_TIMEOUT = 5
 	local SPAWN_TIMEOUT = 4
 	local api = {}
+	local hudHasOpenStar
 	-- Rooms we have seen host at least one awake enemy this run. Empty rooms not
 	-- in this set are candidates for a walk-in activation (hordes).
 	local visited = {}
@@ -5385,6 +5386,10 @@ local Rooms = (function()
 		rt.zoneLayout = nil
 		rt.zoneCurrent = nil
 		rt.zoneFromGc = nil
+		rt.farmRoomIdx = 1
+		rt.farmRoomPhase = 'wait'
+		rt.farmRoomFilter = nil
+		rt.farmDungeonId = nil
 	end
 
 	function api.maxRoom(dungeon)
@@ -5778,7 +5783,12 @@ local Rooms = (function()
 		if expectingSpawn then
 			-- HUD still has empty circles — this room may be a late special/horde
 			-- wave. emptyHop + Next Area is how Depth 1 skipped a star.
-			if not special and not hudHasOpenStar() and not api.specialStarOpen() then
+			local starsOpen = false
+			pcall(function()
+				starsOpen = (hudHasOpenStar and hudHasOpenStar())
+					or (type(api.specialStarOpen) == 'function' and api.specialStarOpen())
+			end)
+			if not special and not starsOpen then
 				emptyHop[idx] = true
 			end
 			return false
@@ -5790,6 +5800,67 @@ local Rooms = (function()
 			end)
 		end
 		return woke
+	end
+
+	-- Stand in the Zone for `seconds`. Return true as soon as THIS room has
+	-- an awake pack so farm can kill with the usual hover stand.
+	function api.holdRoom(dungeon, idx, seconds)
+		local goal = entryPoint(dungeon, idx)
+		local root = routeRoot()
+		if not goal or not root then
+			return false
+		end
+		local zone = api.zone(dungeon, idx)
+		Pin.at(standingSpot(goal, 0), true)
+		local function pokeZone()
+			local my = routeRoot()
+			if not my then
+				return
+			end
+			pcall(function()
+				my.CanCollide = true
+			end)
+			if zone and type(firetouchinterest) == 'function' then
+				pcall(firetouchinterest, my, zone, 0)
+				pcall(firetouchinterest, my, zone, 1)
+			end
+		end
+		rt.holdCollideUntil = os.clock() + (tonumber(seconds) or 3) + 1
+		pokeZone()
+		local function awakeHere()
+			local n = 0
+			eachNpc(dungeon, function(npc)
+				if api.indexOf(npc) == idx
+					and isWorldEnemy(npc)
+					and enemyAlive(npc)
+					and npc:GetAttribute('IsDormant') ~= true
+					and enemyRoot(npc)
+				then
+					n += 1
+				end
+			end)
+			return n > 0
+		end
+		if awakeHere() then
+			return true
+		end
+		local deadline = os.clock() + (tonumber(seconds) or 3)
+		local poked = 0
+		while os.clock() < deadline do
+			if not farmActive() or not routeRoot() then
+				rt.holdCollideUntil = 0
+				return false
+			end
+			if awakeHere() then
+				return true
+			end
+			if os.clock() - poked > 0.35 then
+				poked = os.clock()
+				pokeZone()
+			end
+			task.wait(0.1)
+		end
+		return awakeHere()
 	end
 
 	-- Completion_Progress stars: each ZoneSlot is a room Index from RoomLayoutUpdate.
@@ -5923,7 +5994,7 @@ local Rooms = (function()
 		return false
 	end
 
-	local function hudHasOpenStar()
+	hudHasOpenStar = function()
 		for _, slot in ipairs(hudSlots()) do
 			local boss = slot:FindFirstChild('Boss')
 			local completed = slot:FindFirstChild('Completed')
@@ -7002,6 +7073,11 @@ local function pickFarmTarget()
 	if inBossRushFarm() then
 		skipFinal = false
 	end
+	-- Sequential room tour fights whatever is in THIS room, including the
+	-- floor boss. skipFinal is map-wide leftover trash after the tour.
+	if tonumber(rt.farmRoomFilter) then
+		skipFinal = false
+	end
 	-- Crystals first (Dark Professor wipe if they finish). Hunt special next
 	-- (Scarlet Knight loop), then raid / room special, then summoned adds.
 	local crystal, crystalD = nearestCrystal()
@@ -7026,6 +7102,10 @@ local function pickFarmTarget()
 			and not farmSkipped(farmLock)
 			and not (skipFinal and isFinalBoss(farmLock))
 			and not (enemyRank(farmLock) >= 4 and select(1, addsNearSpecial(farmLock)))
+		local roomOnly = tonumber(rt.farmRoomFilter)
+		if keep and roomOnly and Rooms.indexOf(farmLock) ~= roomOnly then
+			keep = false
+		end
 		local part = keep and enemyRoot(farmLock)
 		local d = part and (part.Position - root.Position).Magnitude
 		if keep and part then
@@ -7038,6 +7118,10 @@ local function pickFarmTarget()
 	local ranged, rangedD = nil, nil
 	eachFarmNpc(function(npc)
 		if not enemyAlive(npc) or farmSkipped(npc) then
+			return
+		end
+		local roomOnly = tonumber(rt.farmRoomFilter)
+		if roomOnly and Rooms.indexOf(npc) ~= roomOnly then
 			return
 		end
 		if skipFinal and isFinalBoss(npc) then
@@ -7100,6 +7184,10 @@ local function pickFarmTarget()
 		local parts = {}
 		eachFarmNpc(function(npc)
 			if not enemyAlive(npc) or farmSkipped(npc) or enemyRank(npc) >= 3 then
+				return
+			end
+			local roomOnly = tonumber(rt.farmRoomFilter)
+			if roomOnly and Rooms.indexOf(npc) ~= roomOnly then
 				return
 			end
 			if skipFinal and isFinalBoss(npc) then
@@ -8032,6 +8120,145 @@ local function farmKill(npc)
 	end
 end
 
+local function findLiveSpecial()
+	local best, bestD = nil, 9e9
+	eachFarmNpc(function(npc)
+		if not enemyAlive(npc) or farmSkipped(npc) or isFinalBoss(npc) then
+			return
+		end
+		local special = enemyRank(npc) >= 4
+			or npc:GetAttribute('IsSpecial') == true
+			or npc:GetAttribute('IsSpecialBoss') == true
+		if not special then
+			return
+		end
+		local part = enemyRoot(npc)
+		if not part then
+			return
+		end
+		local me = routeRoot()
+		local d = me and (part.Position - me.Position).Magnitude or 0
+		if d < bestD then
+			best, bestD = npc, d
+		end
+	end)
+	return best
+end
+
+local function farmKillNpc(npc)
+	if not npc then
+		return
+	end
+	farmLabel = ('%s · %d kills'):format(npc.Name, farmKills)
+	Rooms.markVisited(Rooms.indexOf(npc))
+	if npc:GetAttribute('IsDormant') == true then
+		farmLabel = ('wake %s'):format(npc.Name)
+		wakeTarget(npc)
+	else
+		local okKill, errKill = pcall(farmKill, npc)
+		if not okKill then
+			farmFinished[npc] = os.clock() + 2
+			Library:Notify('Farm skip: ' .. tostring(errKill))
+		end
+	end
+end
+
+-- Room_1→N once: wait 3s (cut short if THIS room wakes), hover-kill, gate, chests.
+local function tourFarmRooms(dungeon)
+	if inBossRushFarm() and not dungeon then
+		farmLabel = 'boss rush · waiting'
+		task.wait(0.25)
+		return
+	end
+	if not dungeon then
+		farmLabel = ('idle · %d kills'):format(farmKills)
+		task.wait(0.25)
+		return
+	end
+	local dname = dungeon.Name
+	if dname and rt.farmDungeonId ~= dname then
+		rt.farmDungeonId = dname
+		rt.farmRoomIdx = 1
+		rt.farmRoomPhase = 'wait'
+		rt.farmRoomFilter = nil
+	end
+	local maxRoom = Rooms.maxRoom(dungeon)
+	local idx = tonumber(rt.farmRoomIdx) or 1
+	if maxRoom < 1 then
+		farmLabel = ('idle · %d kills'):format(farmKills)
+		task.wait(0.25)
+		return
+	end
+	if idx > maxRoom then
+		rt.farmRoomFilter = nil
+		local leftover = pickFarmTarget()
+		if leftover then
+			farmKillNpc(leftover)
+			return
+		end
+		farmLabel = ('idle · %d kills'):format(farmKills)
+		task.wait(0.25)
+		return
+	end
+	local phase = rt.farmRoomPhase or 'wait'
+	rt.farmRoomFilter = idx
+	if phase == 'wait' then
+		farmLabel = ('Room_%d · wait'):format(idx)
+		local model = dungeon:FindFirstChild('Room_' .. tostring(idx))
+		if not model then
+			farmLabel = ('Room_%d · load'):format(idx)
+			local from = routeRoot() and routeRoot().Position
+			if from then
+				pcall(Rooms.pushForward, dungeon, from)
+			end
+			task.wait(0.35)
+			return
+		end
+		local spawned = Rooms.holdRoom(dungeon, idx, 3)
+		if spawned or Rooms.aliveCount(dungeon, idx) > 0 then
+			rt.farmRoomPhase = 'fight'
+		else
+			rt.farmRoomPhase = 'loot'
+		end
+		return
+	end
+	if phase == 'fight' then
+		if Rooms.aliveCount(dungeon, idx) <= 0 then
+			rt.farmRoomPhase = 'loot'
+			return
+		end
+		local target = pickFarmTarget()
+		if not target then
+			rt.farmRoomPhase = 'loot'
+			return
+		end
+		farmLabel = ('Room_%d · %s'):format(idx, target.Name)
+		farmKillNpc(target)
+		if Rooms.aliveCount(dungeon, idx) <= 0 then
+			rt.farmRoomPhase = 'loot'
+		end
+		return
+	end
+	farmLabel = ('Room_%d · loot'):format(idx)
+	if wantOpenGates() then
+		local opened = false
+		pcall(function()
+			opened = KeyDoor.unlockForRoom(idx) == true
+		end)
+		if opened then
+			rt.chestRoomOpen = rt.chestRoomOpen or {}
+			rt.chestRoomOpen[idx] = true
+		end
+	end
+	if on('DLChestAnywhere') and Rooms.aliveCount(dungeon, idx) == 0 then
+		pcall(clearChestSkipForRoom, idx)
+		pcall(lootClearedRoom, idx, dungeon)
+	end
+	rt.farmRoomIdx = idx + 1
+	rt.farmRoomPhase = 'wait'
+	rt.farmRoomFilter = nil
+end
+
 local function farmLoop()
 	local root = routeRoot()
 	farmHome = root and root.CFrame or nil
@@ -8071,270 +8298,27 @@ local function farmLoop()
 				end
 				task.wait(0.4)
 			else
-			if (on('DLAutoSpecial') or on('DLHuntSpecial')) and not Rooms.starsHold() then
-				pcall(trySummonSpecial)
-			end
-			local aoeOk, aoeHit = pcall(rt.avoidFloorAoe)
-			if aoeOk and aoeHit and typeof(rt.aoeGoal) == 'Vector3' then
-				farmLabel = 'aoe gap'
-				Pin.at(rt.aoeGoal, true)
-			end
-			local dungeon = activeDungeonRoot()
-			local from = routeRoot() and routeRoot().Position
-			local starsHold = Rooms.starsHold()
-			local starIdx = dungeon and Rooms.nextStarRoom(dungeon, from)
-			local target = pickFarmTarget()
-			-- Leftover packs in other rooms must not warp us off the star we
-			-- just entered (that was the map hop).
-			if target and starIdx and starsHold then
-				if Rooms.indexOf(target) ~= starIdx then
-					target = nil
+			local blessHold = false
+			pcall(function()
+				if type(rt.blessFarmPriority) == 'function' then
+					blessHold = rt.blessFarmPriority() == true
 				end
-			elseif target and starIdx and (enemyRank(target) >= 4 or isFinalBoss(target)) then
-				if Rooms.indexOf(target) ~= starIdx then
-					target = nil
-				end
-			end
-			-- Wait only in a real rush arena (no Generated_ rooms to walk).
-			if inBossRushFarm() and not target and not activeDungeonRoot() then
-				farmLabel = 'boss rush · waiting'
-				task.wait(0.25)
-			elseif target then
-				farmLabel = ('%s · %d kills'):format(target.Name, farmKills)
-				local dungeon = activeDungeonRoot()
-				local idx = Rooms.indexOf(target)
-				Rooms.markVisited(idx)
-				if target:GetAttribute('IsDormant') == true then
-					farmLabel = ('wake %s'):format(target.Name)
-					wakeTarget(target)
-				else
-					local okKill, errKill = pcall(farmKill, target)
-					if not okKill then
-						farmFinished[target] = os.clock() + 2
-						Library:Notify('Farm skip: ' .. tostring(errKill))
-					end
-				end
-				-- Unlock the gate as rooms clear. Endless has no boss — loot that
-				-- room the moment its pack is dead.
-				local clearIdx = idx
-				if not clearIdx then
-					local myRoot = routeRoot()
-					clearIdx = myRoot and select(1, Rooms.nearestIdx(dungeon, myRoot.Position))
-				end
-				if clearIdx and Rooms.aliveCount(dungeon, clearIdx) == 0 and not isFinalBoss(target) then
-					local opened = false
-					pcall(function()
-						opened = KeyDoor.unlockForRoom(clearIdx) == true
-					end)
-					if opened then
-						rt.chestRoomOpen = rt.chestRoomOpen or {}
-						rt.chestRoomOpen[clearIdx] = true
-					end
-					-- Loot this room as soon as ITS pack is dead. A boss in
-					-- another room must not skip these chests.
-					if inEndlessFarm() then
-						clearChestSkipForRoom(clearIdx)
-						task.wait(0.15)
-						if Rooms.aliveCount(dungeon, clearIdx) == 0 and not rt.anyAwakeTrash() then
-							pcall(lootClearedRoom, clearIdx, dungeon)
-						end
-					end
-				end
+			end)
+			if blessHold then
+				task.wait(0.2)
 			else
-				-- Nothing awake. Prefer rooms whose Completion_Progress star is still
-				-- empty — open-world Catacombs keeps CurrentRoom=0 so softlock repair
-				-- must not override missing stars.
+				local aoeOk, aoeHit = pcall(rt.avoidFloorAoe)
+				if aoeOk and aoeHit and typeof(rt.aoeGoal) == 'Vector3' then
+					farmLabel = 'aoe gap'
+					Pin.at(rt.aoeGoal, true)
+				end
 				local dungeon = activeDungeonRoot()
-				local myRoot = routeRoot()
-				local from = myRoot and myRoot.Position
-				local awakeN = dungeon and Rooms.awakeCount(dungeon) or 0
-				local curRoom = Rooms.sessionCurrentRoom()
-				local phase = Rooms.sessionPhase()
-				local starsHold = Rooms.starsHold()
-				local starIdx = dungeon and Rooms.nextStarRoom(dungeon, from)
-				-- Endless keeps CurrentRoom=0. The Catacombs Room_1→N repair
-				-- sweep is what parked us in the courtyard with an empty HUD slot.
-				local softlocked = curRoom == 0
-					and awakeN == 0
-					and phase ~= 'BossPhase'
-					and phase ~= 'Boss'
-					and not Rooms.repairFinished()
-					and not starIdx
-					and not inEndlessFarm()
-				-- Rooms first. Map-wide chest tours on an empty floor skipped
-				-- special / star rooms (Depth 1 Next Area with empty circles).
-				local specialIdx = dungeon and Rooms.nextSpecialRoom(dungeon)
-				if specialIdx and starsHold and starIdx and specialIdx ~= starIdx then
-					specialIdx = nil
-				end
-				if specialIdx then
-					-- Empty rooms that are special / horde waves: stand in the Zone
-					-- until the pack spawns. Skipping them was Depth hops with 0 enemies.
-					farmLabel = ('special Room_%d'):format(specialIdx)
-					if not Rooms.enter(dungeon, specialIdx) then
-						Rooms.park(specialIdx, 2.5)
-					end
-				elseif (phase == 'BossPhase' or phase == 'Boss' or (inEndlessFarm() and awakeN == 0 and Rooms.bossStarOpen() and not Rooms.specialStarOpen())) then
-					-- Open-world keeps CurrentRoom=0 and a streamed-out floor boss
-					-- looks like awakeN=0 — do not hop Room_1→N / Next Area.
-					-- Endless also leaves Phase blank while the boss star is still
-					-- empty, which used to park us in Room_28 doing nothing.
-					local bossTrash = select(1, countFarmSides())
-					if bossTrash == 0 and not starsHold then
-						tryChestSweep('chest sweep · then boss')
-					end
-					local bossNpc
-					eachFarmNpc(function(npc)
-						if not bossNpc and enemyAlive(npc) and isFinalBoss(npc) then
-							bossNpc = npc
-						end
-					end)
-					if bossNpc then
-						farmLabel = ('%s · %d kills'):format(bossNpc.Name, farmKills)
-						if bossNpc:GetAttribute('IsDormant') == true then
-							wakeTarget(bossNpc)
-						else
-							local okKill, errKill = pcall(farmKill, bossNpc)
-							if not okKill then
-								farmFinished[bossNpc] = os.clock() + 2
-								Library:Notify('Farm skip: ' .. tostring(errKill))
-							end
-						end
-					else
-						local boss = dungeon and Rooms.bossSpawn(dungeon)
-						if boss then
-							farmLabel = 'boss pad'
-							Pin.at(standingSpot(boss.Position, 0), true)
-							task.wait(0.2)
-						else
-							farmLabel = 'boss · waiting'
-							task.wait(0.5)
-						end
-					end
-				elseif starIdx and dungeon then
-					farmLabel = ('star Room_%d'):format(starIdx)
-					-- Ghost spent key gates so we can reach the incomplete star.
-					pcall(function()
-						for _, child in ipairs(dungeon:GetChildren()) do
-							if child.Name:sub(1, 7) == 'Locked_' then
-								local p = child:FindFirstChildWhichIsA('ProximityPrompt', true)
-								if not p or p.Enabled ~= true then
-									ghostDoor(child)
-								end
-							end
-						end
-					end)
-					if not Rooms.enter(dungeon, starIdx) then
-						Rooms.park(starIdx, 1.8)
-					end
-				elseif softlocked and dungeon then
-					local fixIdx = tonumber(rt.repairIdx) or Rooms.nextArm(dungeon) or 1
-					farmLabel = ('repair Room_%d'):format(fixIdx)
-					if not Rooms.repairSkip(dungeon) then
-						task.wait(0.35)
-					end
-				elseif (inEndlessFarm() and awakeN == 0 and not starIdx)
-					or (curRoom == 0 and awakeN == 0 and Rooms.repairFinished() and not starIdx)
-				then
-					-- Empty stars / special waves still on the bar: never Next Area.
-					-- Depth 1 courtyard skips were this branch walking the gate.
-					if starsHold and dungeon then
-						local holdIdx = Rooms.nextEmpty(dungeon, from, nil)
-						if holdIdx then
-							farmLabel = ('star Room_%d'):format(holdIdx)
-							if not Rooms.enter(dungeon, holdIdx) then
-								Rooms.park(holdIdx, 1.8)
-							end
-						elseif from and Rooms.pushForward(dungeon, from) then
-							farmLabel = 'load next room'
-							task.wait(0.2)
-						else
-							farmLabel = 'wait stars'
-							task.wait(0.35)
-						end
-					else
-						-- Endless floor is empty, or Catacombs softlock already swept:
-						-- loot happened above. Push gates — do not tour empty Room_N.
-						local gatePos = from and select(1, NextArea.find(from))
-						local boss = (not inEndlessFarm()) and dungeon and Rooms.bossSpawn(dungeon)
-						if boss then
-							farmLabel = 'boss pad'
-							Pin.at(standingSpot(boss.Position, 0), true)
-							task.wait(0.2)
-							Pin.stop()
-						elseif gatePos and NextArea.advance() then
-							farmLabel = 'next gate'
-						elseif from and Rooms.pushForward(dungeon, from) then
-							farmLabel = 'load next room'
-							task.wait(0.2)
-						else
-							farmLabel = ('idle · %d kills'):format(farmKills)
-							task.wait(0.2)
-						end
-					end
+				local specialNpc = findLiveSpecial()
+				if specialNpc then
+					rt.farmRoomFilter = nil
+					farmKillNpc(specialNpc)
 				else
-				-- Resolve dormant packs / missing stars before chest hops — looting
-				-- across the map while a progress star is empty is the 3-room hop.
-				local noMobs = dungeon and Rooms.livingNpc(dungeon) == 0
-				local flipping = Rooms.flipping()
-				local hasDormant = (not noMobs) and from and Rooms.nextDormant(dungeon, from)
-				local starIdx = dungeon and Rooms.nextStarRoom(dungeon, from)
-				local trashLeft, bossesLeft = countFarmSides()
-				local looted = false
-				-- Chests only after every star is filled. Sweeping first is what
-				-- walked Next Area / other rooms while circles were still empty.
-				if trashLeft == 0 and not starsHold and not starIdx and not hasDormant then
-					looted = tryChestSweep(bossesLeft > 0 and 'chest sweep · then boss' or 'chest sweep')
-				end
-				if not looted then
-					-- Gates only when no sleeping pack is waiting — otherwise we loop
-					-- Locked_/ContinuePath next to Room_20 while Room_16 stays dormant.
-					local gatePos = (awakeN == 0 and not hasDormant and not starIdx and not softlocked and not starsHold and from)
-						and select(1, NextArea.find(from))
-						or nil
-					if from and KeyDoor.unlock(from) then
-						farmLabel = 'use key'
-					elseif starIdx then
-						-- HUD star missing for this room Index — clear it before gates.
-						if flipping then
-							Rooms.park(Rooms.lastEnter(), 8)
-						end
-						farmLabel = ('star Room_%d'):format(starIdx)
-						if not Rooms.enter(dungeon, starIdx) then
-							Rooms.park(starIdx)
-						end
-					elseif hasDormant then
-						-- Even while "flipping", keep waking the lowest dormant room.
-						-- Only park the room we just bounced off of.
-						if flipping then
-							Rooms.park(Rooms.lastEnter(), 8)
-						end
-						farmLabel = ('waking Room_%d'):format(hasDormant)
-						if not Rooms.enter(dungeon, hasDormant) then
-							Rooms.park(hasDormant)
-						end
-					else
-						local idx = (not flipping) and from and Rooms.nextEmpty(dungeon, from, gatePos)
-						if idx then
-							farmLabel = ('horde Room_%d'):format(idx)
-							if not Rooms.enter(dungeon, idx) then
-								Rooms.park(idx)
-							end
-						elseif gatePos and NextArea.advance() then
-							farmLabel = 'next gate'
-						elseif from and Rooms.pushForward(dungeon, from) then
-							farmLabel = noMobs and 'load next room' or 'unstuck push'
-							if noMobs then
-								task.wait(0.2)
-							end
-						elseif awakeN == 0 and not hasDormant and not starIdx and not starsHold and NextArea.advance() then
-							farmLabel = 'next gate'
-						else
-							farmLabel = ('idle · %d kills'):format(farmKills)
-							task.wait(noMobs and 0.25 or 0.12)
-						end
-					end
-				end
+					tourFarmRooms(dungeon)
 				end
 			end
 			end
@@ -9811,6 +9795,10 @@ local BlessPick = (function()
 		if not on('DLAutoBless') or shrineBusy or routeBusy or rt.refillBusy or rt.refillUrgent or os.clock() < shrineNext then
 			return
 		end
+		-- Farm loop calls farmPriority instead so shrines beat rooms.
+		if farmBusy and rt.blessFromFarm ~= true then
+			return
+		end
 		shrineNext = os.clock() + (farmBusy and 4 or 2)
 		local root = routeRoot()
 		if not root then
@@ -9933,6 +9921,36 @@ local BlessPick = (function()
 			shrineNext = os.clock() + ((bestPrompt.Parent and bestPrompt.Enabled) and 2.5 or 10)
 		end)
 	end
+
+	function api.busy()
+		return shrineBusy == true
+	end
+
+	-- True = farm must yield. Blessings beat specials and room walking.
+	function api.farmPriority()
+		if not on('DLAutoBless') then
+			return false
+		end
+		if shrineBusy then
+			farmLabel = 'blessing shrine'
+			return true
+		end
+		if api.open() then
+			farmLabel = 'blessing'
+			pcall(api.run, true)
+			return true
+		end
+		rt.blessFromFarm = true
+		pcall(api.shrineTick)
+		rt.blessFromFarm = nil
+		if shrineBusy then
+			farmLabel = 'blessing shrine'
+			return true
+		end
+		return false
+	end
+
+	rt.blessFarmPriority = api.farmPriority
 
 	return api
 end)()
