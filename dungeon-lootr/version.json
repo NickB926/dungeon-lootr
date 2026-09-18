@@ -1,6 +1,6 @@
 {
-    "version":  "1.0.64",
-    "message":  "stop farm CFrame lock and 100-stud load hops",
+    "version":  "1.0.65",
+    "message":  "skip claimed blessing shrines and their checkpoint rooms",
     "files":  [
                   "dungeon-lootr/launch.lua",
                   "dungeon-lootr/DungeonLootr.lua",

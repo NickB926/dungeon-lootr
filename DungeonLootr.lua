@@ -93,7 +93,7 @@ Library.ToggleKeybind = { Value = 'Home' }
 Library.Animations = Library.Animations or {}
 Library.Animations.TabSwitch = false
 
-local DL_BUILD = '1.0.64'
+local DL_BUILD = '1.0.65'
 getgenv().DLBuild = DL_BUILD
 
 local Window = Library:CreateWindow({
@@ -8499,9 +8499,18 @@ local function tourFarmRooms(dungeon)
 		task.wait(0.25)
 		return
 	end
-	while idx <= maxRoom and (Rooms.isCorridor(dungeon, idx) or (rt.roomSweepDone and rt.roomSweepDone[idx])) do
+	while idx <= maxRoom and (
+		Rooms.isCorridor(dungeon, idx)
+		or (rt.roomSweepDone and rt.roomSweepDone[idx])
+		or (type(rt.shrineRoomDone) == 'function' and rt.shrineRoomDone(dungeon, idx))
+	) do
 		if Rooms.isCorridor(dungeon, idx) then
 			farmLabel = ('skip hall Room_%d'):format(idx)
+		elseif type(rt.shrineRoomDone) == 'function' and rt.shrineRoomDone(dungeon, idx) then
+			farmLabel = ('skip shrine Room_%d'):format(idx)
+			rt.roomSweepDone = rt.roomSweepDone or {}
+			rt.roomSweepDone[idx] = true
+			clearSweepMark(idx)
 		else
 			farmLabel = ('done Room_%d'):format(idx)
 		end
@@ -10137,19 +10146,50 @@ local BlessPick = (function()
 		return string.format('s:%.0f:%.0f:%.0f', pos.X, pos.Y, pos.Z)
 	end
 
+	local function shrineLooksSpent(model, prompt)
+		if prompt and prompt.Enabled == true then
+			return false
+		end
+		-- Unused template keeps emitters on and Enabled=true. Claimed live
+		-- altars disable Receive Blessing and turn every ParticleEmitter off.
+		if model then
+			local onN, saw = 0, false
+			for _, d in ipairs(model:GetDescendants()) do
+				if d:IsA('ParticleEmitter') then
+					saw = true
+					if d.Enabled then
+						onN += 1
+						break
+					end
+				end
+			end
+			if saw and onN == 0 then
+				return true
+			end
+		end
+		return false
+	end
+
 	local function shrineAlreadyUsed(model, pos)
 		rt.shrineUsed = rt.shrineUsed or {}
 		if model and rt.shrineUsed[model] then
 			return true
 		end
+		if model and rt.shrineUsed['name:' .. model.Name] then
+			return true
+		end
 		local key = shrinePosKey(pos)
-		return key ~= nil and rt.shrineUsed[key] == true
+		if key and rt.shrineUsed[key] == true then
+			return true
+		end
+		return shrineLooksSpent(model, model and model:FindFirstChildWhichIsA('ProximityPrompt', true) or nil)
 	end
 
 	local function markShrineUsed(model, pos)
 		rt.shrineUsed = rt.shrineUsed or {}
 		if model then
 			rt.shrineUsed[model] = true
+			rt.shrineUsed['name:' .. model.Name] = true
 		end
 		local key = shrinePosKey(pos)
 		if key then
@@ -10188,6 +10228,9 @@ local BlessPick = (function()
 				pos = ok and p or nil
 			end
 			if not pos or shrineAlreadyUsed(model, pos) then
+				if pos then
+					markShrineUsed(model, pos)
+				end
 				return
 			end
 			local dist = (pos - root.Position).Magnitude
@@ -10269,7 +10312,9 @@ local BlessPick = (function()
 				picked = api.run(true) == true
 				task.wait(0.45)
 			end
-			if picked or opened or (bestPrompt and bestPrompt.Parent and bestPrompt.Enabled ~= true) then
+			if picked or opened or shrineLooksSpent(bestModel, bestPrompt)
+				or (bestPrompt and bestPrompt.Parent and bestPrompt.Enabled ~= true)
+			then
 				markShrineUsed(bestModel, bestPos)
 			end
 			local live = routeRoot()
@@ -10353,7 +10398,42 @@ local BlessPick = (function()
 		return false
 	end
 
+	-- Checkpoint that only hosts a claimed altar: do not walk it again.
+	function api.roomIsSpent(dungeon, idx)
+		if not dungeon or not idx then
+			return false
+		end
+		local room = dungeon:FindFirstChild('Room_' .. tostring(idx))
+		if not room or room:GetAttribute('IsCheckpoint') ~= true then
+			return false
+		end
+		local spawns = room:FindFirstChild('Spawns')
+		if not (spawns and spawns:FindFirstChild('Altar_Spawn')) then
+			return false
+		end
+		if Rooms.aliveCount(dungeon, idx) > 0 then
+			return false
+		end
+		if roomHasPendingChest(dungeon, idx) or roomHasPendingGate(dungeon, idx) then
+			return false
+		end
+		local altar = dungeon:FindFirstChild('Blessing_Altar')
+		if not altar then
+			return false
+		end
+		local prompt = altar:FindFirstChildWhichIsA('ProximityPrompt', true)
+		local ok, pos = pcall(function()
+			return altar:GetPivot().Position
+		end)
+		if shrineAlreadyUsed(altar, ok and pos or nil) or shrineLooksSpent(altar, prompt) then
+			markShrineUsed(altar, ok and pos or nil)
+			return true
+		end
+		return false
+	end
+
 	rt.blessFarmPriority = api.farmPriority
+	rt.shrineRoomDone = api.roomIsSpent
 
 	return api
 end)()
