@@ -1,6 +1,6 @@
 {
-    "version":  "1.0.52",
-    "message":  "leave leftover specials to finish empty star rooms; stamp helper version",
+    "version":  "1.0.53",
+    "message":  "Loop specific Endless presses Continue on floor clear",
     "files":  [
                   "dungeon-lootr/launch.lua",
                   "dungeon-lootr/DungeonLootr.lua",

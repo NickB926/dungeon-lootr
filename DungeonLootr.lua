@@ -93,7 +93,7 @@ Library.ToggleKeybind = { Value = 'Home' }
 Library.Animations = Library.Animations or {}
 Library.Animations.TabSwitch = false
 
-local DL_BUILD = '1.0.52'
+local DL_BUILD = '1.0.53'
 getgenv().DLBuild = DL_BUILD
 
 local Window = Library:CreateWindow({
@@ -9911,15 +9911,30 @@ local Replay = (function()
 			return nil
 		end
 		-- Live path is Main.HUD.Dungeon_Container.Completion_Info (not under a "ui" folder).
+		-- Endless floor-clear lives on Endless_Container. Reading Dungeon_Container first
+		-- hid Continue_Frame so Loop specific never pressed it.
 		local main = pg:FindFirstChild('Main')
 		local hud = main and main:FindFirstChild('HUD')
 		if hud then
-			for _, name in ipairs({ 'Dungeon_Container', 'Endless_Container' }) do
+			local names = { 'Dungeon_Container', 'Endless_Container' }
+			if inEndlessFarm() then
+				names = { 'Endless_Container', 'Dungeon_Container' }
+			end
+			local fallback
+			for _, name in ipairs(names) do
 				local cont = hud:FindFirstChild(name)
 				local frame = cont and cont:FindFirstChild('Completion_Info')
 				if frame then
-					return frame
+					local shown = frame.Visible == true
+						or (cont:IsA('GuiObject') and cont.Visible == true and frame.Visible ~= false)
+					if shown then
+						return frame
+					end
+					fallback = fallback or frame
 				end
+			end
+			if fallback then
+				return fallback
 			end
 		end
 		return pg:FindFirstChild('Completion_Info', true)
@@ -10013,17 +10028,29 @@ local Replay = (function()
 		if not btn or not btn:IsA('GuiButton') then
 			return false
 		end
-		if type(firesignal) == 'function' and pcall(firesignal, btn.MouseButton1Click) then
-			return true
+		if type(firesignal) == 'function' then
+			for _, ev in ipairs({ btn.MouseButton1Click, btn.Activated, btn.MouseButton1Down }) do
+				if ev and pcall(firesignal, ev) then
+					return true
+				end
+			end
 		end
 		local ok, conns = pcall(getconnections, btn.MouseButton1Click)
-		if not ok then
-			return false
+		if ok then
+			for _, c in ipairs(conns) do
+				if c.Function then
+					task.spawn(c.Function)
+					return true
+				end
+			end
 		end
-		for _, c in ipairs(conns) do
-			if c.Function then
-				task.spawn(c.Function)
-				return true
+		ok, conns = pcall(getconnections, btn.Activated)
+		if ok then
+			for _, c in ipairs(conns) do
+				if c.Function then
+					task.spawn(c.Function)
+					return true
+				end
 			end
 		end
 		return false
@@ -10040,6 +10067,18 @@ local Replay = (function()
 		return hud and hud:FindFirstChild('Warning') or nil
 	end
 
+	local function loopingEndless()
+		if not on('DLLoopSpecific') then
+			return false
+		end
+		local wantDiff = Options.DLLoopDifficulty and tostring(Options.DLLoopDifficulty.Value or '')
+		if string.lower(wantDiff):find('endless', 1, true) then
+			return true
+		end
+		-- Dropdown can say Endless while CurrentDifficultyMode is blank mid-floor.
+		return inEndlessFarm()
+	end
+
 	-- Checkpoint confirm: Endless floors and Boss Rush wave 100 both use HUD.Warning
 	-- with green Confirm (not Completion_Info). Do not match chest / summon dialogs.
 	local function continueWarningShowing()
@@ -10053,10 +10092,11 @@ local Replay = (function()
 			or tx:find('summon', 1, true)
 			or tx:find('platinum', 1, true)
 			or tx:find('open all', 1, true)
+			or tx:find('bless', 1, true)
 		then
 			return false
 		end
-		return tx:find('checkpoint', 1, true)
+		if tx:find('checkpoint', 1, true)
 			or tx:find('regenerat', 1, true)
 			or tx:find('extract', 1, true)
 			or tx:find('continue', 1, true)
@@ -10064,6 +10104,79 @@ local Replay = (function()
 			or tx:find('milestone', 1, true)
 			or tx:find('wave', 1, true)
 			or tx:find('boss rush', 1, true)
+			or tx:find('next floor', 1, true)
+			or tx:find('next area', 1, true)
+			or tx:find('depth', 1, true)
+		then
+			return true
+		end
+		-- Endless floor prompt often has no keyword — just green Confirm.
+		if loopingEndless() or inEndlessFarm() then
+			local confirm = w:FindFirstChild('Confirm')
+			return confirm ~= nil and guiChainVisible(confirm)
+		end
+		return false
+	end
+
+	local function findContinueButton()
+		local pg = LocalPlayer:FindFirstChild('PlayerGui')
+		local main = pg and pg:FindFirstChild('Main')
+		local hud = main and main:FindFirstChild('HUD')
+		if not hud then
+			return nil
+		end
+		local best
+		local function consider(btn)
+			if btn and btn:IsA('GuiButton') and guiChainVisible(btn) then
+				best = best or btn
+			end
+		end
+		local endless = hud:FindFirstChild('Endless_Container')
+		local info = endless and endless:FindFirstChild('Completion_Info')
+		if info then
+			local frame = info:FindFirstChild('Continue_Frame')
+			consider(frame and (frame:FindFirstChildWhichIsA('GuiButton', true)))
+			consider(info:FindFirstChild('Continue', true))
+			consider(info:FindFirstChild('ContinueButton', true))
+		end
+		consider(hud:FindFirstChild('Continue', true))
+		consider(hud:FindFirstChild('ContinueButton', true))
+		local w = hudWarning()
+		if continueWarningShowing() then
+			consider(w and w:FindFirstChild('Confirm'))
+		end
+		local function scan(root)
+			if not root then
+				return
+			end
+			for _, d in ipairs(root:GetDescendants()) do
+				if d:IsA('GuiButton') and guiChainVisible(d) then
+					local n = string.lower(tostring(d.Name or ''))
+					local lab = d:FindFirstChildWhichIsA('TextLabel', true)
+					local tx = string.lower(tostring((lab and lab.Text) or d.Text or ''))
+					if n:find('continue', 1, true)
+						or tx:find('continue', 1, true)
+						or tx:find('next floor', 1, true)
+					then
+						if not n:find('chest', 1, true) and not tx:find('chest', 1, true) then
+							consider(d)
+						end
+					end
+				end
+			end
+		end
+		scan(info)
+		if continueWarningShowing() then
+			scan(w)
+		end
+		return best
+	end
+
+	local function continueUiShowing()
+		if continueWarningShowing() then
+			return true
+		end
+		return findContinueButton() ~= nil
 	end
 
 	local function clickContinueWarning()
@@ -10108,6 +10221,9 @@ local Replay = (function()
 	end
 
 	local function continueEndless()
+		if clickBtn(findContinueButton()) then
+			return true
+		end
 		if continueWarningShowing() and clickContinueWarning() then
 			return true
 		end
@@ -10128,6 +10244,9 @@ local Replay = (function()
 				return true
 			end
 		end
+		if not continueUiShowing() then
+			return false
+		end
 		local rf = RunLoops.knitRF('DungeonRunService', 'SubmitEndlessChoice')
 		if not rf then
 			return false
@@ -10146,15 +10265,11 @@ local Replay = (function()
 		return ok and res ~= false
 	end
 
-	local function loopingEndless()
-		if not on('DLLoopSpecific') then
-			return false
-		end
-		local wantDiff = Options.DLLoopDifficulty and tostring(Options.DLLoopDifficulty.Value or '')
-		return wantDiff == 'Endless'
-	end
-
 	function api.request(silent)
+		-- Endless floor-clear is Continue, not CHANGE DUNGEON / RequestReplay.
+		if loopingEndless() and continueEndless() then
+			return true
+		end
 		-- Prefer a better dungeon/diff when one is unlocked; otherwise same-run replay.
 		local upgrade = rt.dungeonUpgradeOrReplay
 		if type(upgrade) == 'function' then
@@ -10163,18 +10278,8 @@ local Replay = (function()
 				return true
 			end
 		end
-		-- Loop Endless on this map: floor-clear uses Continue, not RequestReplay.
-		if on('DLLoopSpecific') then
-			local wantDiff = Options.DLLoopDifficulty and tostring(Options.DLLoopDifficulty.Value or '')
-			local curDiff = tostring(
-				LocalPlayer:GetAttribute('CurrentDifficultyMode')
-					or LocalPlayer:GetAttribute('CurrentDifficulty')
-					or rt.runDifficulty
-					or ''
-			)
-			if wantDiff == 'Endless' and curDiff == 'Endless' and continueEndless() then
-				return true
-			end
+		if loopingEndless() and continueEndless() then
+			return true
 		end
 		if inRushNow() then
 			if clickReplayButton() then
@@ -10224,8 +10329,9 @@ local Replay = (function()
 			replayTries = 0
 			return
 		end
-		-- Never replay while the reward pick is still open.
-		if ChestPick.open() then
+		-- Never replay while the reward pick is still open. A faded Chest_Selection
+		-- must not block Endless Continue.
+		if ChestPick.open() and not (loopingEndless() and continueUiShowing()) then
 			replayArmedAt = nil
 			return
 		end
@@ -10253,8 +10359,8 @@ local Replay = (function()
 			end)
 			return
 		end
-		-- Endless floor checkpoint: HUD.Warning green Confirm.
-		if loopingEndless() and continueWarningShowing() then
+		-- Endless floor checkpoint: Continue_Frame or HUD.Warning green Confirm.
+		if loopingEndless() and continueUiShowing() then
 			local now = os.clock()
 			if now - lastReplayAt < 1.2 then
 				return
