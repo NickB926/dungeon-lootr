@@ -1276,6 +1276,11 @@ local function maintainNoclip()
 	local now = os.clock()
 	-- Farm already re-applies noclip when it starts; the game rarely flips
 	-- CanCollide back on mid-fight, so slow the maintain pass way down.
+	-- ZoneEntered (horde / special wave spawn) needs collision. Noclip maintain
+	-- used to flip it back off mid-arm and the room looked empty.
+	if now < (rt.holdCollideUntil or 0) then
+		return
+	end
 	local gap = farmBusy and 0.85 or 0.4
 	if now - rt.noclip < gap then
 		return
@@ -5311,7 +5316,10 @@ local Rooms = (function()
 			want = (api.nearestIdx(dungeon, fromPos) or 0) + 1
 		end
 		local zone = api.zone(dungeon, want)
-		if not zone or visited[want] or emptyHop[want] or (retryAt[want] or 0) > now then
+		-- Special / horde waves start with 0 NPCs. emptyHop used to skip them
+		-- forever after one short stand.
+		local special = api.roomIsSpecial(dungeon, want)
+		if not zone or visited[want] or (emptyHop[want] and not special) or (retryAt[want] or 0) > now then
 			return nil
 		end
 		if api.dormantCount(dungeon, want) > 0 or api.aliveCount(dungeon, want) > 0 then
@@ -5658,12 +5666,26 @@ local Rooms = (function()
 		end
 		api.noteEnter(idx)
 		local expectingSpawn = api.dormantCount(dungeon, idx) == 0
+		local special = api.roomIsSpecial(dungeon, idx)
 		local zone = api.zone(dungeon, idx)
 		Pin.at(standingSpot(goal, 0), true)
-		if zone and type(firetouchinterest) == 'function' then
-			pcall(firetouchinterest, root, zone, 0)
-			pcall(firetouchinterest, root, zone, 1)
+		-- Special / horde waves only start after ZoneEntered. Noclip skips that
+		-- touch, the room stays empty, and farm hopped to the next star.
+		local function pokeZone()
+			local my = routeRoot()
+			if not my then
+				return
+			end
+			pcall(function()
+				my.CanCollide = true
+			end)
+			if zone and type(firetouchinterest) == 'function' then
+				pcall(firetouchinterest, my, zone, 0)
+				pcall(firetouchinterest, my, zone, 1)
+			end
 		end
+		rt.holdCollideUntil = os.clock() + (special and 9 or 6)
+		pokeZone()
 		local function packReady()
 			local n = 0
 			eachNpc(dungeon, function(npc)
@@ -5679,9 +5701,14 @@ local Rooms = (function()
 		end
 		local function grabbed()
 			visited[idx] = true
+			emptyHop[idx] = nil
 			enterFlip = 0
+			rt.holdCollideUntil = 0
 			Pin.stop()
 			enemyCacheAt = 0
+			if noclipOn then
+				pcall(setCharNoclip, true)
+			end
 			pcall(function()
 				KeyDoor.unlockForRoom(idx)
 			end)
@@ -5690,12 +5717,14 @@ local Rooms = (function()
 		if packReady() then
 			return grabbed()
 		end
-		-- Empty rooms hop fast. Horde spawn still needs a short server window.
-		local waitFor = expectingSpawn and 2.1 or 1.2
+		-- Empty connector rooms can leave fast. Special / horde waves spawn late.
+		local waitFor = special and 8 or (expectingSpawn and 5.5 or 1.2)
 		local deadline = os.clock() + waitFor
 		local bumped = false
+		local poked = 0
 		while os.clock() < deadline do
 			if not routeRoot() or not farmActive() then
+				rt.holdCollideUntil = 0
 				Pin.stop()
 				return false
 			end
@@ -5704,6 +5733,10 @@ local Rooms = (function()
 			end
 			if not expectingSpawn and api.dormantCount(dungeon, idx) == 0 and api.aliveCount(dungeon, idx) > 0 then
 				return grabbed()
+			end
+			if os.clock() - poked > 0.35 then
+				poked = os.clock()
+				pokeZone()
 			end
 			if not bumped then
 				bumped = true
@@ -5717,13 +5750,18 @@ local Rooms = (function()
 			task.wait(0.05)
 		end
 		Pin.stop()
+		rt.holdCollideUntil = 0
+		if noclipOn then
+			pcall(setCharNoclip, true)
+		end
 		if packReady() or api.livingNpc(dungeon) > 0 then
 			return grabbed()
 		end
 		if expectingSpawn then
-			-- Remember the miss. Marking visited used to fill the list and
-			-- nextStarRoom then sent Endless to HUD slot 2 (courtyard).
-			emptyHop[idx] = true
+			-- Only skip true empty shells. Special-wave rooms stay eligible.
+			if not special then
+				emptyHop[idx] = true
+			end
 			return false
 		end
 		local woke = api.dormantCount(dungeon, idx) == 0
@@ -5737,20 +5775,44 @@ local Rooms = (function()
 
 	-- Completion_Progress stars: each ZoneSlot is a room Index from RoomLayoutUpdate.
 	-- Empty circle (Completed not visible, not Boss) → that room still needs a clear.
+	local function zoneLooksSpecial(z)
+		if type(z) ~= 'table' then
+			return false
+		end
+		if z.IsSpecial == true or z.HasSpecial == true or z.IsSpecialBoss == true
+			or z.IsHorde == true or z.IsEvent == true or z.IsWave == true
+		then
+			return true
+		end
+		local t = string.lower(tostring(z.Type or z.RoomType or z.Kind or z.WaveType or ''))
+		return t:find('special', 1, true)
+			or t:find('horde', 1, true)
+			or t:find('event', 1, true)
+			or t:find('wave', 1, true)
+			or false
+	end
+
+	local function copyZone(z)
+		if type(z) ~= 'table' then
+			return nil
+		end
+		return {
+			Index = tonumber(z.Index),
+			IsBoss = z.IsBoss == true,
+			IsSpecial = zoneLooksSpecial(z),
+			Completed = z.Completed == true or z.Done == true,
+			HasTreasure = z.HasTreasure == true,
+			Type = z.Type or z.RoomType or z.Kind,
+		}
+	end
+
 	function api.ingestLayout(zones, current)
 		if type(zones) ~= 'table' then
 			return
 		end
 		local copy = {}
 		for i, z in ipairs(zones) do
-			if type(z) == 'table' then
-				copy[i] = {
-					Index = tonumber(z.Index),
-					IsBoss = z.IsBoss == true,
-					Completed = z.Completed == true,
-					HasTreasure = z.HasTreasure == true,
-				}
-			end
+			copy[i] = copyZone(z)
 		end
 		rt.zoneLayout = copy
 		rt.zoneCurrent = current
@@ -5822,6 +5884,88 @@ local Rooms = (function()
 		return false
 	end
 
+	function api.specialStarOpen()
+		for _, slot in ipairs(hudSlots()) do
+			local completed = slot:FindFirstChild('Completed')
+			if completed and completed.Visible then
+				continue
+			end
+			for _, name in ipairs({ 'Special', 'Event', 'Horde', 'SpecialBoss' }) do
+				local ch = slot:FindFirstChild(name)
+				if ch and ch.Visible == true then
+					return true
+				end
+			end
+		end
+		return false
+	end
+
+	function api.roomIsSpecial(dungeon, idx)
+		if not idx then
+			return false
+		end
+		if type(rt.zoneLayout) == 'table' then
+			for _, z in ipairs(rt.zoneLayout) do
+				if z and tonumber(z.Index) == idx and z.IsSpecial then
+					return true
+				end
+			end
+		end
+		local room = dungeon and dungeon:FindFirstChild('Room_' .. tostring(idx))
+		if not room then
+			return false
+		end
+		if room:GetAttribute('IsSpecial') == true
+			or room:GetAttribute('HasSpecial') == true
+			or room:GetAttribute('IsHorde') == true
+			or room:GetAttribute('IsEvent') == true
+			or room:GetAttribute('IsWave') == true
+		then
+			return true
+		end
+		local t = string.lower(tostring(room:GetAttribute('Type') or room:GetAttribute('RoomType') or ''))
+		return t:find('special', 1, true)
+			or t:find('horde', 1, true)
+			or t:find('event', 1, true)
+			or t:find('wave', 1, true)
+			or false
+	end
+
+	-- Incomplete special / horde rooms still have 0 NPCs until the wave starts.
+	function api.nextSpecialRoom(dungeon)
+		if not dungeon then
+			return nil
+		end
+		local now = os.clock()
+		local function okRoom(i)
+			if not i or (retryAt[i] or 0) > now then
+				return false
+			end
+			if not entryPoint(dungeon, i) then
+				return false
+			end
+			if api.aliveCount(dungeon, i) > 0 or api.dormantCount(dungeon, i) > 0 then
+				return false
+			end
+			return true
+		end
+		if type(rt.zoneLayout) == 'table' then
+			for _, z in ipairs(rt.zoneLayout) do
+				local i = z and tonumber(z.Index)
+				if i and z.IsSpecial and not z.Completed and not z.IsBoss and okRoom(i) then
+					return i
+				end
+			end
+		end
+		local maxR = api.maxRoom(dungeon)
+		for i = 1, maxR do
+			if api.roomIsSpecial(dungeon, i) and okRoom(i) then
+				return i
+			end
+		end
+		return nil
+	end
+
 	local function seedLayoutFromController(force)
 		-- Stale Done flags left Endless idle↔next-gate while Room_6 was still open.
 		local fresh = os.clock() - (rt.zoneAt or 0) < 3.5
@@ -5845,11 +5989,7 @@ local Rooms = (function()
 				then
 					local copy = {}
 					for i, z in ipairs(v.Zones) do
-						copy[i] = {
-							Index = tonumber(z.Index),
-							IsBoss = z.IsBoss == true,
-							Completed = z.Done == true or z.Completed == true,
-						}
+						copy[i] = copyZone(z)
 					end
 					rt.zoneLayout = copy
 					rt.zoneFromGc = true
@@ -7788,7 +7928,15 @@ local function farmLoop()
 				if inEndlessFarm() and awakeN == 0 then
 					tryChestSweep('chest sweep')
 				end
-				if (phase == 'BossPhase' or phase == 'Boss' or (inEndlessFarm() and awakeN == 0 and Rooms.bossStarOpen())) then
+				local specialIdx = dungeon and Rooms.nextSpecialRoom(dungeon)
+				if specialIdx then
+					-- Empty rooms that are special / horde waves: stand in the Zone
+					-- until the pack spawns. Skipping them was Depth hops with 0 enemies.
+					farmLabel = ('special Room_%d'):format(specialIdx)
+					if not Rooms.enter(dungeon, specialIdx) then
+						Rooms.park(specialIdx, 2.5)
+					end
+				elseif (phase == 'BossPhase' or phase == 'Boss' or (inEndlessFarm() and awakeN == 0 and Rooms.bossStarOpen() and not Rooms.specialStarOpen())) then
 					-- Open-world keeps CurrentRoom=0 and a streamed-out floor boss
 					-- looks like awakeN=0 — do not hop Room_1→N / Next Area.
 					-- Endless also leaves Phase blank while the boss star is still

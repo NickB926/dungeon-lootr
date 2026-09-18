@@ -1,6 +1,6 @@
 {
-    "version":  "1.0.41",
-    "message":  "Go to the floor boss instead of touring empty rooms",
+    "version":  "1.0.42",
+    "message":  "Arm special/horde rooms instead of skipping empty waves",
     "files":  [
                   "dungeon-lootr/launch.lua",
                   "dungeon-lootr/DungeonLootr.lua",
