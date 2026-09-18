@@ -1,5 +1,5 @@
 {
-    "version":  "1.0.47",
+    "version":  "1.0.48",
     "message":  "do not take Next Area while HUD stars are still empty",
     "files":  [
                   "dungeon-lootr/launch.lua",
