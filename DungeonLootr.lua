@@ -93,7 +93,7 @@ Library.ToggleKeybind = { Value = 'Home' }
 Library.Animations = Library.Animations or {}
 Library.Animations.TabSwitch = false
 
-local DL_BUILD = '1.0.60'
+local DL_BUILD = '1.0.61'
 getgenv().DLBuild = DL_BUILD
 
 local Window = Library:CreateWindow({
@@ -2472,7 +2472,8 @@ local function lootClearedRoom(roomIdx, dungeon)
 		return false
 	end
 	farmLabel = ('looting Room_%d'):format(roomIdx)
-	local deadline = os.clock() + (inEndlessFarm() and 1.6 or 4.5)
+	local deadline = os.clock() + (inEndlessFarm() and 0.7 or 1.1)
+	local emptyPolls = 0
 	while os.clock() < deadline do
 		if not on('DLAutoFarm') then
 			return false
@@ -2505,7 +2506,13 @@ local function lootClearedRoom(roomIdx, dungeon)
 		if sawChest and not pending then
 			return false
 		end
-		task.wait(inEndlessFarm() and 0.08 or 0.35)
+		if not sawChest then
+			emptyPolls += 1
+			if emptyPolls >= 2 then
+				return false
+			end
+		end
+		task.wait(inEndlessFarm() and 0.08 or 0.2)
 	end
 	-- Do not fall through to a map-wide sweep — that looted other rooms
 	-- while packs were still up.
@@ -5385,16 +5392,21 @@ local Rooms = (function()
 		return m
 	end
 
-	-- Hallways are also named Room_N. Demon corridors are a ~36x66 Zone with
-	-- no loot/special flags. Do not stand on them — sleepers there belong to
-	-- the next combat room.
+	-- Skinny Zones are hallways even when tagged Checkpoint / Loot.
 	function api.isCorridor(dungeon, idx)
 		local room = dungeon and dungeon:FindFirstChild('Room_' .. tostring(idx))
 		if not room then
 			return false
 		end
+		local function skinny(x, z)
+			local mn, mx = math.min(x, z), math.max(x, z)
+			return mn <= 42 and mx <= 80
+		end
+		local zone = room:FindFirstChild('Zone')
+		if zone and zone:IsA('BasePart') and skinny(zone.Size.X, zone.Size.Z) then
+			return true
+		end
 		if room:GetAttribute('IsLootRoom') == true
-			or room:GetAttribute('IsCheckpoint') == true
 			or room:GetAttribute('IsSpecial') == true
 			or room:GetAttribute('IsSpecialBoss') == true
 			or room:GetAttribute('IsBoss') == true
@@ -5403,20 +5415,15 @@ local Rooms = (function()
 		then
 			return false
 		end
-		local function skinny(x, z)
-			local mn, mx = math.min(x, z), math.max(x, z)
-			return mn <= 42 and mx <= 80
-		end
-		local zone = room:FindFirstChild('Zone')
-		if zone and zone:IsA('BasePart') then
-			return skinny(zone.Size.X, zone.Size.Z)
+		-- Wide checkpoints are rest rooms. Skinny ones already returned true.
+		if room:GetAttribute('IsCheckpoint') == true then
+			return false
 		end
 		local ok, _, sz = pcall(function()
 			return room:GetBoundingBox()
 		end)
 		if ok and typeof(sz) == 'Vector3' and sz.Magnitude > 1 then
 			local mn, mx = math.min(sz.X, sz.Z), math.max(sz.X, sz.Z)
-			-- Streamed hallway shells are a thin strip (~5x72), not a combat tile.
 			if mn <= 14 and mx >= 40 then
 				return true
 			end
@@ -7167,12 +7174,16 @@ local function pickFarmTarget()
 	local nearest, nearestD = nil, nil
 	local top, topD, topRank = nil, nil, 0
 	local ranged, rangedD = nil, nil
-	eachFarmNpc(function(npc)
-		if not enemyAlive(npc) or farmSkipped(npc) then
-			return
-		end
-		local roomOnly = tonumber(rt.farmRoomFilter)
-		if roomOnly and not Rooms.npcInRoom(activeDungeonRoot(), npc, roomOnly) then
+		eachFarmNpc(function(npc)
+			if not enemyAlive(npc) or farmSkipped(npc) then
+				return
+			end
+			local roomOnly = tonumber(rt.farmRoomFilter)
+			local doneIdx = Rooms.indexOf(npc)
+			if not roomOnly and doneIdx and rt.roomSweepDone and rt.roomSweepDone[doneIdx] and not isFinalBoss(npc) then
+				return
+			end
+			if roomOnly and not Rooms.npcInRoom(activeDungeonRoot(), npc, roomOnly) then
 			return
 		end
 		if skipFinal and isFinalBoss(npc) then
@@ -8316,6 +8327,14 @@ local function sweepKindColor(dungeon, idx)
 	return Color3.fromRGB(72, 168, 255)
 end
 
+local function sweepMarksOn()
+	local t = Toggles and Toggles.DLSweepMarks
+	if t == nil then
+		return true
+	end
+	return t.Value == true
+end
+
 local function ensureSweepMark(dungeon, idx)
 	local room = dungeon and dungeon:FindFirstChild('Room_' .. tostring(idx))
 	if not room then
@@ -8323,50 +8342,59 @@ local function ensureSweepMark(dungeon, idx)
 		return
 	end
 	local color = sweepKindColor(dungeon, idx)
+	local zone = room:FindFirstChild('Zone')
+	local adornee = (zone and zone:IsA('BasePart')) and zone
+		or room:FindFirstChild('TileAnchor')
+		or room:FindFirstChildWhichIsA('BasePart', true)
+	if not adornee then
+		clearSweepMark(idx)
+		return
+	end
 	local m = sweepMarks[idx]
 	if not m or not m.hl or not m.hl.Parent then
 		clearSweepMark(idx)
-		local hl = Instance.new('Highlight')
-		hl.Name = SWEEP_MARK
-		hl.FillTransparency = 0.78
-		hl.OutlineTransparency = 0.05
-		hl.DepthMode = Enum.HighlightDepthMode.AlwaysOnTop
-		hl.Adornee = room
-		hl.Parent = room
-		local adornee = room:FindFirstChild('Zone')
-			or room:FindFirstChild('TileAnchor')
-			or room:FindFirstChildWhichIsA('BasePart', true)
+		local box = Instance.new('SelectionBox')
+		box.Name = SWEEP_MARK
+		box.Adornee = adornee
+		box.Color3 = color
+		box.SurfaceColor3 = color
+		box.LineThickness = 0.06
+		box.SurfaceTransparency = 0.72
+		box.Parent = room
 		local bb = Instance.new('BillboardGui')
 		bb.Name = SWEEP_MARK
 		bb.AlwaysOnTop = true
-		bb.Size = UDim2.fromOffset(78, 78)
-		bb.StudsOffset = Vector3.new(0, 14, 0)
-		bb.MaxDistance = 2500
+		bb.Size = UDim2.fromOffset(110, 110)
+		bb.StudsOffset = Vector3.new(0, 8, 0)
+		bb.MaxDistance = 4000
 		bb.Adornee = adornee
 		bb.Parent = room
 		local lab = Instance.new('TextLabel')
-		lab.BackgroundTransparency = 0.2
-		lab.BackgroundColor3 = Color3.fromRGB(10, 12, 18)
+		lab.BackgroundTransparency = 0.15
+		lab.BackgroundColor3 = Color3.fromRGB(8, 10, 16)
 		lab.Size = UDim2.fromScale(1, 1)
-		lab.Font = Enum.Font.GothamBlack
+		lab.Font = Enum.Font.SourceSansBold
 		lab.TextScaled = true
-		lab.TextColor3 = Color3.new(1, 1, 1)
-		lab.TextStrokeTransparency = 0.35
+		lab.Text = tostring(idx)
+		lab.TextColor3 = color
+		lab.TextStrokeTransparency = 0.2
 		lab.Parent = bb
 		local corner = Instance.new('UICorner')
 		corner.CornerRadius = UDim.new(0.2, 0)
 		corner.Parent = lab
-		m = { hl = hl, bb = bb, lab = lab }
+		m = { hl = box, bb = bb, lab = lab }
 		sweepMarks[idx] = m
 	end
-	m.hl.FillColor = color
-	m.hl.OutlineColor = color
+	m.hl.Color3 = color
+	m.hl.SurfaceColor3 = color
+	m.hl.Adornee = adornee
+	m.bb.Adornee = adornee
 	m.lab.Text = tostring(idx)
 	m.lab.TextColor3 = color
 end
 
 local function tickRoomSweepMarks()
-	if not on('DLSweepMarks') then
+	if not sweepMarksOn() then
 		clearAllSweepMarks()
 		return
 	end

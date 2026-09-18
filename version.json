@@ -1,6 +1,6 @@
 {
-    "version":  "1.0.60",
-    "message":  "1s room hold, skip hallways, sweep markers, fight unindexed floor boss",
+    "version":  "1.0.61",
+    "message":  "skip skinny halls even if checkpoint, numbered room boxes, no 4.5s empty loot wait",
     "files":  [
                   "dungeon-lootr/launch.lua",
                   "dungeon-lootr/DungeonLootr.lua",
