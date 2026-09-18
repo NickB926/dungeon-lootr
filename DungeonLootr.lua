@@ -93,7 +93,7 @@ Library.ToggleKeybind = { Value = 'Home' }
 Library.Animations = Library.Animations or {}
 Library.Animations.TabSwitch = false
 
-local DL_BUILD = '1.0.59'
+local DL_BUILD = '1.0.60'
 getgenv().DLBuild = DL_BUILD
 
 local Window = Library:CreateWindow({
@@ -5142,29 +5142,9 @@ local Rooms = (function()
 			-- Zone center at roughly standing height — standingSpot raycasts the floor.
 			return zone.Position + Vector3.new(0, 4, 0)
 		end
-		local room = dungeon and dungeon:FindFirstChild('Room_' .. tostring(idx))
-		local entry = connectorPart(dungeon, idx, 'Entry') or connectorPart(dungeon, idx, 'Exit')
-		if entry then
-			return entry.Position + Vector3.new(0, 3, 0)
-		end
-		if room then
-			local ok, pos = pcall(function()
-				return room:GetPivot().Position
-			end)
-			if ok and pos then
-				return pos + Vector3.new(0, 4, 0)
-			end
-		end
-		local spot
-		eachNpc(dungeon, function(npc)
-			if not spot and api.indexOf(npc) == idx then
-				local part = enemyRoot(npc)
-				if part then
-					spot = part.Position + Vector3.new(0, 3, 0)
-				end
-			end
-		end)
-		return spot
+		-- Connectors.Entry/Exit sit in the hallway. Standing there is how farm
+		-- kept walking corridors that are also named Room_N.
+		return nil
 	end
 
 	function api.livingNpc(dungeon)
@@ -5190,7 +5170,7 @@ local Rooms = (function()
 	function api.aliveCount(dungeon, idx)
 		local n = 0
 		eachNpc(dungeon, function(npc)
-			if api.indexOf(npc) == idx and isWorldEnemy(npc) and enemyAlive(npc) then
+			if api.npcInRoom(dungeon, npc, idx) and isWorldEnemy(npc) and enemyAlive(npc) then
 				n += 1
 			end
 		end)
@@ -5388,6 +5368,7 @@ local Rooms = (function()
 		rt.farmDungeonId = nil
 		rt.shrineUsed = {}
 		rt.chestDone = {}
+		rt.roomSweepDone = {}
 	end
 
 	function api.maxRoom(dungeon)
@@ -5405,8 +5386,8 @@ local Rooms = (function()
 	end
 
 	-- Hallways are also named Room_N. Demon corridors are a ~36x66 Zone with
-	-- no loot/special flags. Waiting 3s there parks farm next to sleepers
-	-- that belong to the next combat room.
+	-- no loot/special flags. Do not stand on them — sleepers there belong to
+	-- the next combat room.
 	function api.isCorridor(dungeon, idx)
 		local room = dungeon and dungeon:FindFirstChild('Room_' .. tostring(idx))
 		if not room then
@@ -5422,13 +5403,58 @@ local Rooms = (function()
 		then
 			return false
 		end
+		local function skinny(x, z)
+			local mn, mx = math.min(x, z), math.max(x, z)
+			return mn <= 42 and mx <= 80
+		end
 		local zone = room:FindFirstChild('Zone')
-		if not (zone and zone:IsA('BasePart')) then
+		if zone and zone:IsA('BasePart') then
+			return skinny(zone.Size.X, zone.Size.Z)
+		end
+		local ok, _, sz = pcall(function()
+			return room:GetBoundingBox()
+		end)
+		if ok and typeof(sz) == 'Vector3' and sz.Magnitude > 1 then
+			local mn, mx = math.min(sz.X, sz.Z), math.max(sz.X, sz.Z)
+			-- Streamed hallway shells are a thin strip (~5x72), not a combat tile.
+			if mn <= 14 and mx >= 40 then
+				return true
+			end
+			return skinny(sz.X, sz.Z)
+		end
+		return false
+	end
+
+	function api.isBossRoom(dungeon, idx)
+		local room = dungeon and dungeon:FindFirstChild('Room_' .. tostring(idx))
+		if not room then
 			return false
 		end
-		local mn = math.min(zone.Size.X, zone.Size.Z)
-		local mx = math.max(zone.Size.X, zone.Size.Z)
-		return mn <= 42 and mx <= 80
+		if room:GetAttribute('IsBoss') == true then
+			return true
+		end
+		local spawns = room:FindFirstChild('Spawns')
+		local part = spawns and (spawns:FindFirstChild('Boss_Spawn') or spawns:FindFirstChild('BossSpawn'))
+		return part ~= nil
+	end
+
+	-- Floor boss often has no RoomIndex. It still belongs to the Boss_Spawn room.
+	function api.npcInRoom(dungeon, npc, idx)
+		if not npc or not idx then
+			return false
+		end
+		if api.indexOf(npc) == idx then
+			return true
+		end
+		if npc:GetAttribute('IsBoss') == true
+			and npc:GetAttribute('IsSpecialBoss') ~= true
+			and npc:GetAttribute('IsMiniBoss') ~= true
+			and npc:GetAttribute('IsLootRoomGuard') ~= true
+			and api.isBossRoom(dungeon, idx)
+		then
+			return true
+		end
+		return false
 	end
 
 	-- Lowest room we have not yet touch-armed. Skipping ahead with noclip left
@@ -5850,12 +5876,12 @@ local Rooms = (function()
 				pcall(firetouchinterest, my, zone, 1)
 			end
 		end
-		rt.holdCollideUntil = os.clock() + (tonumber(seconds) or 3) + 1
+		rt.holdCollideUntil = os.clock() + (tonumber(seconds) or 1) + 1
 		pokeZone()
 		local function awakeHere()
 			local n = 0
 			eachNpc(dungeon, function(npc)
-				if api.indexOf(npc) == idx
+				if api.npcInRoom(dungeon, npc, idx)
 					and isWorldEnemy(npc)
 					and enemyAlive(npc)
 					and npc:GetAttribute('IsDormant') ~= true
@@ -5869,7 +5895,7 @@ local Rooms = (function()
 		if awakeHere() then
 			return true
 		end
-		local deadline = os.clock() + (tonumber(seconds) or 3)
+		local deadline = os.clock() + (tonumber(seconds) or 1)
 		local poked = 0
 		while os.clock() < deadline do
 			if not farmActive() or not routeRoot() then
@@ -7128,7 +7154,7 @@ local function pickFarmTarget()
 			and not (skipFinal and isFinalBoss(farmLock))
 			and not (enemyRank(farmLock) >= 4 and select(1, addsNearSpecial(farmLock)))
 		local roomOnly = tonumber(rt.farmRoomFilter)
-		if keep and roomOnly and Rooms.indexOf(farmLock) ~= roomOnly then
+		if keep and roomOnly and not Rooms.npcInRoom(activeDungeonRoot(), farmLock, roomOnly) then
 			keep = false
 		end
 		local part = keep and enemyRoot(farmLock)
@@ -7146,7 +7172,7 @@ local function pickFarmTarget()
 			return
 		end
 		local roomOnly = tonumber(rt.farmRoomFilter)
-		if roomOnly and Rooms.indexOf(npc) ~= roomOnly then
+		if roomOnly and not Rooms.npcInRoom(activeDungeonRoot(), npc, roomOnly) then
 			return
 		end
 		if skipFinal and isFinalBoss(npc) then
@@ -7212,7 +7238,7 @@ local function pickFarmTarget()
 				return
 			end
 			local roomOnly = tonumber(rt.farmRoomFilter)
-			if roomOnly and Rooms.indexOf(npc) ~= roomOnly then
+			if roomOnly and not Rooms.npcInRoom(activeDungeonRoot(), npc, roomOnly) then
 				return
 			end
 			if skipFinal and isFinalBoss(npc) then
@@ -8170,6 +8196,204 @@ local function findLiveSpecial()
 	return best
 end
 
+local function findFloorBoss()
+	local best
+	eachFarmNpc(function(npc)
+		if not enemyAlive(npc) or farmSkipped(npc) or not isFinalBoss(npc) then
+			return
+		end
+		if not enemyRoot(npc) then
+			return
+		end
+		best = npc
+	end)
+	return best
+end
+
+local SWEEP_MARK = '_DLSweep'
+local sweepMarks = {}
+
+local function clearSweepMark(idx)
+	local m = sweepMarks[idx]
+	if not m then
+		return
+	end
+	sweepMarks[idx] = nil
+	pcall(function()
+		if m.hl then
+			m.hl:Destroy()
+		end
+	end)
+	pcall(function()
+		if m.bb then
+			m.bb:Destroy()
+		end
+	end)
+end
+
+local function clearAllSweepMarks()
+	for idx in pairs(sweepMarks) do
+		clearSweepMark(idx)
+	end
+end
+
+local function roomHasPendingChest(dungeon, idx)
+	if not dungeon or not idx or not on('DLChestAnywhere') then
+		return false
+	end
+	for _, child in ipairs(dungeon:GetChildren()) do
+		if child:GetAttribute('DungeonChest') == true or child.Name:sub(1, 13) == 'DungeonChest' then
+			if tonumber(child:GetAttribute('RoomIndex')) == idx then
+				if rt.chestDone and rt.chestDone[child] then
+					continue
+				end
+				if child:GetAttribute('Looted') == true
+					or child:GetAttribute('Opened') == true
+					or child:GetAttribute('Claimed') == true
+				then
+					continue
+				end
+				if child:GetAttribute('LockedRoom') == true and not wantOpenGates() then
+					local p = chestPrompt(child)
+					if not (p and p.Enabled == true) then
+						continue
+					end
+				end
+				return true
+			end
+		end
+	end
+	return false
+end
+
+local function roomHasPendingGate(dungeon, idx)
+	if not dungeon or not idx or not wantOpenGates() then
+		return false
+	end
+	for _, child in ipairs(dungeon:GetChildren()) do
+		if child.Name:sub(1, 7) == 'Locked_' then
+			if tonumber(child:GetAttribute('ParentRoomIndex')) == idx then
+				local p = child:FindFirstChildWhichIsA('ProximityPrompt', true)
+				if p and p.Enabled == true then
+					local blob = (tostring(p.ActionText) .. ' ' .. tostring(p.ObjectText)):lower()
+					if blob:find('key', 1, true) or blob:find('unlock', 1, true) then
+						return true
+					end
+				end
+			end
+		end
+	end
+	return false
+end
+
+local function roomSweepComplete(dungeon, idx)
+	if not dungeon or not idx then
+		return false
+	end
+	if Rooms.aliveCount(dungeon, idx) > 0 then
+		return false
+	end
+	if roomHasPendingChest(dungeon, idx) then
+		return false
+	end
+	if roomHasPendingGate(dungeon, idx) then
+		return false
+	end
+	return true
+end
+
+local function sweepKindColor(dungeon, idx)
+	if Rooms.isBossRoom(dungeon, idx) then
+		return Color3.fromRGB(255, 72, 118)
+	end
+	local room = dungeon and dungeon:FindFirstChild('Room_' .. tostring(idx))
+	if room and room:GetAttribute('IsLootRoom') == true then
+		return Color3.fromRGB(255, 196, 64)
+	end
+	if room and room:GetAttribute('IsCheckpoint') == true then
+		return Color3.fromRGB(86, 214, 141)
+	end
+	return Color3.fromRGB(72, 168, 255)
+end
+
+local function ensureSweepMark(dungeon, idx)
+	local room = dungeon and dungeon:FindFirstChild('Room_' .. tostring(idx))
+	if not room then
+		clearSweepMark(idx)
+		return
+	end
+	local color = sweepKindColor(dungeon, idx)
+	local m = sweepMarks[idx]
+	if not m or not m.hl or not m.hl.Parent then
+		clearSweepMark(idx)
+		local hl = Instance.new('Highlight')
+		hl.Name = SWEEP_MARK
+		hl.FillTransparency = 0.78
+		hl.OutlineTransparency = 0.05
+		hl.DepthMode = Enum.HighlightDepthMode.AlwaysOnTop
+		hl.Adornee = room
+		hl.Parent = room
+		local adornee = room:FindFirstChild('Zone')
+			or room:FindFirstChild('TileAnchor')
+			or room:FindFirstChildWhichIsA('BasePart', true)
+		local bb = Instance.new('BillboardGui')
+		bb.Name = SWEEP_MARK
+		bb.AlwaysOnTop = true
+		bb.Size = UDim2.fromOffset(78, 78)
+		bb.StudsOffset = Vector3.new(0, 14, 0)
+		bb.MaxDistance = 2500
+		bb.Adornee = adornee
+		bb.Parent = room
+		local lab = Instance.new('TextLabel')
+		lab.BackgroundTransparency = 0.2
+		lab.BackgroundColor3 = Color3.fromRGB(10, 12, 18)
+		lab.Size = UDim2.fromScale(1, 1)
+		lab.Font = Enum.Font.GothamBlack
+		lab.TextScaled = true
+		lab.TextColor3 = Color3.new(1, 1, 1)
+		lab.TextStrokeTransparency = 0.35
+		lab.Parent = bb
+		local corner = Instance.new('UICorner')
+		corner.CornerRadius = UDim.new(0.2, 0)
+		corner.Parent = lab
+		m = { hl = hl, bb = bb, lab = lab }
+		sweepMarks[idx] = m
+	end
+	m.hl.FillColor = color
+	m.hl.OutlineColor = color
+	m.lab.Text = tostring(idx)
+	m.lab.TextColor3 = color
+end
+
+local function tickRoomSweepMarks()
+	if not on('DLSweepMarks') then
+		clearAllSweepMarks()
+		return
+	end
+	local dungeon = activeDungeonRoot()
+	if not dungeon then
+		clearAllSweepMarks()
+		return
+	end
+	local maxR = Rooms.maxRoom(dungeon)
+	local keep = {}
+	for i = 1, maxR do
+		if Rooms.isCorridor(dungeon, i) then
+			clearSweepMark(i)
+		elseif rt.roomSweepDone and rt.roomSweepDone[i] then
+			clearSweepMark(i)
+		else
+			keep[i] = true
+			ensureSweepMark(dungeon, i)
+		end
+	end
+	for idx in pairs(sweepMarks) do
+		if not keep[idx] then
+			clearSweepMark(idx)
+		end
+	end
+end
+
 local function farmKillNpc(npc)
 	if not npc then
 		return
@@ -8188,7 +8412,7 @@ local function farmKillNpc(npc)
 	end
 end
 
--- Room_1→N once: wait 3s (cut short if THIS room wakes), hover-kill, gate, chests.
+-- Room_1→N once: wait 1s (cut short if THIS room wakes), hover-kill, gate, chests.
 local function tourFarmRooms(dungeon)
 	if inBossRushFarm() and not dungeon then
 		farmLabel = 'boss rush · waiting'
@@ -8216,6 +8440,11 @@ local function tourFarmRooms(dungeon)
 	end
 	if idx > maxRoom then
 		rt.farmRoomFilter = nil
+		local boss = findFloorBoss()
+		if boss then
+			farmKillNpc(boss)
+			return
+		end
 		local leftover = pickFarmTarget()
 		if leftover then
 			farmKillNpc(leftover)
@@ -8225,12 +8454,11 @@ local function tourFarmRooms(dungeon)
 		task.wait(0.25)
 		return
 	end
-	while idx <= maxRoom and Rooms.isCorridor(dungeon, idx) and Rooms.aliveCount(dungeon, idx) <= 0 do
-		farmLabel = ('skip hall Room_%d'):format(idx)
-		if wantOpenGates() then
-			pcall(function()
-				KeyDoor.unlockForRoom(idx)
-			end)
+	while idx <= maxRoom and (Rooms.isCorridor(dungeon, idx) or (rt.roomSweepDone and rt.roomSweepDone[idx])) do
+		if Rooms.isCorridor(dungeon, idx) then
+			farmLabel = ('skip hall Room_%d'):format(idx)
+		else
+			farmLabel = ('done Room_%d'):format(idx)
 		end
 		idx += 1
 		rt.farmRoomIdx = idx
@@ -8250,7 +8478,7 @@ local function tourFarmRooms(dungeon)
 	if phase == 'wait' then
 		farmLabel = ('Room_%d · wait'):format(idx)
 		local model = dungeon:FindFirstChild('Room_' .. tostring(idx))
-		if not model then
+		if not model or not Rooms.zone(dungeon, idx) then
 			farmLabel = ('Room_%d · load'):format(idx)
 			local from = routeRoot() and routeRoot().Position
 			if from then
@@ -8259,7 +8487,7 @@ local function tourFarmRooms(dungeon)
 			task.wait(0.35)
 			return
 		end
-		local spawned = Rooms.holdRoom(dungeon, idx, 3)
+		local spawned = Rooms.holdRoom(dungeon, idx, 1)
 		if spawned or Rooms.aliveCount(dungeon, idx) > 0 then
 			rt.farmRoomPhase = 'fight'
 		else
@@ -8284,6 +8512,10 @@ local function tourFarmRooms(dungeon)
 		end
 		return
 	end
+	if Rooms.aliveCount(dungeon, idx) > 0 then
+		rt.farmRoomPhase = 'fight'
+		return
+	end
 	farmLabel = ('Room_%d · loot'):format(idx)
 	if wantOpenGates() then
 		local opened = false
@@ -8295,12 +8527,19 @@ local function tourFarmRooms(dungeon)
 			rt.chestRoomOpen[idx] = true
 		end
 	end
-	if on('DLChestAnywhere') and Rooms.aliveCount(dungeon, idx) == 0 then
+	if on('DLChestAnywhere') then
 		pcall(lootClearedRoom, idx, dungeon)
 	end
-	rt.farmRoomIdx = idx + 1
-	rt.farmRoomPhase = 'wait'
-	rt.farmRoomFilter = nil
+	if roomSweepComplete(dungeon, idx) then
+		rt.roomSweepDone = rt.roomSweepDone or {}
+		rt.roomSweepDone[idx] = true
+		clearSweepMark(idx)
+		rt.farmRoomIdx = idx + 1
+		rt.farmRoomPhase = 'wait'
+		rt.farmRoomFilter = nil
+	else
+		rt.farmRoomPhase = 'loot'
+	end
 end
 
 local function farmLoop()
@@ -13023,6 +13262,16 @@ FarmBox:AddToggle('DLAutoFarm', {
 		Library:Notify(('Auto farm off — %d kills'):format(farmKills))
 	end
 end)
+FarmBox:AddToggle('DLSweepMarks', {
+	Text = 'Room sweep markers',
+	Default = true,
+	Tooltip = 'Highlights each combat/loot/boss room with its number. Marker vanishes after that room is clear, and after chests/gates if those toggles are on. Farm will not go back to an unmarked room.',
+}):OnChanged(function(v)
+	if not v then
+		pcall(clearAllSweepMarks)
+	end
+	Library:Notify(v and 'Room sweep markers on' or 'Room sweep markers off')
+end)
 FarmBox:AddToggle('DLFarmBoss', {
 	Text = 'Prefer bosses',
 	Default = false,
@@ -13784,6 +14033,7 @@ hbEspConn = track(RunService.Heartbeat:Connect(function(dt)
 	pcall(ChestPick.tick)
 	pcall(BlessPick.tick)
 	pcall(BlessPick.shrineTick)
+	pcall(tickRoomSweepMarks)
 	pcall(RunLoops.trySummonSpecial)
 	pcall(RunLoops.confirmSpecialSummon)
 	pcall(Replay.tick)
