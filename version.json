@@ -1,5 +1,5 @@
 {
-    "version":  "1.0.62",
+    "version":  "1.0.63",
     "message":  "auto skill on fodder, one slot at a time, no 60ms cancel",
     "files":  [
                   "dungeon-lootr/launch.lua",
