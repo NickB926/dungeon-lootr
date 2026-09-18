@@ -6946,6 +6946,45 @@ local function pickFarmTarget()
 	if picked and enemyRank(picked) >= 3 and enemyRank(picked) < 4 and not isRaidBossNpc(picked) then
 		farmLock = picked
 	end
+	-- Fodder: stand in the densest clump, not on a lone nearest beetle.
+	if picked and enemyRank(picked) < 3 and not preferRanged then
+		local CROWD_R = 22
+		local best, bestN, bestD = picked, 0, pickedD or 9e9
+		local counts = {}
+		local parts = {}
+		eachFarmNpc(function(npc)
+			if not enemyAlive(npc) or farmSkipped(npc) or enemyRank(npc) >= 3 then
+				return
+			end
+			if skipFinal and isFinalBoss(npc) then
+				return
+			end
+			local part = enemyRoot(npc)
+			if not part then
+				return
+			end
+			parts[npc] = part
+		end)
+		for npc, part in pairs(parts) do
+			local n = 0
+			local room = Rooms.indexOf(npc)
+			for other, op in pairs(parts) do
+				if (not room or Rooms.indexOf(other) == room)
+					and (op.Position - part.Position).Magnitude <= CROWD_R
+				then
+					n += 1
+				end
+			end
+			counts[npc] = n
+			local d = (part.Position - root.Position).Magnitude
+			if n > bestN or (n == bestN and d < bestD) then
+				best, bestN, bestD = npc, n, d
+			end
+		end
+		if best then
+			picked, pickedD = best, bestD
+		end
+	end
 	return picked, pickedD
 end
 
@@ -7539,7 +7578,7 @@ local function holdOnEnemy(npc)
 		local hit = workspace:Raycast(part.Position + Vector3.new(0, 14, 0), Vector3.new(0, -80, 0), params)
 		baseY = hit and (hit.Position.Y + hip) or part.Position.Y
 	end
-	local cachedOffY, cachedStand, cachedAt = 0, 5, 0
+	local cachedOffY, cachedStand, cachedAt, cachedAim = 0, 5, 0, nil
 	Pin.follow(function()
 		local live = enemyRoot(npc)
 		if not live then
@@ -7609,11 +7648,51 @@ local function holdOnEnemy(npc)
 		end
 			cachedOffY = y - live.Position.Y
 			cachedStand = stand
+			cachedAim = nil
+			-- Face the clump, not a stray on the edge. Same-room fodder within 22.
+			if enemyRank(npc) < 3 then
+				local sx, sz, n = live.Position.X, live.Position.Z, 1
+				local room = Rooms.indexOf(npc)
+				eachFarmNpc(function(other)
+					if other == npc or not enemyAlive(other) or farmSkipped(other) then
+						return
+					end
+					if enemyRank(other) >= 3 then
+						return
+					end
+					local p = enemyRoot(other)
+					if not p then
+						return
+					end
+					if room and Rooms.indexOf(other) ~= room then
+						return
+					end
+					if (p.Position - live.Position).Magnitude <= 22 then
+						sx += p.Position.X
+						sz += p.Position.Z
+						n += 1
+					end
+				end)
+				if n >= 2 then
+					cachedAim = Vector3.new(sx / n, live.Position.Y, sz / n)
+				end
+			end
 		end
 		local y = live.Position.Y + cachedOffY
 		local stand = cachedStand
-		local goal = Vector3.new(live.Position.X, y, live.Position.Z) + Vector3.new(dir.X, 0, dir.Z) * stand
-		return goal, Vector3.new(live.Position.X, y, live.Position.Z)
+		local aimAt = cachedAim or live.Position
+		local myNow = routeRoot()
+		local back
+		if myNow then
+			back = Vector3.new(myNow.Position.X - aimAt.X, 0, myNow.Position.Z - aimAt.Z)
+		end
+		if not back or back.Magnitude < 0.15 then
+			back = dir
+		else
+			back = back.Unit
+		end
+		local goal = Vector3.new(aimAt.X, y, aimAt.Z) + Vector3.new(back.X, 0, back.Z) * stand
+		return goal, Vector3.new(aimAt.X, y, aimAt.Z)
 	end)
 end
 

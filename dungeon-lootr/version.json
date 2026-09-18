@@ -1,6 +1,6 @@
 {
-    "version":  "1.0.43",
-    "message":  "Arm special/horde rooms instead of skipping empty waves",
+    "version":  "1.0.44",
+    "message":  "Farm stands on and faces enemy crowds",
     "files":  [
                   "dungeon-lootr/launch.lua",
                   "dungeon-lootr/DungeonLootr.lua",
