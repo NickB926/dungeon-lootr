@@ -1,6 +1,6 @@
 {
-    "version":  "1.0.63",
-    "message":  "skip claimed chests via Chest_Lock, not missing Looted attr",
+    "version":  "1.0.64",
+    "message":  "stop farm CFrame lock and 100-stud load hops",
     "files":  [
                   "dungeon-lootr/launch.lua",
                   "dungeon-lootr/DungeonLootr.lua",

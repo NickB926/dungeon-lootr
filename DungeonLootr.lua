@@ -93,7 +93,7 @@ Library.ToggleKeybind = { Value = 'Home' }
 Library.Animations = Library.Animations or {}
 Library.Animations.TabSwitch = false
 
-local DL_BUILD = '1.0.63'
+local DL_BUILD = '1.0.64'
 getgenv().DLBuild = DL_BUILD
 
 local Window = Library:CreateWindow({
@@ -1486,13 +1486,13 @@ local Pin = (function()
 			if myRoot then
 				lastGoal = myRoot.Position
 				lastAim = nil
-				snapExact = true
+				-- Loose park. snapExact here CFrame-locked every Heartbeat
+				-- (the farm stutter) and cancelled M1 / skill windups.
+				snapExact = false
 				goalFn = function()
 					return lastGoal
 				end
-				if not conn then
-					bind()
-				end
+				bind()
 				return
 			end
 		end
@@ -1550,7 +1550,8 @@ local Pin = (function()
 					local to = Vector3.new(aim.X - here.X, 0, aim.Z - here.Z)
 					if to.Magnitude > 0.25 then
 						local look = Vector3.new(myRoot.CFrame.LookVector.X, 0, myRoot.CFrame.LookVector.Z)
-						if look.Magnitude < 0.05 or look.Unit:Dot(to.Unit) < 0.65 then
+						-- 0.65 (~49°) rewrote facing every few frames and looked like stutter.
+						if look.Magnitude < 0.05 or look.Unit:Dot(to.Unit) < 0.25 then
 							myRoot.CFrame = CFrame.lookAt(here, Vector3.new(aim.X, here.Y, aim.Z))
 						end
 					end
@@ -1609,22 +1610,24 @@ local Pin = (function()
 	end
 
 	bind = function()
-		unbind()
+		if conn then
+			return
+		end
 		rt.pinAcc = 1
-		-- Heartbeat only. RenderStepped + Heartbeat both wrote CFrame/velocity
-		-- every frame and the two poses fought, which is the farm stutter.
+		-- Heartbeat only. Re-connecting every Pin.at() hitch the frame (~200ms)
+		-- and the two poses fought, which is the farm stutter.
 		conn = RunService.Heartbeat:Connect(step)
 		getgenv().DLPinConn = conn
 	end
 
 	function api.follow(fn)
-		snapExact = farmBusy
+		snapExact = false
 		goalFn = fn
 		bind()
 	end
 
 	function api.at(pos, exact)
-		snapExact = exact == true or farmBusy
+		snapExact = exact == true
 		lastGoal, lastAim = pos, nil
 		local myRoot = routeRoot()
 		if myRoot then
@@ -1949,7 +1952,6 @@ KeyDoor = (function()
 		task.wait(0.28)
 		local deadline = os.clock() + 3.2
 		while os.clock() < deadline and prompt.Parent and prompt.Enabled do
-			Pin.at(stand, true)
 			fireKeyPrompt(prompt)
 			task.wait(0.08)
 		end
@@ -8006,17 +8008,8 @@ local function holdOnEnemy(npc)
 		local y = live.Position.Y + cachedOffY
 		local stand = cachedStand
 		local aimAt = cachedAim or live.Position
-		local myNow = routeRoot()
-		local back
-		if myNow then
-			back = Vector3.new(myNow.Position.X - aimAt.X, 0, myNow.Position.Z - aimAt.Z)
-		end
-		if not back or back.Magnitude < 0.15 then
-			back = dir
-		else
-			back = back.Unit
-		end
-		local goal = Vector3.new(aimAt.X, y, aimAt.Z) + Vector3.new(back.X, 0, back.Z) * stand
+		-- `dir` is locked at hold start. Live-position back orbited the pack.
+		local goal = Vector3.new(aimAt.X, y, aimAt.Z) + Vector3.new(dir.X, 0, dir.Z) * stand
 		return goal, Vector3.new(aimAt.X, y, aimAt.Z)
 	end)
 end
@@ -8532,9 +8525,19 @@ local function tourFarmRooms(dungeon)
 		local model = dungeon:FindFirstChild('Room_' .. tostring(idx))
 		if not model or not Rooms.zone(dungeon, idx) then
 			farmLabel = ('Room_%d · load'):format(idx)
-			local from = routeRoot() and routeRoot().Position
-			if from then
-				pcall(Rooms.pushForward, dungeon, from)
+			-- Do not pushForward to a neighboring streamed room — that was a
+			-- ~100-stud snap every few seconds (the load-phase stutter).
+			if model then
+				local ok, pivot = pcall(function()
+					return model:GetPivot().Position
+				end)
+				if ok and typeof(pivot) == 'Vector3' then
+					local stand = standingSpot(pivot, 0)
+					local here = routeRoot()
+					if not here or (here.Position - stand).Magnitude > 8 then
+						Pin.at(stand, true)
+					end
+				end
 			end
 			task.wait(0.35)
 			return
