@@ -74,6 +74,17 @@ if ($Message) {
 
 Write-Host "==> Publishing Dungeon Lootr $($ver.version): $($ver.message)"
 
+# Keep DL_BUILD in lockstep with version.json. Bootstrap warns "delete folder"
+# when version.json is newer than the helper stamp (1.0.50 vs 1.0.49).
+$luaPath = Join-Path $repoRoot 'DungeonLootr.lua'
+$luaText = [System.IO.File]::ReadAllText($luaPath)
+$stamped = [regex]::Replace($luaText, "local DL_BUILD = '[^']*'", "local DL_BUILD = '$($ver.version)'")
+if ($stamped -eq $luaText -and $luaText -notmatch "local DL_BUILD = '") {
+  throw "DungeonLootr.lua missing DL_BUILD stamp"
+}
+Write-Utf8NoBom $luaPath $stamped
+Write-Host "==> Stamped DL_BUILD $($ver.version)"
+
 # Canonical working copies live at repo root (flat). Stage into dungeon-lootr/ for friends.
 $flatMap = @{
   'DungeonLootr.lua' = 'DungeonLootr.lua'

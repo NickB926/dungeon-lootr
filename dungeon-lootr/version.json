@@ -1,6 +1,6 @@
 {
-    "version":  "1.0.50",
-    "message":  "farm rooms first again; chests only after stars fill",
+    "version":  "1.0.51",
+    "message":  "leave leftover specials to finish empty star rooms; stamp helper version",
     "files":  [
                   "dungeon-lootr/launch.lua",
                   "dungeon-lootr/DungeonLootr.lua",

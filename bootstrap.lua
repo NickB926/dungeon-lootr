@@ -74,22 +74,18 @@ getgenv().DLUpdateBase = BASE
 
 local info = Updater.check and Updater.check() or { ok = false }
 
-local function luaIsCurrent(ver)
+local function luaBuild()
 	if type(isfile) ~= 'function' or type(readfile) ~= 'function' then
-		return false
+		return nil
 	end
 	if not isfile('dungeon-lootr/DungeonLootr.lua') then
-		return false
+		return nil
 	end
 	local ok, body = pcall(readfile, 'dungeon-lootr/DungeonLootr.lua')
-	if not ok or type(body) ~= 'string' or body == '' then
-		return false
+	if not ok or type(body) ~= 'string' then
+		return nil
 	end
-	ver = tostring(ver or '')
-	if ver ~= '' and body:find("local DL_BUILD = '" .. ver .. "'", 1, true) then
-		return true
-	end
-	return false
+	return body:match("local DL_BUILD = '([%d%.]+)'")
 end
 
 -- Always re-download. Matching version.json with a stale DungeonLootr.lua
@@ -103,8 +99,7 @@ if not ok then
 	say('Update finished with issues: ' .. tostring(detail))
 end
 
-local remoteVer = info and info.remoteVersion
-if not luaIsCurrent(remoteVer) then
+if not luaBuild() then
 	say('GitHub copy looked stale — retrying jsDelivr')
 	getgenv().DLUpdateBase = 'https://cdn.jsdelivr.net/gh/NickB926/dungeon-lootr@main'
 	local ok2, detail2 = Updater.apply({
@@ -118,8 +113,11 @@ if not luaIsCurrent(remoteVer) then
 	getgenv().DLUpdateBase = BASE
 end
 
-if not luaIsCurrent(remoteVer) and remoteVer then
-	say('Warning: local DungeonLootr.lua is not ' .. tostring(remoteVer) .. ' — delete dungeon-lootr folder and re-run bootstrap')
+local got = luaBuild()
+if got then
+	say('Helper build ' .. tostring(got))
+elseif info and info.remoteVersion then
+	say('Warning: helper download did not include a build stamp — re-run bootstrap')
 end
 
 -- Always refresh Ataraxia if somehow missing after a partial apply.

@@ -93,7 +93,7 @@ Library.ToggleKeybind = { Value = 'Home' }
 Library.Animations = Library.Animations or {}
 Library.Animations.TabSwitch = false
 
-local DL_BUILD = '1.0.49'
+local DL_BUILD = '1.0.51'
 getgenv().DLBuild = DL_BUILD
 
 local Window = Library:CreateWindow({
@@ -6130,8 +6130,9 @@ local Rooms = (function()
 		return type(rt.zoneLayout) == 'table' and #rt.zoneLayout > 0
 	end
 
-	-- First progress-bar room that still has no star (skip boss skull).
-	function api.nextStarRoom(dungeon)
+	-- First incomplete star, then sequential empty rooms. A leftover special
+	-- with NPCs used to win via starLock / nextGapRoom and skip the rest.
+	function api.nextStarRoom(dungeon, fromPos)
 		seedLayoutFromController()
 		local layout = rt.zoneLayout
 		local function layoutOpen()
@@ -6145,69 +6146,57 @@ local Rooms = (function()
 			end
 			return false
 		end
-		-- Stale layout after Endless regen: HUD still has an empty circle.
 		if hudHasOpenStar() and not layoutOpen() then
 			seedLayoutFromHud()
 			layout = rt.zoneLayout
 		end
-		if type(layout) ~= 'table' or #layout == 0 then
-			return nil
-		end
-		local slots = {}
-		local list = progressList()
-		if list then
-			for _, c in ipairs(list:GetChildren()) do
-				if c.Name == 'ZoneSlot' then
-					slots[#slots + 1] = c
-				end
-			end
-			table.sort(slots, function(a, b)
-				return (a.LayoutOrder or 0) < (b.LayoutOrder or 0)
-			end)
-		end
-		local function starOpen(i, z)
-			if not z or not z.Index or z.IsBoss then
-				return false
-			end
-			local done = z.Completed == true or z.Done == true
-			local slot = slots[i]
-			if slot then
-				local boss = slot:FindFirstChild('Boss')
-				local completed = slot:FindFirstChild('Completed')
-				if boss and boss.Visible then
-					done = true
-				elseif completed then
-					done = completed.Visible == true
-				end
-			end
-			return not done
-		end
 		local now = os.clock()
-		-- Stay on the room we already chose. Snow only streams a Zone near you, so
-		-- picking "first incomplete with a Zone" flip-flopped Room_2 and Room_9.
-		local lock = rt.starLock
-		if lock and (retryAt[lock] or 0) <= now then
+		if type(layout) == 'table' and #layout > 0 then
+			local slots = {}
+			local list = progressList()
+			if list then
+				for _, c in ipairs(list:GetChildren()) do
+					if c.Name == 'ZoneSlot' then
+						slots[#slots + 1] = c
+					end
+				end
+				table.sort(slots, function(a, b)
+					return (a.LayoutOrder or 0) < (b.LayoutOrder or 0)
+				end)
+			end
+			local function starOpen(i, z)
+				if not z or not z.Index or z.IsBoss then
+					return false
+				end
+				local done = z.Completed == true or z.Done == true
+				local slot = slots[i]
+				if slot then
+					local boss = slot:FindFirstChild('Boss')
+					local completed = slot:FindFirstChild('Completed')
+					if boss and boss.Visible then
+						done = true
+					elseif completed then
+						done = completed.Visible == true
+					end
+				end
+				return not done
+			end
 			for i, z in ipairs(layout) do
-				if z and z.Index == lock and starOpen(i, z) then
-					if not dungeon or entryPoint(dungeon, lock) then
-						return lock
+				local idx = z and z.Index
+				if starOpen(i, z) and (retryAt[idx] or 0) <= now then
+					if not dungeon or entryPoint(dungeon, idx) then
+						rt.starLock = idx
+						return idx
 					end
 				end
 			end
-			rt.starLock = nil
-		elseif lock then
-			rt.starLock = nil
 		end
-		for i, z in ipairs(layout) do
-			local idx = z and z.Index
-			if starOpen(i, z) and (retryAt[idx] or 0) <= now then
-				if not dungeon or entryPoint(dungeon, idx) then
-					rt.starLock = idx
-					return idx
-				end
-			end
+		if hudHasOpenStar() or api.specialStarOpen() then
+			return api.nextOpenRoom(dungeon, fromPos)
+				or api.nextEmpty(dungeon, fromPos, nil)
+				or api.nextGapRoom(dungeon)
 		end
-		return nil
+		return api.nextGapRoom(dungeon) or api.nextOpenRoom(dungeon, fromPos)
 	end
 
 	function api.lowestDormant(dungeon)
@@ -8054,7 +8043,7 @@ local function farmLoop()
 				end
 				task.wait(0.4)
 			else
-			if on('DLAutoSpecial') or on('DLHuntSpecial') then
+			if (on('DLAutoSpecial') or on('DLHuntSpecial')) and not Rooms.starsHold() then
 				pcall(trySummonSpecial)
 			end
 			local aoeOk, aoeHit = pcall(rt.avoidFloorAoe)
@@ -8062,7 +8051,17 @@ local function farmLoop()
 				farmLabel = 'aoe gap'
 				Pin.at(rt.aoeGoal, true)
 			end
+			local dungeon = activeDungeonRoot()
+			local from = routeRoot() and routeRoot().Position
+			local starsHold = Rooms.starsHold()
+			local starIdx = dungeon and Rooms.nextStarRoom(dungeon, from)
 			local target = pickFarmTarget()
+			-- A special / floor boss in another room glued farm and skipped empty stars.
+			if target and starIdx and (enemyRank(target) >= 4 or isFinalBoss(target)) then
+				if Rooms.indexOf(target) ~= starIdx then
+					target = nil
+				end
+			end
 			-- Wait only in a real rush arena (no Generated_ rooms to walk).
 			if inBossRushFarm() and not target and not activeDungeonRoot() then
 				farmLabel = 'boss rush · waiting'
@@ -8119,10 +8118,7 @@ local function farmLoop()
 				local curRoom = Rooms.sessionCurrentRoom()
 				local phase = Rooms.sessionPhase()
 				local starsHold = Rooms.starsHold()
-				local starIdx = dungeon and (Rooms.nextGapRoom(dungeon) or Rooms.nextOpenRoom(dungeon, from))
-				if not starIdx and starsHold and dungeon and from then
-					starIdx = Rooms.nextEmpty(dungeon, from, nil)
-				end
+				local starIdx = dungeon and Rooms.nextStarRoom(dungeon, from)
 				-- Endless keeps CurrentRoom=0. The Catacombs Room_1→N repair
 				-- sweep is what parked us in the courtyard with an empty HUD slot.
 				local softlocked = curRoom == 0
@@ -8246,7 +8242,7 @@ local function farmLoop()
 				local noMobs = dungeon and Rooms.livingNpc(dungeon) == 0
 				local flipping = Rooms.flipping()
 				local hasDormant = (not noMobs) and from and Rooms.nextDormant(dungeon, from)
-				local starIdx = dungeon and (Rooms.nextGapRoom(dungeon) or Rooms.nextOpenRoom(dungeon, from) or (starsHold and from and Rooms.nextEmpty(dungeon, from, nil)))
+				local starIdx = dungeon and Rooms.nextStarRoom(dungeon, from)
 				local trashLeft, bossesLeft = countFarmSides()
 				local looted = false
 				-- Chests only after every star is filled. Sweeping first is what
