@@ -5319,7 +5319,11 @@ local Rooms = (function()
 		-- Special / horde waves start with 0 NPCs. emptyHop used to skip them
 		-- forever after one short stand.
 		local special = api.roomIsSpecial(dungeon, want)
-		if not zone or visited[want] or (emptyHop[want] and not special) or (retryAt[want] or 0) > now then
+		local starsHold = hudHasOpenStar() or api.specialStarOpen()
+		if not zone then
+			return nil
+		end
+		if not starsHold and (visited[want] or (emptyHop[want] and not special) or (retryAt[want] or 0) > now) then
 			return nil
 		end
 		if api.dormantCount(dungeon, want) > 0 or api.aliveCount(dungeon, want) > 0 then
@@ -5329,7 +5333,7 @@ local Rooms = (function()
 		-- Courtyard spawn can be 600+ studs from Room_2. A 550 cap left farm idle
 		-- on empty stars (Knights yard with 3 open circles).
 		local maxDist = 220
-		if hudHasOpenStar() then
+		if starsHold then
 			maxDist = 4000
 		elseif api.livingNpc(dungeon) == 0 then
 			maxDist = 2500
@@ -5337,7 +5341,9 @@ local Rooms = (function()
 		if d > maxDist then
 			return nil
 		end
-		if gateD and d > gateD + 8 then
+		-- Standing at Next Area made gateD tiny, so the next room looked "too far"
+		-- and farm walked the gate with empty stars still on the bar.
+		if not starsHold and gateD and d > gateD + 8 then
 			return nil
 		end
 		return want
@@ -5763,8 +5769,9 @@ local Rooms = (function()
 			return grabbed()
 		end
 		if expectingSpawn then
-			-- Only skip true empty shells. Special-wave rooms stay eligible.
-			if not special then
+			-- HUD still has empty circles — this room may be a late special/horde
+			-- wave. emptyHop + Next Area is how Depth 1 skipped a star.
+			if not special and not hudHasOpenStar() and not api.specialStarOpen() then
 				emptyHop[idx] = true
 			end
 			return false
@@ -5832,32 +5839,76 @@ local Rooms = (function()
 		if not hud then
 			return nil
 		end
-		for _, name in ipairs({ 'Dungeon_Container', 'Endless_Container' }) do
+		local function listOf(name)
 			local cont = hud:FindFirstChild(name)
 			local frame = cont and cont:FindFirstChild('Completion_Progress')
-			local list = frame and frame:FindFirstChild('List')
-			if list then
-				return list
-			end
+			return frame and frame:FindFirstChild('List'), cont
 		end
-		return nil
+		local dungeonList, dungeonCont = listOf('Dungeon_Container')
+		local endlessList, endlessCont = listOf('Endless_Container')
+		-- Depth / Enemies Left HUD is Endless. Reading Dungeon_Container first
+		-- treated a finished bar as "no stars" and farm took Next Area early.
+		if endlessCont and endlessCont:IsA('GuiObject') and endlessCont.Visible then
+			return endlessList or dungeonList
+		end
+		return dungeonList or endlessList
 	end
 
 	local function hudSlots()
-		local list = progressList()
-		if not list then
+		local pg = LocalPlayer:FindFirstChild('PlayerGui')
+		local main = pg and pg:FindFirstChild('Main')
+		local hud = main and main:FindFirstChild('HUD')
+		if not hud then
 			return {}
 		end
-		local slots = {}
-		for _, c in ipairs(list:GetChildren()) do
-			if c.Name == 'ZoneSlot' then
-				slots[#slots + 1] = c
+		local function collect(visibleOnly)
+			local slots = {}
+			for _, c in ipairs(hud:GetDescendants()) do
+				if c.Name == 'ZoneSlot' then
+					if visibleOnly then
+						local hidden = false
+						local p = c
+						while p and p ~= hud do
+							if p:IsA('GuiObject') and p.Visible == false then
+								hidden = true
+								break
+							end
+							p = p.Parent
+						end
+						if hidden then
+							continue
+						end
+					end
+					slots[#slots + 1] = c
+				end
+			end
+			table.sort(slots, function(a, b)
+				return (a.LayoutOrder or 0) < (b.LayoutOrder or 0)
+			end)
+			return slots
+		end
+		local vis = collect(true)
+		if #vis > 0 then
+			return vis
+		end
+		-- Endless Depth HUD can hide Dungeon_Container while the star row is
+		-- still the one we must honor. Fall back to every ZoneSlot.
+		local list = progressList()
+		if list then
+			local slots = {}
+			for _, c in ipairs(list:GetChildren()) do
+				if c.Name == 'ZoneSlot' then
+					slots[#slots + 1] = c
+				end
+			end
+			table.sort(slots, function(a, b)
+				return (a.LayoutOrder or 0) < (b.LayoutOrder or 0)
+			end)
+			if #slots > 0 then
+				return slots
 			end
 		end
-		table.sort(slots, function(a, b)
-			return (a.LayoutOrder or 0) < (b.LayoutOrder or 0)
-		end)
-		return slots
+		return collect(false)
 	end
 
 	-- HUD LayoutOrder is the star slot (1–7), not Room_N. Do not map slot 2 → Room_2.
@@ -5878,6 +5929,14 @@ local Rooms = (function()
 
 	-- Last star is the floor boss. nextGapRoom skips IsBoss, so Endless used to
 	-- tour empty Room_1→N and sit in the last hallway instead of the boss pad.
+	function api.hudHasOpenStar()
+		return hudHasOpenStar()
+	end
+
+	function api.starsHold()
+		return hudHasOpenStar() or api.specialStarOpen()
+	end
+
 	function api.bossStarOpen()
 		for _, slot in ipairs(hudSlots()) do
 			local boss = slot:FindFirstChild('Boss')
@@ -5895,7 +5954,7 @@ local Rooms = (function()
 			if completed and completed.Visible then
 				continue
 			end
-			for _, name in ipairs({ 'Special', 'Event', 'Horde', 'SpecialBoss' }) do
+			for _, name in ipairs({ 'Special', 'Event', 'Horde', 'SpecialBoss', 'SpecialWave', 'HordeWave', 'Modifier', 'MiniBoss', 'Challenge' }) do
 				local ch = slot:FindFirstChild(name)
 				if ch and ch.Visible == true then
 					return true
@@ -5974,7 +6033,7 @@ local Rooms = (function()
 	-- HUD still has empty circles but RoomLayout didn't map an Index. Walk
 	-- sequential Room_N from the courtyard instead of standing idle.
 	function api.nextOpenRoom(dungeon, fromPos)
-		if not dungeon or not hudHasOpenStar() then
+		if not dungeon or not (hudHasOpenStar() or api.specialStarOpen()) then
 			return nil
 		end
 		local now = os.clock()
@@ -6012,6 +6071,22 @@ local Rooms = (function()
 					return got
 				end
 			end
+		end
+		-- retryAt parked every room. Still do not return nil or Endless walks
+		-- Next Area with empty stars on the bar.
+		local soonest, soonT
+		for i = 1, maxR do
+			if entryPoint(dungeon, i) then
+				local t = retryAt[i] or 0
+				if not soonest or t < soonT then
+					soonest, soonT = i, t
+				end
+			end
+		end
+		if soonest then
+			retryAt[soonest] = 0
+			emptyHop[soonest] = nil
+			return soonest
 		end
 		return nil
 	end
@@ -8043,7 +8118,11 @@ local function farmLoop()
 				local awakeN = dungeon and Rooms.awakeCount(dungeon) or 0
 				local curRoom = Rooms.sessionCurrentRoom()
 				local phase = Rooms.sessionPhase()
+				local starsHold = Rooms.starsHold()
 				local starIdx = dungeon and (Rooms.nextGapRoom(dungeon) or Rooms.nextOpenRoom(dungeon, from))
+				if not starIdx and starsHold and dungeon and from then
+					starIdx = Rooms.nextEmpty(dungeon, from, nil)
+				end
 				-- Endless keeps CurrentRoom=0. The Catacombs Room_1→N repair
 				-- sweep is what parked us in the courtyard with an empty HUD slot.
 				local softlocked = curRoom == 0
@@ -8127,23 +8206,41 @@ local function farmLoop()
 				elseif (inEndlessFarm() and awakeN == 0 and not starIdx)
 					or (curRoom == 0 and awakeN == 0 and Rooms.repairFinished() and not starIdx)
 				then
-					-- Endless floor is empty, or Catacombs softlock already swept:
-					-- loot happened above. Push gates — do not tour empty Room_N.
-					local gatePos = from and select(1, NextArea.find(from))
-					local boss = (not inEndlessFarm()) and dungeon and Rooms.bossSpawn(dungeon)
-					if boss then
-						farmLabel = 'boss pad'
-						Pin.at(standingSpot(boss.Position, 0), true)
-						task.wait(0.2)
-						Pin.stop()
-					elseif gatePos and NextArea.advance() then
-						farmLabel = 'next gate'
-					elseif from and Rooms.pushForward(dungeon, from) then
-						farmLabel = 'load next room'
-						task.wait(0.2)
+					-- Empty stars / special waves still on the bar: never Next Area.
+					-- Depth 1 courtyard skips were this branch walking the gate.
+					if starsHold and dungeon then
+						local holdIdx = Rooms.nextEmpty(dungeon, from, nil)
+						if holdIdx then
+							farmLabel = ('star Room_%d'):format(holdIdx)
+							if not Rooms.enter(dungeon, holdIdx) then
+								Rooms.park(holdIdx, 1.8)
+							end
+						elseif from and Rooms.pushForward(dungeon, from) then
+							farmLabel = 'load next room'
+							task.wait(0.2)
+						else
+							farmLabel = 'wait stars'
+							task.wait(0.35)
+						end
 					else
-						farmLabel = ('idle · %d kills'):format(farmKills)
-						task.wait(0.2)
+						-- Endless floor is empty, or Catacombs softlock already swept:
+						-- loot happened above. Push gates — do not tour empty Room_N.
+						local gatePos = from and select(1, NextArea.find(from))
+						local boss = (not inEndlessFarm()) and dungeon and Rooms.bossSpawn(dungeon)
+						if boss then
+							farmLabel = 'boss pad'
+							Pin.at(standingSpot(boss.Position, 0), true)
+							task.wait(0.2)
+							Pin.stop()
+						elseif gatePos and NextArea.advance() then
+							farmLabel = 'next gate'
+						elseif from and Rooms.pushForward(dungeon, from) then
+							farmLabel = 'load next room'
+							task.wait(0.2)
+						else
+							farmLabel = ('idle · %d kills'):format(farmKills)
+							task.wait(0.2)
+						end
 					end
 				else
 				-- Resolve dormant packs / missing stars before chest hops — looting
@@ -8161,7 +8258,7 @@ local function farmLoop()
 				if not looted then
 					-- Gates only when no sleeping pack is waiting — otherwise we loop
 					-- Locked_/ContinuePath next to Room_20 while Room_16 stays dormant.
-					local gatePos = (awakeN == 0 and not hasDormant and not starIdx and not softlocked and from)
+					local gatePos = (awakeN == 0 and not hasDormant and not starIdx and not softlocked and not starsHold and from)
 						and select(1, NextArea.find(from))
 						or nil
 					if from and KeyDoor.unlock(from) then
@@ -8199,7 +8296,7 @@ local function farmLoop()
 							if noMobs then
 								task.wait(0.2)
 							end
-						elseif awakeN == 0 and not hasDormant and not starIdx and NextArea.advance() then
+						elseif awakeN == 0 and not hasDormant and not starIdx and not starsHold and NextArea.advance() then
 							farmLabel = 'next gate'
 						else
 							farmLabel = ('idle · %d kills'):format(farmKills)
