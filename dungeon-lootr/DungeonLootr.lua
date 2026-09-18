@@ -93,7 +93,7 @@ Library.ToggleKeybind = { Value = 'Home' }
 Library.Animations = Library.Animations or {}
 Library.Animations.TabSwitch = false
 
-local DL_BUILD = '1.0.69'
+local DL_BUILD = '1.0.70'
 getgenv().DLBuild = DL_BUILD
 
 local Window = Library:CreateWindow({
@@ -8727,7 +8727,8 @@ local function tourFarmRooms(dungeon)
 		return
 	end
 	if idx > maxRoom then
-		if goToOpenStar(dungeon, maxRoom) then
+		local okStar, went = pcall(goToOpenStar, dungeon, maxRoom)
+		if okStar and went then
 			return
 		end
 		if Rooms.hudHasOpenStar() then
@@ -8751,7 +8752,10 @@ local function tourFarmRooms(dungeon)
 		return
 	end
 	while idx <= maxRoom do
-		local why = skipTourRoom(dungeon, idx)
+		local okSkip, why = pcall(skipTourRoom, dungeon, idx)
+		if not okSkip then
+			why = 'hall'
+		end
 		if not why then
 			break
 		end
@@ -8769,7 +8773,8 @@ local function tourFarmRooms(dungeon)
 		rt.farmRoomFilter = nil
 	end
 	if idx > maxRoom then
-		if goToOpenStar(dungeon, maxRoom) then
+		local okStar, went = pcall(goToOpenStar, dungeon, maxRoom)
+		if okStar and went then
 			return
 		end
 		if Rooms.hudHasOpenStar() then
@@ -10410,22 +10415,34 @@ local BlessPick = (function()
 		end
 		-- Unused template keeps emitters on and Enabled=true. Claimed live
 		-- altars disable Receive Blessing and turn every ParticleEmitter off.
-		if model then
-			local onN, saw = 0, false
-			for _, d in ipairs(model:GetDescendants()) do
-				if d:IsA('ParticleEmitter') then
-					saw = true
-					if d.Enabled then
-						onN += 1
-						break
-					end
+		if not model then
+			return false
+		end
+		local onN, saw = 0, false
+		local ok, desc = pcall(function()
+			return model:GetDescendants()
+		end)
+		if not ok or type(desc) ~= 'table' then
+			return false
+		end
+		for _, d in ipairs(desc) do
+			local isPe = false
+			pcall(function()
+				isPe = typeof(d) == 'Instance' and d:IsA('ParticleEmitter') == true
+			end)
+			if isPe then
+				saw = true
+				local enabled = false
+				pcall(function()
+					enabled = d.Enabled == true
+				end)
+				if enabled then
+					onN += 1
+					break
 				end
 			end
-			if saw and onN == 0 then
-				return true
-			end
 		end
-		return false
+		return saw and onN == 0
 	end
 
 	local function shrineAlreadyUsed(model, pos)

@@ -1,6 +1,6 @@
 {
-    "version":  "1.0.69",
-    "message":  "fill HUD stars before floor boss; re-enter loot and dormant rooms",
+    "version":  "1.0.70",
+    "message":  "stop farm crash on blessing shrine descendant scan",
     "files":  [
                   "dungeon-lootr/launch.lua",
                   "dungeon-lootr/DungeonLootr.lua",
