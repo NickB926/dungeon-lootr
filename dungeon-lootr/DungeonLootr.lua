@@ -93,7 +93,7 @@ Library.ToggleKeybind = { Value = 'Home' }
 Library.Animations = Library.Animations or {}
 Library.Animations.TabSwitch = false
 
-local DL_BUILD = '1.0.56'
+local DL_BUILD = '1.0.57'
 getgenv().DLBuild = DL_BUILD
 
 local Window = Library:CreateWindow({
@@ -5406,6 +5406,33 @@ local Rooms = (function()
 		return m
 	end
 
+	-- Hallways are also named Room_N. Demon corridors are a ~36x66 Zone with
+	-- no loot/special flags. Waiting 3s there parks farm next to sleepers
+	-- that belong to the next combat room.
+	function api.isCorridor(dungeon, idx)
+		local room = dungeon and dungeon:FindFirstChild('Room_' .. tostring(idx))
+		if not room then
+			return false
+		end
+		if room:GetAttribute('IsLootRoom') == true
+			or room:GetAttribute('IsCheckpoint') == true
+			or room:GetAttribute('IsSpecial') == true
+			or room:GetAttribute('IsSpecialBoss') == true
+			or room:GetAttribute('IsBoss') == true
+			or room:GetAttribute('IsHorde') == true
+			or room:GetAttribute('IsEvent') == true
+		then
+			return false
+		end
+		local zone = room:FindFirstChild('Zone')
+		if not (zone and zone:IsA('BasePart')) then
+			return false
+		end
+		local mn = math.min(zone.Size.X, zone.Size.Z)
+		local mx = math.max(zone.Size.X, zone.Size.Z)
+		return mn <= 42 and mx <= 80
+	end
+
 	-- Lowest room we have not yet touch-armed. Skipping ahead with noclip left
 	-- CurrentRoom=0 on the server so the boss never spawned.
 	function api.nextArm(dungeon)
@@ -8198,6 +8225,21 @@ local function tourFarmRooms(dungeon)
 		end
 		farmLabel = ('idle · %d kills'):format(farmKills)
 		task.wait(0.25)
+		return
+	end
+	while idx <= maxRoom and Rooms.isCorridor(dungeon, idx) and Rooms.aliveCount(dungeon, idx) <= 0 do
+		farmLabel = ('skip hall Room_%d'):format(idx)
+		if wantOpenGates() then
+			pcall(function()
+				KeyDoor.unlockForRoom(idx)
+			end)
+		end
+		idx += 1
+		rt.farmRoomIdx = idx
+		rt.farmRoomPhase = 'wait'
+		rt.farmRoomFilter = nil
+	end
+	if idx > maxRoom then
 		return
 	end
 	local phase = rt.farmRoomPhase or 'wait'

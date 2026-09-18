@@ -1,6 +1,6 @@
 {
-    "version":  "1.0.56",
-    "message":  "sequential farm: shrine, special, then each room wait/kill/gate/chest",
+    "version":  "1.0.57",
+    "message":  "skip hallway Room_N tiles; wait only in combat rooms",
     "files":  [
                   "dungeon-lootr/launch.lua",
                   "dungeon-lootr/DungeonLootr.lua",
