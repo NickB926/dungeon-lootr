@@ -7567,13 +7567,14 @@ local function farmKill(npc)
 			elseif not readable and not sticky and not crystalPack and not addPack then
 				-- AnimationController fodder only exposes HealthOverride (max). If
 				-- HitReact / Damage_Dealt never move, swings are missing.
+				local stallFor = 8
 				local dealt = tonumber(LocalPlayer:GetAttribute('Damage_Dealt')) or 0
 				local react = tonumber(npc:GetAttribute('HitReact')) or 0
 				if dealt > dealt0 + 0.5 or react > react0 then
 					dealt0 = math.max(dealt0, dealt)
 					react0 = math.max(react0, react)
 					lastDrop = now
-				elseif now - started > FARM_STALL_TIMEOUT and now - lastDrop > FARM_STALL_TIMEOUT then
+				elseif now - started > stallFor and now - lastDrop > stallFor then
 					break
 				end
 			end

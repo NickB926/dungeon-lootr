@@ -1,6 +1,6 @@
 {
-    "version":  "1.0.37",
-    "message":  "Face the pack while on farm station so M1s connect; stall-skip HealthOverride fodder that never takes a hit",
+    "version":  "1.0.38",
+    "message":  "Skip HealthOverride fodder after 8s of no HitReact so farm does not sit on unhittable daemons",
     "files":  [
                   "dungeon-lootr/launch.lua",
                   "dungeon-lootr/DungeonLootr.lua",
