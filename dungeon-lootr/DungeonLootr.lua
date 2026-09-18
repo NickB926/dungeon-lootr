@@ -1520,7 +1520,18 @@ local Pin = (function()
 			-- cancel M1 / skill windups (felt like input lag / skills not casting).
 			local hold = snapExact and 0.18 or (dodging and 0.55 or (farmBusy and 1.35 or 0.55))
 			if drift <= hold then
-				-- On station: do not zero velocity — that was eating swing momentum.
+				-- Still face the pack. Stand-range used to skip lookAt, so a dash /
+				-- skill could leave you looking away and M1s never connected
+				-- (Demon Rogue Daemon: 2 studs off, 0 damage, HitReact frozen).
+				if typeof(aim) == 'Vector3' then
+					local to = Vector3.new(aim.X - here.X, 0, aim.Z - here.Z)
+					if to.Magnitude > 0.25 then
+						local look = Vector3.new(myRoot.CFrame.LookVector.X, 0, myRoot.CFrame.LookVector.Z)
+						if look.Magnitude < 0.05 or look.Unit:Dot(to.Unit) < 0.65 then
+							myRoot.CFrame = CFrame.lookAt(here, Vector3.new(aim.X, here.Y, aim.Z))
+						end
+					end
+				end
 				return
 			end
 			-- AOE gap: hard snap. Boss stand: soft lerp so attacks still play.
@@ -7454,6 +7465,8 @@ local function farmKill(npc)
 	end
 	local lastDrop = started
 	local lastHit = 0
+	local dealt0 = tonumber(LocalPlayer:GetAttribute('Damage_Dealt')) or 0
+	local react0 = tonumber(npc:GetAttribute('HitReact')) or 0
 	-- Position is held on Heartbeat for the whole fight; this loop only swings and
 	-- watches health, so its cadence no longer affects how smooth movement looks.
 	rt.crystalPack = crystalPack == true
@@ -7549,6 +7562,18 @@ local function farmKill(npc)
 					lastDrop = now
 				elseif now - started > FARM_STALL_TIMEOUT and now - lastDrop > FARM_STALL_TIMEOUT then
 					-- Unhittable: out of reach, immune phase, or a bad standoff.
+					break
+				end
+			elseif not readable and not sticky and not crystalPack and not addPack then
+				-- AnimationController fodder only exposes HealthOverride (max). If
+				-- HitReact / Damage_Dealt never move, swings are missing.
+				local dealt = tonumber(LocalPlayer:GetAttribute('Damage_Dealt')) or 0
+				local react = tonumber(npc:GetAttribute('HitReact')) or 0
+				if dealt > dealt0 + 0.5 or react > react0 then
+					dealt0 = math.max(dealt0, dealt)
+					react0 = math.max(react0, react)
+					lastDrop = now
+				elseif now - started > FARM_STALL_TIMEOUT and now - lastDrop > FARM_STALL_TIMEOUT then
 					break
 				end
 			end

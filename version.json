@@ -1,6 +1,6 @@
 {
-    "version":  "1.0.36",
-    "message":  "Separate Open locked gates toggle; move auto collect chests out of ESP; skip locked-room chests when gates are off",
+    "version":  "1.0.37",
+    "message":  "Face the pack while on farm station so M1s connect; stall-skip HealthOverride fodder that never takes a hit",
     "files":  [
                   "dungeon-lootr/launch.lua",
                   "dungeon-lootr/DungeonLootr.lua",
