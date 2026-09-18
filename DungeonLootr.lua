@@ -93,7 +93,7 @@ Library.ToggleKeybind = { Value = 'Home' }
 Library.Animations = Library.Animations or {}
 Library.Animations.TabSwitch = false
 
-local DL_BUILD = '1.0.71'
+local DL_BUILD = '1.0.72'
 getgenv().DLBuild = DL_BUILD
 
 local Window = Library:CreateWindow({
@@ -1725,11 +1725,37 @@ local function standingSpot(pos, lift, exclude)
 	params.FilterDescendantsInstances = filter
 	params.IgnoreWater = true
 	local maxRise = 12
+	local function skipHit(inst)
+		if not inst then
+			return false
+		end
+		local n = inst.Name
+		if n == 'Zone' or n == 'TileAnchor' then
+			return true
+		end
+		local trans = 0
+		pcall(function()
+			trans = inst.Transparency
+		end)
+		return trans >= 0.95
+	end
+	local function floorCast(origin, dir)
+		local hit = workspace:Raycast(origin, dir, params)
+		for _ = 1, 8 do
+			if not hit or not skipHit(hit.Instance) then
+				return hit
+			end
+			filter[#filter + 1] = hit.Instance
+			params.FilterDescendantsInstances = filter
+			hit = workspace:Raycast(origin, dir, params)
+		end
+		return hit
+	end
 	-- Cast from above the target; if already sunk (noclip freefall), cast from higher.
 	local originY = math.max(pos.Y + 10, (root and root.Position.Y or pos.Y) + 10)
-	local hit = workspace:Raycast(Vector3.new(pos.X, originY, pos.Z), Vector3.new(0, -80, 0), params)
+	local hit = floorCast(Vector3.new(pos.X, originY, pos.Z), Vector3.new(0, -80, 0))
 	if not hit then
-		hit = workspace:Raycast(pos + Vector3.new(0, 100, 0), Vector3.new(0, -250, 0), params)
+		hit = floorCast(pos + Vector3.new(0, 100, 0), Vector3.new(0, -250, 0))
 	end
 	if hit then
 		local floorY = hit.Position.Y + hip
@@ -10365,10 +10391,27 @@ local BlessPick = (function()
 		if not pg then
 			return {}
 		end
+		local skip = {
+			pg:FindFirstChild('DLDungeonLootr'),
+			pg:FindFirstChild('DLLootHud'),
+		}
+		local main = pg:FindFirstChild('Main')
+		local frames = main and main:FindFirstChild('Frames')
+		if frames then
+			skip[#skip + 1] = frames
+		end
+		local function skipped(inst)
+			for _, root in ipairs(skip) do
+				if root and inst:IsDescendantOf(root) then
+					return true
+				end
+			end
+			return false
+		end
 		local options = {}
 		local seen = {}
 		for _, d in ipairs(pg:GetDescendants()) do
-			if (d:IsA('TextLabel') or d:IsA('TextButton')) and isVisible(d) then
+			if (d:IsA('TextLabel') or d:IsA('TextButton')) and isVisible(d) and not skipped(d) then
 				local title = tostring(d.Text)
 				local buff = index[title]
 				if buff and not seen[d] then
@@ -10559,6 +10602,10 @@ local BlessPick = (function()
 				end
 				return
 			end
+			-- Template / spent copies have no live Receive Blessing prompt.
+			if not (prompt and prompt.Enabled == true) then
+				return
+			end
 			local dist = (pos - root.Position).Magnitude
 			if dist < bestDist then
 				bestPos, bestDist, bestPrompt, bestModel = pos, dist, prompt, model
@@ -10687,11 +10734,9 @@ local BlessPick = (function()
 			return true
 		end
 		if api.open() then
-			farmLabel = 'blessing'
-			local picked = api.run(true) == true
-			if picked then
-				local root = routeRoot()
-				local bestM, bestP, bestD = nil, nil, 9e9
+			local root = routeRoot()
+			local near = false
+			if root then
 				for _, gen in ipairs(workspace:GetChildren()) do
 					if type(gen.Name) == 'string' and gen.Name:sub(1, 10) == 'Generated_' then
 						for _, child in ipairs(gen:GetChildren()) do
@@ -10700,19 +10745,45 @@ local BlessPick = (function()
 								local ok, pos = pcall(function()
 									return child:GetPivot().Position
 								end)
-								if ok and pos and root then
-									local d = (pos - root.Position).Magnitude
-									if d < bestD then
-										bestM, bestP, bestD = child, pos, d
+								if ok and typeof(pos) == 'Vector3' and (pos - root.Position).Magnitude < 28 then
+									near = true
+									break
+								end
+							end
+						end
+					end
+					if near then
+						break
+					end
+				end
+			end
+			if near then
+				farmLabel = 'blessing'
+				local picked = api.run(true) == true
+				if picked then
+					local bestM, bestP, bestD = nil, nil, 9e9
+					for _, gen in ipairs(workspace:GetChildren()) do
+						if type(gen.Name) == 'string' and gen.Name:sub(1, 10) == 'Generated_' then
+							for _, child in ipairs(gen:GetChildren()) do
+								local low = string.lower(child.Name)
+								if low:find('bless', 1, true) or low:find('shrine', 1, true) then
+									local ok, pos = pcall(function()
+										return child:GetPivot().Position
+									end)
+									if ok and pos and root then
+										local d = (pos - root.Position).Magnitude
+										if d < bestD then
+											bestM, bestP, bestD = child, pos, d
+										end
 									end
 								end
 							end
 						end
 					end
+					markShrineUsed(bestM, bestP)
 				end
-				markShrineUsed(bestM, bestP)
+				return true
 			end
-			return true
 		end
 		rt.blessFromFarm = true
 		pcall(api.shrineTick)

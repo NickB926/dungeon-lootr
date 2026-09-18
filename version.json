@@ -1,6 +1,6 @@
 {
-    "version":  "1.0.71",
-    "message":  "skip Player_Spawn starting room; do not park farm on courtyard",
+    "version":  "1.0.72",
+    "message":  "stop spawn bounce: skip Zone floor snap; do not hold farm on fake blessing UI",
     "files":  [
                   "dungeon-lootr/launch.lua",
                   "dungeon-lootr/DungeonLootr.lua",
