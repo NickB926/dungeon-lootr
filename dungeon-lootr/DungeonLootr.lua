@@ -93,7 +93,7 @@ Library.ToggleKeybind = { Value = 'Home' }
 Library.Animations = Library.Animations or {}
 Library.Animations.TabSwitch = false
 
-local DL_BUILD = '1.0.68'
+local DL_BUILD = '1.0.69'
 getgenv().DLBuild = DL_BUILD
 
 local Window = Library:CreateWindow({
@@ -8374,6 +8374,54 @@ local function roomPosKey(dungeon, idx)
 	return string.format('z:%.0f:%.0f:%.0f', p.X, p.Y, p.Z)
 end
 
+local function unmarkRoomSwept(dungeon, idx)
+	if not idx then
+		return
+	end
+	if rt.roomSweepDone then
+		rt.roomSweepDone[idx] = nil
+	end
+	local key = roomPosKey(dungeon, idx)
+	if key and rt.roomSweepDonePos then
+		rt.roomSweepDonePos[key] = nil
+	end
+end
+
+local function goToOpenStar(dungeon, maxRoom)
+	if not dungeon or not Rooms.hudHasOpenStar() then
+		return false
+	end
+	local star
+	pcall(function()
+		star = Rooms.nextStarRoom(dungeon) or Rooms.nextGapRoom(dungeon)
+	end)
+	if not star then
+		for i = 1, maxRoom or Rooms.maxRoom(dungeon) do
+			if Rooms.isCorridor(dungeon, i) then
+				continue
+			end
+			if Rooms.dormantCount(dungeon, i) > 0 or roomHasPendingChest(dungeon, i) then
+				star = i
+				break
+			end
+			local room = dungeon:FindFirstChild('Room_' .. tostring(i))
+			if room and room:GetAttribute('IsLootRoom') == true and not roomIsSwept(dungeon, i) then
+				star = i
+				break
+			end
+		end
+	end
+	if not star then
+		return false
+	end
+	unmarkRoomSwept(dungeon, star)
+	rt.farmRoomIdx = star
+	rt.farmRoomPhase = 'wait'
+	rt.farmRoomFilter = nil
+	farmLabel = ('star Room_%d'):format(star)
+	return true
+end
+
 local function markRoomSwept(dungeon, idx)
 	if not idx then
 		return
@@ -8461,6 +8509,9 @@ local function roomSweepComplete(dungeon, idx)
 	if Rooms.aliveCount(dungeon, idx) > 0 then
 		return false
 	end
+	if Rooms.dormantCount(dungeon, idx) > 0 then
+		return false
+	end
 	if roomHasPendingChest(dungeon, idx) then
 		return false
 	end
@@ -8478,15 +8529,21 @@ local function skipTourRoom(dungeon, idx)
 	if Rooms.isCorridor(dungeon, idx) then
 		return 'hall'
 	end
+	-- Incomplete HUD stars (loot / empty circle) must still be visited even if
+	-- we already stamped the room swept after a dry loot pass.
+	if Rooms.dormantCount(dungeon, idx) > 0 or roomHasPendingChest(dungeon, idx) then
+		return nil
+	end
+	local room = dungeon:FindFirstChild('Room_' .. tostring(idx))
 	if roomIsSwept(dungeon, idx) then
 		return 'done'
 	end
 	if type(rt.shrineRoomDone) == 'function' and rt.shrineRoomDone(dungeon, idx) then
 		return 'shrine'
 	end
-	local room = dungeon:FindFirstChild('Room_' .. tostring(idx))
 	if room and room:GetAttribute('IsCheckpoint') == true
 		and Rooms.aliveCount(dungeon, idx) <= 0
+		and Rooms.dormantCount(dungeon, idx) <= 0
 		and not roomHasPendingChest(dungeon, idx)
 		and not roomHasPendingGate(dungeon, idx)
 	then
@@ -8670,6 +8727,14 @@ local function tourFarmRooms(dungeon)
 		return
 	end
 	if idx > maxRoom then
+		if goToOpenStar(dungeon, maxRoom) then
+			return
+		end
+		if Rooms.hudHasOpenStar() then
+			farmLabel = 'waiting · stars'
+			task.wait(0.4)
+			return
+		end
 		rt.farmRoomFilter = nil
 		local boss = findFloorBoss()
 		if boss then
@@ -8704,11 +8769,22 @@ local function tourFarmRooms(dungeon)
 		rt.farmRoomFilter = nil
 	end
 	if idx > maxRoom then
+		if goToOpenStar(dungeon, maxRoom) then
+			return
+		end
+		if Rooms.hudHasOpenStar() then
+			farmLabel = 'waiting · stars'
+			task.wait(0.4)
+			return
+		end
 		return
 	end
 	local phase = rt.farmRoomPhase or 'wait'
 	local roomModel = dungeon:FindFirstChild('Room_' .. tostring(idx))
-	if roomModel and roomModel:GetAttribute('IsLootRoom') == true and Rooms.aliveCount(dungeon, idx) <= 0 then
+	if roomModel and roomModel:GetAttribute('IsLootRoom') == true
+		and Rooms.aliveCount(dungeon, idx) <= 0
+		and Rooms.dormantCount(dungeon, idx) <= 0
+	then
 		phase = 'loot'
 		rt.farmRoomPhase = 'loot'
 	end

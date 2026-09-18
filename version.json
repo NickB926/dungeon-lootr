@@ -1,6 +1,6 @@
 {
-    "version":  "1.0.68",
-    "message":  "force room markers on load; clear after chests only",
+    "version":  "1.0.69",
+    "message":  "fill HUD stars before floor boss; re-enter loot and dormant rooms",
     "files":  [
                   "dungeon-lootr/launch.lua",
                   "dungeon-lootr/DungeonLootr.lua",
