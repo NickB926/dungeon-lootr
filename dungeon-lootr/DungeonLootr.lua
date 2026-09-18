@@ -93,7 +93,7 @@ Library.ToggleKeybind = { Value = 'Home' }
 Library.Animations = Library.Animations or {}
 Library.Animations.TabSwitch = false
 
-local DL_BUILD = '1.0.54'
+local DL_BUILD = '1.0.55'
 getgenv().DLBuild = DL_BUILD
 
 local Window = Library:CreateWindow({
@@ -5704,6 +5704,9 @@ local Rooms = (function()
 		local function packReady()
 			local n = 0
 			eachNpc(dungeon, function(npc)
+				if api.indexOf(npc) ~= idx then
+					return
+				end
 				if isWorldEnemy(npc)
 					and enemyAlive(npc)
 					and npc:GetAttribute('IsDormant') ~= true
@@ -5769,7 +5772,7 @@ local Rooms = (function()
 		if noclipOn then
 			pcall(setCharNoclip, true)
 		end
-		if packReady() or api.livingNpc(dungeon) > 0 then
+		if packReady() or api.aliveCount(dungeon, idx) > 0 then
 			return grabbed()
 		end
 		if expectingSpawn then
@@ -6060,6 +6063,7 @@ local Rooms = (function()
 				return nil
 			end
 			emptyHop[i] = nil
+			rt.starLock = i
 			return i
 		end
 		for i = want, maxR do
@@ -6090,6 +6094,7 @@ local Rooms = (function()
 		if soonest then
 			retryAt[soonest] = 0
 			emptyHop[soonest] = nil
+			rt.starLock = soonest
 			return soonest
 		end
 		return nil
@@ -6135,6 +6140,11 @@ local Rooms = (function()
 	function api.nextStarRoom(dungeon, fromPos)
 		seedLayoutFromController()
 		local layout = rt.zoneLayout
+		local now = os.clock()
+		local lock = tonumber(rt.starLock)
+		if lock and (retryAt[lock] or 0) <= now and dungeon and entryPoint(dungeon, lock) then
+			return lock
+		end
 		local function layoutOpen()
 			if type(layout) ~= 'table' then
 				return false
@@ -6180,6 +6190,24 @@ local Rooms = (function()
 					end
 				end
 				return not done
+			end
+			local lock = tonumber(rt.starLock)
+			if lock and (retryAt[lock] or 0) <= now and (not dungeon or entryPoint(dungeon, lock)) then
+				-- Stay in the room we already picked. Retargeting every tick
+				-- was the overhead hop across empty zones.
+				local still = true
+				for _, z in ipairs(layout) do
+					if z and tonumber(z.Index) == lock then
+						still = not (z.Completed == true or z.Done == true)
+						break
+					end
+				end
+				if still then
+					return lock
+				end
+				rt.starLock = nil
+			elseif lock then
+				rt.starLock = nil
 			end
 			for i, z in ipairs(layout) do
 				local idx = z and z.Index
@@ -8056,8 +8084,13 @@ local function farmLoop()
 			local starsHold = Rooms.starsHold()
 			local starIdx = dungeon and Rooms.nextStarRoom(dungeon, from)
 			local target = pickFarmTarget()
-			-- A special / floor boss in another room glued farm and skipped empty stars.
-			if target and starIdx and (enemyRank(target) >= 4 or isFinalBoss(target)) then
+			-- Leftover packs in other rooms must not warp us off the star we
+			-- just entered (that was the map hop).
+			if target and starIdx and starsHold then
+				if Rooms.indexOf(target) ~= starIdx then
+					target = nil
+				end
+			elseif target and starIdx and (enemyRank(target) >= 4 or isFinalBoss(target)) then
 				if Rooms.indexOf(target) ~= starIdx then
 					target = nil
 				end
@@ -8131,6 +8164,9 @@ local function farmLoop()
 				-- Rooms first. Map-wide chest tours on an empty floor skipped
 				-- special / star rooms (Depth 1 Next Area with empty circles).
 				local specialIdx = dungeon and Rooms.nextSpecialRoom(dungeon)
+				if specialIdx and starsHold and starIdx and specialIdx ~= starIdx then
+					specialIdx = nil
+				end
 				if specialIdx then
 					-- Empty rooms that are special / horde waves: stand in the Zone
 					-- until the pack spawns. Skipping them was Depth hops with 0 enemies.

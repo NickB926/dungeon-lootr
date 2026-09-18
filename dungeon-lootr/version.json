@@ -1,6 +1,6 @@
 {
-    "version":  "1.0.54",
-    "message":  "Loop specific Endless presses Continue on floor clear",
+    "version":  "1.0.55",
+    "message":  "stop hopping rooms when a leftover pack is elsewhere",
     "files":  [
                   "dungeon-lootr/launch.lua",
                   "dungeon-lootr/DungeonLootr.lua",
