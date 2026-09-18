@@ -5326,9 +5326,14 @@ local Rooms = (function()
 			return nil
 		end
 		local d = (zone.Position - fromPos).Magnitude
-		-- Allow a longer hop when the dungeon is empty: the next horde room may be
-		-- past a connector hall, and we must step into it to spawn the pack.
-		local maxDist = api.livingNpc(dungeon) == 0 and 550 or 220
+		-- Courtyard spawn can be 600+ studs from Room_2. A 550 cap left farm idle
+		-- on empty stars (Knights yard with 3 open circles).
+		local maxDist = 220
+		if hudHasOpenStar() then
+			maxDist = 4000
+		elseif api.livingNpc(dungeon) == 0 then
+			maxDist = 2500
+		end
 		if d > maxDist then
 			return nil
 		end
@@ -5961,6 +5966,51 @@ local Rooms = (function()
 		for i = 1, maxR do
 			if api.roomIsSpecial(dungeon, i) and okRoom(i) then
 				return i
+			end
+		end
+		return nil
+	end
+
+	-- HUD still has empty circles but RoomLayout didn't map an Index. Walk
+	-- sequential Room_N from the courtyard instead of standing idle.
+	function api.nextOpenRoom(dungeon, fromPos)
+		if not dungeon or not hudHasOpenStar() then
+			return nil
+		end
+		local now = os.clock()
+		local want = api.maxVisited() + 1
+		if want < 1 then
+			want = (fromPos and api.nearestIdx(dungeon, fromPos) or 0) + 1
+		end
+		if want < 1 then
+			want = 1
+		end
+		local maxR = api.maxRoom(dungeon)
+		local function take(i)
+			if not i or i < 1 or i > maxR then
+				return nil
+			end
+			if (retryAt[i] or 0) > now then
+				return nil
+			end
+			if not entryPoint(dungeon, i) then
+				return nil
+			end
+			emptyHop[i] = nil
+			return i
+		end
+		for i = want, maxR do
+			local got = take(i)
+			if got then
+				return got
+			end
+		end
+		for i = 1, want - 1 do
+			if not visited[i] then
+				local got = take(i)
+				if got then
+					return got
+				end
 			end
 		end
 		return nil
@@ -7993,7 +8043,7 @@ local function farmLoop()
 				local awakeN = dungeon and Rooms.awakeCount(dungeon) or 0
 				local curRoom = Rooms.sessionCurrentRoom()
 				local phase = Rooms.sessionPhase()
-				local starIdx = dungeon and Rooms.nextGapRoom(dungeon)
+				local starIdx = dungeon and (Rooms.nextGapRoom(dungeon) or Rooms.nextOpenRoom(dungeon, from))
 				-- Endless keeps CurrentRoom=0. The Catacombs Room_1→N repair
 				-- sweep is what parked us in the courtyard with an empty HUD slot.
 				local softlocked = curRoom == 0
@@ -8101,7 +8151,7 @@ local function farmLoop()
 				local noMobs = dungeon and Rooms.livingNpc(dungeon) == 0
 				local flipping = Rooms.flipping()
 				local hasDormant = (not noMobs) and from and Rooms.nextDormant(dungeon, from)
-				local starIdx = dungeon and Rooms.nextGapRoom(dungeon)
+				local starIdx = dungeon and (Rooms.nextGapRoom(dungeon) or Rooms.nextOpenRoom(dungeon, from))
 				local trashLeft, bossesLeft = countFarmSides()
 				local looted = false
 				-- Chests only when every non-boss is dead and the floor boss is next.
