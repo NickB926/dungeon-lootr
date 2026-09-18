@@ -1,6 +1,6 @@
 {
-    "version":  "1.0.67",
-    "message":  "visible room numbers; clear only after chests; do not rewalk swept rooms",
+    "version":  "1.0.68",
+    "message":  "force room markers on load; clear after chests only",
     "files":  [
                   "dungeon-lootr/launch.lua",
                   "dungeon-lootr/DungeonLootr.lua",

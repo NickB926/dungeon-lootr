@@ -93,7 +93,7 @@ Library.ToggleKeybind = { Value = 'Home' }
 Library.Animations = Library.Animations or {}
 Library.Animations.TabSwitch = false
 
-local DL_BUILD = '1.0.67'
+local DL_BUILD = '1.0.68'
 getgenv().DLBuild = DL_BUILD
 
 local Window = Library:CreateWindow({
@@ -8605,12 +8605,12 @@ local function tickRoomSweepMarks()
 	local maxR = Rooms.maxRoom(dungeon)
 	local keep = {}
 	for i = 1, maxR do
-		local why = skipTourRoom(dungeon, i)
-		if why then
+		local ok, why = pcall(skipTourRoom, dungeon, i)
+		if ok and why then
 			clearSweepMark(i)
 		else
 			keep[i] = true
-			ensureSweepMark(dungeon, i)
+			pcall(ensureSweepMark, dungeon, i)
 		end
 	end
 	for idx in pairs(sweepMarks) do
@@ -14219,6 +14219,9 @@ pcall(function()
 		rt.Pause.start()
 	end
 end)
+task.defer(function()
+	pcall(tickRoomSweepMarks)
+end)
 
 local hbCombatConn
 hbCombatConn = track(RunService.Heartbeat:Connect(function(dt)
@@ -14251,7 +14254,9 @@ hbCombatConn = track(RunService.Heartbeat:Connect(function(dt)
 	-- Skills / farm watchdog must not sit behind the combat throttle.
 	pcall(autoSkillTick)
 	pcall(RunLoops.autoFarmTick)
-	if farmBusy and os.clock() - (rt.sweepMarkAt or 0) > 0.45 then
+	if (farmBusy or LocalPlayer:GetAttribute('InDungeon') == true)
+		and os.clock() - (rt.sweepMarkAt or 0) > 0.45
+	then
 		rt.sweepMarkAt = os.clock()
 		pcall(tickRoomSweepMarks)
 	end
