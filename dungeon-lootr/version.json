@@ -1,6 +1,6 @@
 {
-    "version":  "1.0.38",
-    "message":  "Skip HealthOverride fodder after 8s of no HitReact so farm does not sit on unhittable daemons",
+    "version":  "1.0.39",
+    "message":  "Skip unhittable leftover fodder instead of looping them",
     "files":  [
                   "dungeon-lootr/launch.lua",
                   "dungeon-lootr/DungeonLootr.lua",

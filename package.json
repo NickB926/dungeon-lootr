@@ -1,6 +1,6 @@
 {
     "name":  "dungeon-lootr",
-    "version":  "1.0.38",
+    "version":  "1.0.39",
     "private":  true,
     "description":  "Dungeon Lootr update feed (GitHub raw loadstring)",
     "scripts":  {

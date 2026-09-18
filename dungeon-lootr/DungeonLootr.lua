@@ -224,6 +224,15 @@ local farmLabel = nil
 local farmHome = nil
 local farmKills = 0
 local farmFinished = {}
+local farmBan = {}
+local function farmSkipped(npc)
+	local ban = farmBan[npc]
+	if ban and os.clock() < ban then
+		return true
+	end
+	local untilAt = farmFinished[npc]
+	return untilAt ~= nil and os.clock() < untilAt
+end
 local runCompleteAt = nil
 local replayArmedAt = nil
 local replayTries = 0
@@ -3466,6 +3475,9 @@ local function enemyAlive(npc)
 	if not npc or not npc.Parent then
 		return false
 	end
+	if farmSkipped(npc) then
+		return false
+	end
 	local state = string.lower(tostring(npc:GetAttribute('State') or ''))
 	if state == 'dead' or state == 'died' or state == 'dying' then
 		return false
@@ -4876,6 +4888,11 @@ local function autoSkillTick()
 	if rt.refillBusy or rt.refillUrgent then
 		return
 	end
+	-- SkillIFrame sits up for the whole skill dump and the server ignores M1
+	-- during it. Demon leftovers took 0 Damage_Dealt while skills cycled.
+	if rt.farmFighting and rt.farmFightNpc and enemyRank(rt.farmFightNpc) < 3 then
+		return
+	end
 	-- Ultimate first. Skill 1–4 used to set lastSkillFire every tick and starve G.
 	-- Farm-on also dumps G so it still pops if Auto skill was left off.
 	if wantUlt and type(rt.tryFarmUlt) == 'function' then
@@ -4994,11 +5011,6 @@ local function farmActive()
 	local char = character()
 	local hum = char and char:FindFirstChildOfClass('Humanoid')
 	return hum ~= nil and hum.Health > 0
-end
-
-local function farmSkipped(npc)
-	local untilAt = farmFinished[npc]
-	return untilAt ~= nil and os.clock() < untilAt
 end
 
 -- The global 'Enemy' tag is not a safe target list: the map has props wearing it
@@ -7466,7 +7478,7 @@ local function farmKill(npc)
 	local lastDrop = started
 	local lastHit = 0
 	local dealt0 = tonumber(LocalPlayer:GetAttribute('Damage_Dealt')) or 0
-	local react0 = tonumber(npc:GetAttribute('HitReact')) or 0
+	local hits0 = tonumber(LocalPlayer:GetAttribute('Hit_Count')) or 0
 	-- Position is held on Heartbeat for the whole fight; this loop only swings and
 	-- watches health, so its cadence no longer affects how smooth movement looks.
 	rt.crystalPack = crystalPack == true
@@ -7499,6 +7511,10 @@ local function farmKill(npc)
 			break
 		end
 		if now - started > timeout then
+			if not sticky then
+				farmBan[npc] = os.clock() + 120
+				farmLabel = ('skip · %s'):format(npc.Name)
+			end
 			break
 		end
 		local myPct = rt.hpPct()
@@ -7550,7 +7566,10 @@ local function farmKill(npc)
 			end
 			if now - lastHit >= attackDelay() then
 				lastHit = now
-				pcall(fireAttack)
+				local me = character()
+				if not (me and me:GetAttribute('SkillIFrame') == true) then
+					pcall(fireAttack)
+				end
 			end
 			-- Stall detection needs a readable HP bar; a boss without one only gets
 			-- the timeout above. Specials / minis are never stall-abandoned — that
@@ -7561,20 +7580,23 @@ local function farmKill(npc)
 					lastHp = hp
 					lastDrop = now
 				elseif now - started > FARM_STALL_TIMEOUT and now - lastDrop > FARM_STALL_TIMEOUT then
-					-- Unhittable: out of reach, immune phase, or a bad standoff.
+					farmBan[npc] = os.clock() + 120
+					farmLabel = ('skip · %s'):format(npc.Name)
 					break
 				end
 			elseif not readable and not sticky and not crystalPack and not addPack then
-				-- AnimationController fodder only exposes HealthOverride (max). If
-				-- HitReact / Damage_Dealt never move, swings are missing.
-				local stallFor = 8
+				-- HealthOverride fodder has no HP bar. HitReact still ticks on
+				-- their own swings, so stall must watch OUR damage, not theirs.
+				local stallFor = 6
 				local dealt = tonumber(LocalPlayer:GetAttribute('Damage_Dealt')) or 0
-				local react = tonumber(npc:GetAttribute('HitReact')) or 0
-				if dealt > dealt0 + 0.5 or react > react0 then
+				local hits = tonumber(LocalPlayer:GetAttribute('Hit_Count')) or 0
+				if dealt > dealt0 + 0.5 or hits > hits0 then
 					dealt0 = math.max(dealt0, dealt)
-					react0 = math.max(react0, react)
+					hits0 = math.max(hits0, hits)
 					lastDrop = now
 				elseif now - started > stallFor and now - lastDrop > stallFor then
+					farmBan[npc] = os.clock() + 120
+					farmLabel = ('skip · %s'):format(npc.Name)
 					break
 				end
 			end
@@ -7597,6 +7619,10 @@ local function farmKill(npc)
 	elseif addPack then
 		if #listAddsNearSpecial(addAnchor) == 0 then
 			farmKills += 1
+		end
+	elseif farmBan[npc] and os.clock() < farmBan[npc] then
+		if farmLock == npc then
+			farmLock = nil
 		end
 	elseif not enemyAlive(npc) then
 		farmKills += 1
@@ -7921,6 +7947,7 @@ local function startFarm()
 	if not rt.farmStarted then
 		farmKills = 0
 		farmFinished = {}
+		farmBan = {}
 		farmLock = nil
 		pcall(Rooms.reset)
 		rt.farmStarted = true
