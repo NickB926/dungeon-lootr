@@ -93,7 +93,7 @@ Library.ToggleKeybind = { Value = 'Home' }
 Library.Animations = Library.Animations or {}
 Library.Animations.TabSwitch = false
 
-local DL_BUILD = '1.0.70'
+local DL_BUILD = '1.0.71'
 getgenv().DLBuild = DL_BUILD
 
 local Window = Library:CreateWindow({
@@ -5494,6 +5494,41 @@ local Rooms = (function()
 		return false
 	end
 
+	-- Courtyard / Player_Spawn pad. No pack, not a HUD star — do not tour it.
+	function api.isStartRoom(dungeon, idx)
+		local room = dungeon and dungeon:FindFirstChild('Room_' .. tostring(idx))
+		if not room then
+			return false
+		end
+		if room:GetAttribute('IsLootRoom') == true
+			or room:GetAttribute('IsSpecial') == true
+			or room:GetAttribute('IsSpecialBoss') == true
+			or room:GetAttribute('IsBoss') == true
+			or room:GetAttribute('IsHorde') == true
+			or room:GetAttribute('IsEvent') == true
+		then
+			return false
+		end
+		local spawns = room:FindFirstChild('Spawns')
+		if not spawns then
+			return false
+		end
+		local playerSpawn = spawns:FindFirstChild('Player_Spawn') or spawns:FindFirstChild('PlayerSpawn')
+		if not playerSpawn then
+			return false
+		end
+		if spawns:FindFirstChild('Enemy_Spawn') or spawns:FindFirstChild('EnemySpawn') then
+			return false
+		end
+		if spawns:FindFirstChild('Chest_Spawn')
+			or spawns:FindFirstChild('Chest_Spawn_Rare')
+			or spawns:FindFirstChild('ChestSpawn')
+		then
+			return false
+		end
+		return true
+	end
+
 	function api.isBossRoom(dungeon, idx)
 		local room = dungeon and dungeon:FindFirstChild('Room_' .. tostring(idx))
 		if not room then
@@ -6367,7 +6402,10 @@ local Rooms = (function()
 		local now = os.clock()
 		local lock = tonumber(rt.starLock)
 		if lock and (retryAt[lock] or 0) <= now and dungeon and entryPoint(dungeon, lock) then
-			return lock
+			if not api.isStartRoom(dungeon, lock) and not api.isCorridor(dungeon, lock) then
+				return lock
+			end
+			rt.starLock = nil
 		end
 		local function layoutOpen()
 			if type(layout) ~= 'table' then
@@ -6436,6 +6474,9 @@ local Rooms = (function()
 			for i, z in ipairs(layout) do
 				local idx = z and z.Index
 				if starOpen(i, z) and (retryAt[idx] or 0) <= now then
+					if dungeon and (api.isStartRoom(dungeon, idx) or api.isCorridor(dungeon, idx)) then
+						continue
+					end
 					if not dungeon or entryPoint(dungeon, idx) then
 						rt.starLock = idx
 						return idx
@@ -6483,12 +6524,16 @@ local Rooms = (function()
 			end
 		end)
 		local dorm = api.lowestDormant(dungeon)
-		if dorm and (retryAt[dorm] or 0) <= now and entryPoint(dungeon, dorm) then
+		if dorm and (retryAt[dorm] or 0) <= now and entryPoint(dungeon, dorm)
+			and not api.isStartRoom(dungeon, dorm) and not api.isCorridor(dungeon, dorm)
+		then
 			rt.starLock = dorm
 			return dorm
 		end
 		for i = 1, maxR do
-			if withNpc[i] and (retryAt[i] or 0) <= now and entryPoint(dungeon, i) then
+			if withNpc[i] and (retryAt[i] or 0) <= now and entryPoint(dungeon, i)
+				and not api.isStartRoom(dungeon, i) and not api.isCorridor(dungeon, i)
+			then
 				rt.starLock = i
 				return i
 			end
@@ -6500,7 +6545,9 @@ local Rooms = (function()
 			for _, z in ipairs(rt.zoneLayout) do
 				local i = z and tonumber(z.Index)
 				local done = z and (z.Completed == true or z.Done == true)
-				if i and not z.IsBoss and not done and entryPoint(dungeon, i) then
+				if i and not z.IsBoss and not done and entryPoint(dungeon, i)
+					and not api.isStartRoom(dungeon, i) and not api.isCorridor(dungeon, i)
+				then
 					-- Incomplete stars always win over park/retry. Empty hop parks
 					-- used to softlock Room_6 while NextArea spun forever.
 					if not anyLive then
@@ -8397,7 +8444,7 @@ local function goToOpenStar(dungeon, maxRoom)
 	end)
 	if not star then
 		for i = 1, maxRoom or Rooms.maxRoom(dungeon) do
-			if Rooms.isCorridor(dungeon, i) then
+			if Rooms.isCorridor(dungeon, i) or Rooms.isStartRoom(dungeon, i) then
 				continue
 			end
 			if Rooms.dormantCount(dungeon, i) > 0 or roomHasPendingChest(dungeon, i) then
@@ -8528,6 +8575,9 @@ local function skipTourRoom(dungeon, idx)
 	end
 	if Rooms.isCorridor(dungeon, idx) then
 		return 'hall'
+	end
+	if Rooms.isStartRoom(dungeon, idx) then
+		return 'start'
 	end
 	-- Incomplete HUD stars (loot / empty circle) must still be visited even if
 	-- we already stamped the room swept after a dry loot pass.
@@ -8761,7 +8811,8 @@ local function tourFarmRooms(dungeon)
 		end
 		if why == 'hall' then
 			farmLabel = ('skip hall Room_%d'):format(idx)
-		elseif why == 'shrine' or why == 'checkpoint' then
+			clearSweepMark(idx)
+		elseif why == 'start' or why == 'shrine' or why == 'checkpoint' then
 			farmLabel = ('skip %s Room_%d'):format(why, idx)
 			clearSweepMark(idx)
 		else

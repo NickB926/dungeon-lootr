@@ -1,6 +1,6 @@
 {
-    "version":  "1.0.70",
-    "message":  "stop farm crash on blessing shrine descendant scan",
+    "version":  "1.0.71",
+    "message":  "skip Player_Spawn starting room; do not park farm on courtyard",
     "files":  [
                   "dungeon-lootr/launch.lua",
                   "dungeon-lootr/DungeonLootr.lua",
