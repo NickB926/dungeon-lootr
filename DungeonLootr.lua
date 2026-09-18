@@ -93,7 +93,7 @@ Library.ToggleKeybind = { Value = 'Home' }
 Library.Animations = Library.Animations or {}
 Library.Animations.TabSwitch = false
 
-local DL_BUILD = '1.0.72'
+local DL_BUILD = '1.0.73'
 getgenv().DLBuild = DL_BUILD
 
 local Window = Library:CreateWindow({
@@ -3567,9 +3567,17 @@ local function enemyAlive(npc)
 	if state == 'dead' or state == 'died' or state == 'dying' then
 		return false
 	end
-	local hp = enemyHealth(npc)
+	local hp, maxHp = enemyHealth(npc)
 	if hp ~= nil then
-		return hp > 0
+		if hp > 0 then
+			return true
+		end
+		-- Dummy Humanoid sits at 0; live HP is HealthOverride + State.
+		local ov = tonumber(npc:GetAttribute('HealthOverride'))
+		if ov and ov > 0 then
+			return true
+		end
+		return false
 	end
 	return true
 end
@@ -8295,10 +8303,8 @@ local function farmKill(npc)
 			end
 			if now - lastHit >= attackDelay() then
 				lastHit = now
-				local me = character()
-				if not (me and me:GetAttribute('SkillIFrame') == true) then
-					pcall(fireAttack)
-				end
+				-- SkillIFrame sticks true on some classes and used to skip every M1.
+				pcall(fireAttack)
 			end
 			-- Stall detection needs a readable HP bar; a boss without one only gets
 			-- the timeout above. Specials / minis are never stall-abandoned — that
@@ -8385,6 +8391,32 @@ local function findLiveSpecial()
 		end
 		local me = routeRoot()
 		local d = me and (part.Position - me.Position).Magnitude or 0
+		if d < bestD then
+			best, bestD = npc, d
+		end
+	end)
+	return best
+end
+
+local function nearestAggro(maxD)
+	local root = routeRoot()
+	if not root then
+		return nil
+	end
+	maxD = tonumber(maxD) or 55
+	local best, bestD = nil, maxD
+	eachFarmNpc(function(npc)
+		if not enemyAlive(npc) or farmSkipped(npc) or isFinalBoss(npc) then
+			return
+		end
+		if npc:GetAttribute('IsDormant') == true then
+			return
+		end
+		local part = enemyRoot(npc)
+		if not part then
+			return
+		end
+		local d = (part.Position - root.Position).Magnitude
 		if d < bestD then
 			best, bestD = npc, d
 		end
@@ -8992,6 +9024,7 @@ local function farmLoop()
 				end
 			end)
 			if blessHold then
+				farmLabel = farmLabel or 'blessing'
 				task.wait(0.2)
 			else
 				local aoeOk, aoeHit = pcall(rt.avoidFloorAoe)
@@ -9001,9 +9034,13 @@ local function farmLoop()
 				end
 				local dungeon = activeDungeonRoot()
 				local specialNpc = findLiveSpecial()
+				local aggroNpc = nearestAggro(60)
 				if specialNpc then
 					rt.farmRoomFilter = nil
 					farmKillNpc(specialNpc)
+				elseif aggroNpc then
+					rt.farmRoomFilter = nil
+					farmKillNpc(aggroNpc)
 				else
 					tourFarmRooms(dungeon)
 				end
@@ -10641,7 +10678,9 @@ local BlessPick = (function()
 			return
 		end
 		shrineBusy = true
+		rt.shrineBusyAt = os.clock()
 		task.spawn(function()
+			local ok, err = pcall(function()
 			local home = root.CFrame
 			local wasNoclip = noclipOn
 			routeBusy = true
@@ -10709,14 +10748,14 @@ local BlessPick = (function()
 			end
 			Pin.stop()
 			routeLabel = nil
-			routeBusy = false
-			shrineBusy = false
 			if shrineAlreadyUsed(bestModel, bestPos) then
 				shrineNext = os.clock() + 8
 			else
-				-- Hold missed — try again shortly, do not immediately re-warp.
 				shrineNext = os.clock() + 2.5
 			end
+			end)
+			routeBusy = false
+			shrineBusy = false
 		end)
 	end
 
@@ -10730,8 +10769,13 @@ local BlessPick = (function()
 			return false
 		end
 		if shrineBusy then
-			farmLabel = 'blessing shrine'
-			return true
+			if os.clock() - (rt.shrineBusyAt or 0) > 8 then
+				shrineBusy = false
+				routeBusy = false
+			else
+				farmLabel = 'blessing shrine'
+				return true
+			end
 		end
 		if api.open() then
 			local root = routeRoot()

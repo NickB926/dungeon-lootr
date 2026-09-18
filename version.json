@@ -1,6 +1,6 @@
 {
-    "version":  "1.0.72",
-    "message":  "stop spawn bounce: skip Zone floor snap; do not hold farm on fake blessing UI",
+    "version":  "1.0.73",
+    "message":  "farm M1 despite stuck SkillIFrame; attack nearby aggro packs",
     "files":  [
                   "dungeon-lootr/launch.lua",
                   "dungeon-lootr/DungeonLootr.lua",
