@@ -1,6 +1,6 @@
 {
     "version":  "1.0.63",
-    "message":  "auto skill on fodder, one slot at a time, no 60ms cancel",
+    "message":  "skip claimed chests via Chest_Lock, not missing Looted attr",
     "files":  [
                   "dungeon-lootr/launch.lua",
                   "dungeon-lootr/DungeonLootr.lua",

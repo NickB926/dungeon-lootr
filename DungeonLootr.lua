@@ -2057,8 +2057,45 @@ local function chestActionOk(prompt)
 	return obj:find('chest', 1, true) ~= nil
 end
 
+local function markChestDone(model)
+	if not model then
+		return
+	end
+	rt.chestDone = rt.chestDone or {}
+	rt.chestDone[model] = true
+	local uid = model:GetAttribute('ChestUID')
+	if uid then
+		rt.chestDoneUid = rt.chestDoneUid or {}
+		rt.chestDoneUid[tostring(uid)] = true
+	end
+end
+
+-- Server never sets Looted/Opened/Claimed. Claimed chests spawn a Chest_Lock
+-- child (prompt stays Action=Loot, Enabled=false). Unclaimed chests have no lock.
+local function chestIsClaimed(model)
+	if not model or not model.Parent then
+		return true
+	end
+	if rt.chestDone and rt.chestDone[model] then
+		return true
+	end
+	local uid = model:GetAttribute('ChestUID')
+	if uid and rt.chestDoneUid and rt.chestDoneUid[tostring(uid)] then
+		return true
+	end
+	if model:GetAttribute('Looted') == true
+		or model:GetAttribute('Opened') == true
+		or model:GetAttribute('Claimed') == true
+	then
+		return true
+	end
+	if model:FindFirstChild('Chest_Lock', true) then
+		return true
+	end
+	return false
+end
+
 -- Prompt.Enabled is often false until you stand in range after the pack dies.
--- Chest_Lock is on unclaimed chests too — only Looted/Opened/Claimed means done.
 local function chestClaimCandidate(model)
 	if not model or not model.Parent then
 		return false
@@ -2066,12 +2103,8 @@ local function chestClaimCandidate(model)
 	if not (model:GetAttribute('DungeonChest') == true or model.Name:sub(1, 13) == 'DungeonChest') then
 		return false
 	end
-	if rt.chestDone and rt.chestDone[model] then
-		return false
-	end
-	if model:GetAttribute('Looted') == true or model:GetAttribute('Opened') == true or model:GetAttribute('Claimed') == true then
-		rt.chestDone = rt.chestDone or {}
-		rt.chestDone[model] = true
+	if chestIsClaimed(model) then
+		markChestDone(model)
 		return false
 	end
 	if model:GetAttribute('LockedRoom') == true then
@@ -2289,9 +2322,8 @@ local function collectChestRoute(silent, roomOnly)
 				break
 			end
 			-- Re-check after travel: claimed while we were en route.
-			if model:GetAttribute('Looted') == true or model:GetAttribute('Opened') == true or model:GetAttribute('Claimed') == true then
-				rt.chestDone = rt.chestDone or {}
-				rt.chestDone[model] = true
+			if chestIsClaimed(model) then
+				markChestDone(model)
 				rt.chestSkip[model] = os.clock() + 90
 			elseif not chestClaimCandidate(model) then
 				rt.chestSkip[model] = os.clock() + 8
@@ -2359,13 +2391,15 @@ local function collectChestRoute(silent, roomOnly)
 						end
 						if not chestClaimCandidate(model) or not chestStillOpen(model) then
 							got += 1
-							rt.chestDone = rt.chestDone or {}
-							rt.chestDone[model] = true
+							markChestDone(model)
 							rt.chestSkip[model] = os.clock() + 120
 						else
 							-- Failed this pass — retry soon, do not park the chest 3 min.
 							rt.chestSkip[model] = os.clock() + 6
 						end
+					elseif chestIsClaimed(model) then
+						markChestDone(model)
+						rt.chestSkip[model] = os.clock() + 90
 					else
 						rt.chestSkip[model] = os.clock() + 6
 					end
@@ -5369,6 +5403,7 @@ local Rooms = (function()
 		rt.farmDungeonId = nil
 		rt.shrineUsed = {}
 		rt.chestDone = {}
+		rt.chestDoneUid = {}
 		rt.roomSweepDone = {}
 	end
 
@@ -8249,13 +8284,8 @@ local function roomHasPendingChest(dungeon, idx)
 	for _, child in ipairs(dungeon:GetChildren()) do
 		if child:GetAttribute('DungeonChest') == true or child.Name:sub(1, 13) == 'DungeonChest' then
 			if tonumber(child:GetAttribute('RoomIndex')) == idx then
-				if rt.chestDone and rt.chestDone[child] then
-					continue
-				end
-				if child:GetAttribute('Looted') == true
-					or child:GetAttribute('Opened') == true
-					or child:GetAttribute('Claimed') == true
-				then
+				if chestIsClaimed(child) then
+					markChestDone(child)
 					continue
 				end
 				if child:GetAttribute('LockedRoom') == true and not wantOpenGates() then
