@@ -1,6 +1,6 @@
 {
-    "version":  "1.0.58",
-    "message":  "bless first, skip used shrines/chests, stand inside chests",
+    "version":  "1.0.59",
+    "message":  "skip loot-room guards so chests and floor boss are not blocked",
     "files":  [
                   "dungeon-lootr/launch.lua",
                   "dungeon-lootr/DungeonLootr.lua",

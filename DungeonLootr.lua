@@ -93,7 +93,7 @@ Library.ToggleKeybind = { Value = 'Home' }
 Library.Animations = Library.Animations or {}
 Library.Animations.TabSwitch = false
 
-local DL_BUILD = '1.0.58'
+local DL_BUILD = '1.0.59'
 getgenv().DLBuild = DL_BUILD
 
 local Window = Library:CreateWindow({
@@ -230,6 +230,11 @@ local farmKills = 0
 local farmFinished = {}
 local farmBan = {}
 local function farmSkipped(npc)
+	-- Chest-room mannequins have no Humanoid. Fighting them parks farm on the
+	-- dummy (skipFinal then also hides the floor boss).
+	if npc and npc:GetAttribute('IsLootRoomGuard') == true then
+		return true
+	end
 	local ban = farmBan[npc]
 	if ban and os.clock() < ban then
 		return true
@@ -8236,6 +8241,11 @@ local function tourFarmRooms(dungeon)
 		return
 	end
 	local phase = rt.farmRoomPhase or 'wait'
+	local roomModel = dungeon:FindFirstChild('Room_' .. tostring(idx))
+	if roomModel and roomModel:GetAttribute('IsLootRoom') == true and Rooms.aliveCount(dungeon, idx) <= 0 then
+		phase = 'loot'
+		rt.farmRoomPhase = 'loot'
+	end
 	rt.farmRoomFilter = idx
 	if phase == 'wait' then
 		farmLabel = ('Room_%d · wait'):format(idx)
