@@ -17,26 +17,31 @@ local VERSION_PATH = 'dungeon-lootr/version.json'
 local UPDATE_URL_PATH = 'dungeon-lootr/update_url.txt'
 
 local function httpGet(url)
-	local req = (syn and syn.request) or http_request or (http and http.request) or request
-	if type(req) == 'function' then
-		local ok, res = pcall(req, { Url = url, Method = 'GET' })
-		if ok and type(res) == 'table' then
-			local body = res.Body or res.body
-			local code = tonumber(res.StatusCode or res.Status or res.statusCode) or 0
-			if code >= 200 and code < 300 and type(body) == 'string' then
+	local function once(target)
+		local req = (syn and syn.request) or http_request or (http and http.request) or request
+		if type(req) == 'function' then
+			local ok, res = pcall(req, { Url = target, Method = 'GET' })
+			if ok and type(res) == 'table' then
+				local body = res.Body or res.body
+				local code = tonumber(res.StatusCode or res.Status or res.statusCode) or 0
+				if code >= 200 and code < 300 and type(body) == 'string' then
+					return body
+				end
+			end
+		end
+		if type(game.HttpGet) == 'function' then
+			local ok, body = pcall(function()
+				return game:HttpGet(target)
+			end)
+			if ok and type(body) == 'string' and body ~= '' then
 				return body
 			end
 		end
+		return nil
 	end
-	if type(game.HttpGet) == 'function' then
-		local ok, body = pcall(function()
-			return game:HttpGet(url)
-		end)
-		if ok and type(body) == 'string' and body ~= '' then
-			return body
-		end
-	end
-	return nil
+	-- GitHub raw caches by path. A query string misses some CDNs; still try it.
+	local sep = string.find(url, '?', 1, true) and '&' or '?'
+	return once(url .. sep .. 'dl=' .. tostring(math.floor(os.clock() * 1000))) or once(url)
 end
 
 local function readLocalVersion()
@@ -60,6 +65,10 @@ local function readLocalVersion()
 end
 
 local function updateBaseUrl()
+	local env = getgenv().DLUpdateBase
+	if type(env) == 'string' and env ~= '' then
+		return env:gsub('/+$', '')
+	end
 	if type(isfile) == 'function' and type(readfile) == 'function' and isfile(UPDATE_URL_PATH) then
 		local ok, body = pcall(readfile, UPDATE_URL_PATH)
 		if ok and type(body) == 'string' then
@@ -68,10 +77,6 @@ local function updateBaseUrl()
 				return url
 			end
 		end
-	end
-	local env = getgenv().DLUpdateBase
-	if type(env) == 'string' and env ~= '' then
-		return env:gsub('/+$', '')
 	end
 	return DEFAULT_BASE
 end
@@ -197,6 +202,27 @@ function Updater.apply(opts)
 	local remoteBody = httpGet(base .. '/version.json')
 	if remoteBody then
 		writeFile(VERSION_PATH, remoteBody)
+	end
+
+	-- GitHub raw often serves a fresh version.json with a cached DungeonLootr.lua.
+	-- Friends then match versions and never re-download. Verify the build stamp.
+	local mainPath = 'dungeon-lootr/DungeonLootr.lua'
+	local ver = tostring(info.remoteVersion or '')
+	local function mainIsCurrent()
+		if type(readfile) ~= 'function' or type(isfile) ~= 'function' or not isfile(mainPath) then
+			return false
+		end
+		local ok, body = pcall(readfile, mainPath)
+		return ok and type(body) == 'string' and ver ~= ''
+			and body:find("local DL_BUILD = '" .. ver .. "'", 1, true) ~= nil
+	end
+	if ver ~= '' and not mainIsCurrent() then
+		say('DungeonLootr.lua did not match ' .. ver .. ' — retrying jsDelivr')
+		local alt = 'https://cdn.jsdelivr.net/gh/NickB926/dungeon-lootr@main/dungeon-lootr/DungeonLootr.lua'
+		local body = httpGet(alt)
+		if type(body) == 'string' and body ~= '' then
+			writeFile(mainPath, body)
+		end
 	end
 
 	say(('Update done - %d ok, %d failed. Re-run launch / bootstrap.'):format(okCount, failCount))

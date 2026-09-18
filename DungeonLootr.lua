@@ -93,10 +93,14 @@ Library.ToggleKeybind = { Value = 'Home' }
 Library.Animations = Library.Animations or {}
 Library.Animations.TabSwitch = false
 
+local DL_BUILD = '1.0.49'
+getgenv().DLBuild = DL_BUILD
+
 local Window = Library:CreateWindow({
 	Title = 'Dungeon Lootr',
 	Footer = 'Home toggles menu',
 	Folder = 'dungeon-lootr',
+	Version = DL_BUILD,
 	Size = UDim2.fromOffset(880, 560),
 })
 pcall(function()
@@ -8068,10 +8072,6 @@ local function farmLoop()
 				local dungeon = activeDungeonRoot()
 				local idx = Rooms.indexOf(target)
 				Rooms.markVisited(idx)
-				if isFinalBoss(target) and not rt.bossSweepDone and not inBossRushFarm() then
-					tryChestSweep('chest sweep · then boss')
-					rt.bossSweepDone = true
-				end
 				if target:GetAttribute('IsDormant') == true then
 					farmLabel = ('wake %s'):format(target.Name)
 					wakeTarget(target)
@@ -8132,10 +8132,8 @@ local function farmLoop()
 					and not Rooms.repairFinished()
 					and not starIdx
 					and not inEndlessFarm()
-				-- Endless: no boss gate. Grab chests before hopping to the next star.
-				if inEndlessFarm() and awakeN == 0 then
-					tryChestSweep('chest sweep')
-				end
+				-- Rooms first. Map-wide chest tours on an empty floor skipped
+				-- special / star rooms (Depth 1 Next Area with empty circles).
 				local specialIdx = dungeon and Rooms.nextSpecialRoom(dungeon)
 				if specialIdx then
 					-- Empty rooms that are special / horde waves: stand in the Zone
@@ -8150,7 +8148,7 @@ local function farmLoop()
 					-- Endless also leaves Phase blank while the boss star is still
 					-- empty, which used to park us in Room_28 doing nothing.
 					local bossTrash = select(1, countFarmSides())
-					if bossTrash == 0 then
+					if bossTrash == 0 and not starsHold then
 						tryChestSweep('chest sweep · then boss')
 					end
 					local bossNpc
@@ -8248,11 +8246,12 @@ local function farmLoop()
 				local noMobs = dungeon and Rooms.livingNpc(dungeon) == 0
 				local flipping = Rooms.flipping()
 				local hasDormant = (not noMobs) and from and Rooms.nextDormant(dungeon, from)
-				local starIdx = dungeon and (Rooms.nextGapRoom(dungeon) or Rooms.nextOpenRoom(dungeon, from))
+				local starIdx = dungeon and (Rooms.nextGapRoom(dungeon) or Rooms.nextOpenRoom(dungeon, from) or (starsHold and from and Rooms.nextEmpty(dungeon, from, nil)))
 				local trashLeft, bossesLeft = countFarmSides()
 				local looted = false
-				-- Chests only when every non-boss is dead and the floor boss is next.
-				if trashLeft == 0 then
+				-- Chests only after every star is filled. Sweeping first is what
+				-- walked Next Area / other rooms while circles were still empty.
+				if trashLeft == 0 and not starsHold and not starIdx and not hasDormant then
 					looted = tryChestSweep(bossesLeft > 0 and 'chest sweep · then boss' or 'chest sweep')
 				end
 				if not looted then
@@ -13740,5 +13739,5 @@ pcall(rt.bindCharHp, character())
 pcall(scanEsp)
 pcall(refreshHud)
 pcall(captureCollisionBaseline)
-Library:Notify('Dungeon Lootr helper loaded — Home toggles menu')
-print('[DL] helper loaded — Home toggles menu')
+Library:Notify('Dungeon Lootr ' .. DL_BUILD .. ' — Home toggles menu')
+print('[DL] helper loaded —', DL_BUILD)

@@ -1,9 +1,9 @@
 --[[
 	bootstrap.lua — one-line install / update for Dungeon Lootr
 
-	Friend load:
+	Friend load (cache-bust so GitHub raw cannot serve yesterday's bootstrap):
 
-	  loadstring(game:HttpGet("https://raw.githubusercontent.com/NickB926/dungeon-lootr/main/bootstrap.lua"))()
+	  loadstring(game:HttpGet("https://raw.githubusercontent.com/NickB926/dungeon-lootr/main/bootstrap.lua?"..tostring(tick())))()
 
 	Optional feed override:
 	  getgenv().DLUpdateBase = "https://raw.githubusercontent.com/NickB926/dungeon-lootr/main"
@@ -72,24 +72,54 @@ end
 local Updater = fn()
 getgenv().DLUpdateBase = BASE
 
-local hasLaunch = type(isfile) == 'function' and isfile('dungeon-lootr/launch.lua')
-local hasMain = type(isfile) == 'function' and isfile('dungeon-lootr/DungeonLootr.lua')
-local hasAta = type(isfile) == 'function' and isfile('dungeon-lootr/AtaraxiaLibrary.lua')
 local info = Updater.check and Updater.check() or { ok = false }
 
-if info.ok and not info.needsUpdate and hasLaunch and hasMain and hasAta then
-	say(('Already on %s — skip download'):format(tostring(info.remoteVersion)))
-else
-	local ok, detail = Updater.apply({
-		force = not (hasLaunch and hasMain and hasAta),
+local function luaIsCurrent(ver)
+	if type(isfile) ~= 'function' or type(readfile) ~= 'function' then
+		return false
+	end
+	if not isfile('dungeon-lootr/DungeonLootr.lua') then
+		return false
+	end
+	local ok, body = pcall(readfile, 'dungeon-lootr/DungeonLootr.lua')
+	if not ok or type(body) ~= 'string' or body == '' then
+		return false
+	end
+	ver = tostring(ver or '')
+	if ver ~= '' and body:find("local DL_BUILD = '" .. ver .. "'", 1, true) then
+		return true
+	end
+	return false
+end
+
+-- Always re-download. Matching version.json with a stale DungeonLootr.lua
+-- (GitHub raw cache) is why friends stayed on the old farm.
+local ok, detail = Updater.apply({
+	force = true,
+	notify = say,
+	quietWarn = true,
+})
+if not ok then
+	say('Update finished with issues: ' .. tostring(detail))
+end
+
+local remoteVer = info and info.remoteVersion
+if not luaIsCurrent(remoteVer) then
+	say('GitHub copy looked stale — retrying jsDelivr')
+	getgenv().DLUpdateBase = 'https://cdn.jsdelivr.net/gh/NickB926/dungeon-lootr@main'
+	local ok2, detail2 = Updater.apply({
+		force = true,
 		notify = say,
 		quietWarn = true,
 	})
-	if not ok then
-		say('Update finished with issues: ' .. tostring(detail))
-	else
-		say('Files ready.')
+	if not ok2 then
+		say('jsDelivr retry had issues: ' .. tostring(detail2))
 	end
+	getgenv().DLUpdateBase = BASE
+end
+
+if not luaIsCurrent(remoteVer) and remoteVer then
+	say('Warning: local DungeonLootr.lua is not ' .. tostring(remoteVer) .. ' — delete dungeon-lootr folder and re-run bootstrap')
 end
 
 -- Always refresh Ataraxia if somehow missing after a partial apply.

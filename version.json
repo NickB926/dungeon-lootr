@@ -1,6 +1,6 @@
 {
-    "version":  "1.0.48",
-    "message":  "do not take Next Area while HUD stars are still empty",
+    "version":  "1.0.49",
+    "message":  "farm rooms first again; chests only after stars fill",
     "files":  [
                   "dungeon-lootr/launch.lua",
                   "dungeon-lootr/DungeonLootr.lua",
