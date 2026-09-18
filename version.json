@@ -1,6 +1,6 @@
 {
-    "version":  "1.0.61",
-    "message":  "skip skinny halls even if checkpoint, numbered room boxes, no 4.5s empty loot wait",
+    "version":  "1.0.62",
+    "message":  "auto skill on fodder, one slot at a time, no 60ms cancel",
     "files":  [
                   "dungeon-lootr/launch.lua",
                   "dungeon-lootr/DungeonLootr.lua",

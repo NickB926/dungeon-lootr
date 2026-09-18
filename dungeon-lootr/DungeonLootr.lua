@@ -93,7 +93,7 @@ Library.ToggleKeybind = { Value = 'Home' }
 Library.Animations = Library.Animations or {}
 Library.Animations.TabSwitch = false
 
-local DL_BUILD = '1.0.61'
+local DL_BUILD = '1.0.62'
 getgenv().DLBuild = DL_BUILD
 
 local Window = Library:CreateWindow({
@@ -4857,25 +4857,21 @@ local function fireSkill(slot)
 	elseif type(slot) == 'string' then
 		hold = LocalPlayer:GetAttribute('Skill' .. slot .. '_HasHold') == true
 	end
-	-- Bare FireServer(slot) first: extra boolean args are ignored by 1–4 but
-	-- used to make Ultimate (E / G) no-op.
+	-- Bare FireServer(slot) is what 1–4 actually consume. Extra true/false used
+	-- to cancel the same cast 60ms later (release) on press/hold weapons.
 	pcall(function()
 		rem:FireServer(slot)
 	end)
-	local ok = pcall(function()
-		rem:FireServer(slot, true)
-	end)
-	if not ok then
+	if hold then
 		pcall(function()
-			rem:FireServer(slot)
+			rem:FireServer(slot, true)
 		end)
-		return true
+		task.delay(0.45, function()
+			pcall(function()
+				rem:FireServer(slot, false)
+			end)
+		end)
 	end
-	task.delay(hold and 0.45 or 0.06, function()
-		pcall(function()
-			rem:FireServer(slot, false)
-		end)
-	end)
 	return true
 end
 
@@ -4900,9 +4896,9 @@ local function autoSkillTick()
 	if rt.refillBusy or rt.refillUrgent then
 		return
 	end
-	-- SkillIFrame sits up for the whole skill dump and the server ignores M1
-	-- during it. Demon leftovers took 0 Damage_Dealt while skills cycled.
-	if rt.farmFighting and rt.farmFightNpc and enemyRank(rt.farmFightNpc) < 3 then
+	-- Wait out the current skill's iframe so the next FireServer is not ignored.
+	-- Cap it: SkillIFrame has stuck true before and would starve Auto skill.
+	if char:GetAttribute('SkillIFrame') == true and os.clock() - lastSkillFire < 0.85 then
 		return
 	end
 	-- Ultimate first. Skill 1–4 used to set lastSkillFire every tick and starve G.
@@ -4913,7 +4909,7 @@ local function autoSkillTick()
 	if not on('DLAutoSkill') then
 		return
 	end
-	if os.clock() - lastSkillFire < 0.1 then
+	if os.clock() - lastSkillFire < 0.16 then
 		return
 	end
 	if routeBusy then
@@ -4924,18 +4920,16 @@ local function autoSkillTick()
 	if not rt.farmFighting and not anyEnemyInRange() then
 		return
 	end
-	-- Dump every ready skill this tick (old code fired one then returned — felt slow).
-	local fired = 0
+	-- One skill per tick. Dumping 1–4 on the same Heartbeat made the server
+	-- eat the rest; skipping fodder (rank < 3) left Auto skill idle all dungeon.
 	for i = 0, 3 do
 		local slot = ((nextSkillSlot + i - 1) % 4) + 1
 		if skillIsReady(slot) then
 			nextSkillSlot = (slot % 4) + 1
+			lastSkillFire = os.clock()
 			pcall(fireSkill, slot)
-			fired += 1
+			return
 		end
-	end
-	if fired > 0 then
-		lastSkillFire = os.clock()
 	end
 end
 
