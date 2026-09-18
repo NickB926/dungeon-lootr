@@ -93,7 +93,7 @@ Library.ToggleKeybind = { Value = 'Home' }
 Library.Animations = Library.Animations or {}
 Library.Animations.TabSwitch = false
 
-local DL_BUILD = '1.0.57'
+local DL_BUILD = '1.0.58'
 getgenv().DLBuild = DL_BUILD
 
 local Window = Library:CreateWindow({
@@ -2019,50 +2019,23 @@ KeyDoor = (function()
 	return api
 end)()
 
--- ChestPrompt MaxActivationDistance is 8. The prompt Attachment sits at the
--- chest origin (rel 0,0,0 / BOTTOM). Hovering +Y or standing at a 0-size
--- streamed-out pivot parks you inside the ice once the mesh loads. Stand
--- toward the player, just outside the live bounding box, still in prompt range.
+-- ChestPrompt MaxActivationDistance is 8 and the server wants you inside the
+-- chest volume. Standing beside the bbox left the prompt just out of range.
 local function chestStandPos(model)
+	if not model then
+		return nil
+	end
+	local ok, cf, size = pcall(function()
+		return model:GetBoundingBox()
+	end)
+	if ok and typeof(cf) == 'CFrame' and typeof(size) == 'Vector3' and size.Magnitude > 0.5 then
+		return cf.Position
+	end
 	local anchor = chestAnchor(model)
 	if not anchor then
 		return nil
 	end
-	local prompt = chestPrompt(model)
-	local maxDist = tonumber(prompt and prompt.MaxActivationDistance) or 8
-	local half = 0
-	local ok, _, size = pcall(function()
-		return model:GetBoundingBox()
-	end)
-	if ok and typeof(size) == 'Vector3' and size.Magnitude > 0.5 then
-		half = math.max(size.X, size.Z) * 0.5
-	else
-		local bottom = model:FindFirstChild('BOTTOM', true)
-		if bottom and bottom:IsA('BasePart') then
-			half = math.max(bottom.Size.X, bottom.Size.Z) * 0.5
-		end
-	end
-	local my = routeRoot()
-	local dir = Vector3.new(1, 0, 0)
-	if my then
-		local flat = Vector3.new(my.Position.X - anchor.X, 0, my.Position.Z - anchor.Z)
-		if flat.Magnitude > 0.2 then
-			dir = flat.Unit
-		end
-	end
-	-- Unstreamed chests report size 0 — use a short offset so we are not inside
-	-- ice after it streams. Huge ice is capped so hip-height still fits in 8.
-	local side = math.clamp(half + 2.2, 2.2, math.max(2.2, maxDist * 0.52))
-	local beside = Vector3.new(anchor.X, anchor.Y, anchor.Z) + Vector3.new(dir.X, 0, dir.Z) * side
-	local floor = standingSpot(beside, 2.8, model)
-	if (floor - anchor).Magnitude > maxDist - 0.8 then
-		floor = Vector3.new(
-			anchor.X + dir.X * (maxDist * 0.45),
-			anchor.Y + 2.8,
-			anchor.Z + dir.Z * (maxDist * 0.45)
-		)
-	end
-	return floor
+	return anchor + Vector3.new(0, 2.2, 0)
 end
 
 local function chestActionOk(prompt)
@@ -2088,7 +2061,12 @@ local function chestClaimCandidate(model)
 	if not (model:GetAttribute('DungeonChest') == true or model.Name:sub(1, 13) == 'DungeonChest') then
 		return false
 	end
+	if rt.chestDone and rt.chestDone[model] then
+		return false
+	end
 	if model:GetAttribute('Looted') == true or model:GetAttribute('Opened') == true or model:GetAttribute('Claimed') == true then
+		rt.chestDone = rt.chestDone or {}
+		rt.chestDone[model] = true
 		return false
 	end
 	if model:GetAttribute('LockedRoom') == true then
@@ -2307,6 +2285,8 @@ local function collectChestRoute(silent, roomOnly)
 			end
 			-- Re-check after travel: claimed while we were en route.
 			if model:GetAttribute('Looted') == true or model:GetAttribute('Opened') == true or model:GetAttribute('Claimed') == true then
+				rt.chestDone = rt.chestDone or {}
+				rt.chestDone[model] = true
 				rt.chestSkip[model] = os.clock() + 90
 			elseif not chestClaimCandidate(model) then
 				rt.chestSkip[model] = os.clock() + 8
@@ -2327,8 +2307,8 @@ local function collectChestRoute(silent, roomOnly)
 				local pos = chestStandPos(model)
 				if pos then
 					Pin.at(pos, true)
-					-- Mesh often streams in after the first warp; re-stand beside
-					-- the real bounding box so we are not inside the ice.
+					-- Mesh often streams in after the first warp; re-stand in the
+					-- live bounding-box center so the prompt is in range.
 					task.wait((rt.chestFast and 0.18) or 0.35)
 					local pos2 = chestStandPos(model)
 					if pos2 and (pos2 - pos).Magnitude > 0.6 then
@@ -2374,6 +2354,8 @@ local function collectChestRoute(silent, roomOnly)
 						end
 						if not chestClaimCandidate(model) or not chestStillOpen(model) then
 							got += 1
+							rt.chestDone = rt.chestDone or {}
+							rt.chestDone[model] = true
 							rt.chestSkip[model] = os.clock() + 120
 						else
 							-- Failed this pass — retry soon, do not park the chest 3 min.
@@ -2495,11 +2477,17 @@ local function lootClearedRoom(roomIdx, dungeon)
 		end
 		pcall(scanEspThrottled, 0.9)
 		local ready = false
+		local sawChest = false
+		local pending = false
 		for _, child in ipairs(dungeon:GetChildren()) do
 			if child:GetAttribute('DungeonChest') == true or child.Name:sub(1, 13) == 'DungeonChest' then
-				if tonumber(child:GetAttribute('RoomIndex')) == roomIdx and chestClaimCandidate(child) then
-					ready = true
-					break
+				if tonumber(child:GetAttribute('RoomIndex')) == roomIdx then
+					sawChest = true
+					if chestClaimCandidate(child) then
+						ready = true
+						pending = true
+						break
+					end
 				end
 			end
 		end
@@ -2508,6 +2496,9 @@ local function lootClearedRoom(roomIdx, dungeon)
 			local ok = collectChestRoute(true, roomIdx)
 			rt.chestFast = false
 			return ok
+		end
+		if sawChest and not pending then
+			return false
 		end
 		task.wait(inEndlessFarm() and 0.08 or 0.35)
 	end
@@ -5390,6 +5381,8 @@ local Rooms = (function()
 		rt.farmRoomPhase = 'wait'
 		rt.farmRoomFilter = nil
 		rt.farmDungeonId = nil
+		rt.shrineUsed = {}
+		rt.chestDone = {}
 	end
 
 	function api.maxRoom(dungeon)
@@ -8293,7 +8286,6 @@ local function tourFarmRooms(dungeon)
 		end
 	end
 	if on('DLChestAnywhere') and Rooms.aliveCount(dungeon, idx) == 0 then
-		pcall(clearChestSkipForRoom, idx)
 		pcall(lootClearedRoom, idx, dungeon)
 	end
 	rt.farmRoomIdx = idx + 1
@@ -9833,6 +9825,34 @@ local BlessPick = (function()
 	-- Attachment (PromptAttachment), and altars are often hundreds of studs off the
 	-- farm path — the old 45-stud BasePart-only scan never reached them.
 	local shrineBusy, shrineNext = false, 0
+
+	local function shrinePosKey(pos)
+		if typeof(pos) ~= 'Vector3' then
+			return nil
+		end
+		return string.format('s:%.0f:%.0f:%.0f', pos.X, pos.Y, pos.Z)
+	end
+
+	local function shrineAlreadyUsed(model, pos)
+		rt.shrineUsed = rt.shrineUsed or {}
+		if model and rt.shrineUsed[model] then
+			return true
+		end
+		local key = shrinePosKey(pos)
+		return key ~= nil and rt.shrineUsed[key] == true
+	end
+
+	local function markShrineUsed(model, pos)
+		rt.shrineUsed = rt.shrineUsed or {}
+		if model then
+			rt.shrineUsed[model] = true
+		end
+		local key = shrinePosKey(pos)
+		if key then
+			rt.shrineUsed[key] = true
+		end
+	end
+
 	function api.shrineTick()
 		if not on('DLAutoBless') or shrineBusy or routeBusy or rt.refillBusy or rt.refillUrgent or os.clock() < shrineNext then
 			return
@@ -9841,7 +9861,6 @@ local BlessPick = (function()
 		if farmBusy and rt.blessFromFarm ~= true then
 			return
 		end
-		shrineNext = os.clock() + (farmBusy and 4 or 2)
 		local root = routeRoot()
 		if not root then
 			return
@@ -9852,10 +9871,7 @@ local BlessPick = (function()
 		local maxDist = 4000
 		local bestPos, bestDist, bestPrompt, bestModel = nil, maxDist, nil, nil
 		local function consider(model, prompt)
-			if not prompt or not prompt.Enabled then
-				return
-			end
-			local part = prompt.Parent
+			local part = prompt and prompt.Parent
 			local pos
 			if part and part:IsA('Attachment') then
 				pos = part.WorldPosition
@@ -9867,7 +9883,7 @@ local BlessPick = (function()
 				end)
 				pos = ok and p or nil
 			end
-			if not pos then
+			if not pos or shrineAlreadyUsed(model, pos) then
 				return
 			end
 			local dist = (pos - root.Position).Magnitude
@@ -9887,12 +9903,12 @@ local BlessPick = (function()
 		end
 		-- Fallback: prompt text under the active dungeon (expensive). Skip while
 		-- autofarm is moving — top-level Bless/Shrine names are enough mid-run.
-		if not bestPrompt and not farmBusy then
+		if not bestModel and not farmBusy then
 			local dungeon = activeDungeonRoot()
 			if dungeon and os.clock() - (rt.shrineDeepAt or 0) > 8 then
 				rt.shrineDeepAt = os.clock()
 				for _, d in ipairs(dungeon:GetDescendants()) do
-					if d:IsA('ProximityPrompt') and d.Enabled then
+					if d:IsA('ProximityPrompt') then
 						local action = (tostring(d.ActionText) .. ' ' .. tostring(d.ObjectText)):lower()
 						if action:find('bless', 1, true) or action:find('shrine', 1, true) or action:find('pray', 1, true) or action:find('boon', 1, true) then
 							consider(d:FindFirstAncestorOfClass('Model'), d)
@@ -9901,7 +9917,7 @@ local BlessPick = (function()
 				end
 			end
 		end
-		if not bestPrompt or not bestPos then
+		if not bestPos then
 			return
 		end
 		shrineBusy = true
@@ -9912,12 +9928,15 @@ local BlessPick = (function()
 			noclipOn = true
 			pcall(setCharNoclip, true)
 			routeLabel = 'blessing shrine'
+			farmLabel = 'blessing shrine'
 			-- Stand on the PromptAttachment itself — altar mesh has CanQuery=false so
 			-- floor snaps can miss and leave you out of the 10-stud hold range.
 			local stand = bestPos + Vector3.new(0, 3, 0)
-			local ranged = promptStandPos(bestPrompt, bestModel)
-			if ranged and (ranged - bestPos).Magnitude <= 8 then
-				stand = ranged
+			if bestPrompt then
+				local ranged = promptStandPos(bestPrompt, bestModel)
+				if ranged and (ranged - bestPos).Magnitude <= 8 then
+					stand = ranged
+				end
 			end
 			Pin.at(stand, true)
 			task.wait(0.55)
@@ -9928,15 +9947,26 @@ local BlessPick = (function()
 					opened = true
 					break
 				end
-				if bestPrompt.Enabled then
+				if bestPrompt and bestPrompt.Parent and bestPrompt.Enabled then
 					chestFiredAt[bestPrompt] = nil
 					fireChestPrompt(bestPrompt)
+				elseif bestModel then
+					local p = bestModel:FindFirstChildWhichIsA('ProximityPrompt', true)
+					if p and p.Enabled then
+						bestPrompt = p
+						chestFiredAt[p] = nil
+						fireChestPrompt(p)
+					end
 				end
 				task.wait(0.35)
 			end
+			local picked = false
 			if opened or api.open() then
-				api.run(true)
+				picked = api.run(true) == true
 				task.wait(0.45)
+			end
+			if picked or opened or (bestPrompt and bestPrompt.Parent and bestPrompt.Enabled ~= true) then
+				markShrineUsed(bestModel, bestPos)
 			end
 			local live = routeRoot()
 			if live then
@@ -9959,8 +9989,12 @@ local BlessPick = (function()
 			routeLabel = nil
 			routeBusy = false
 			shrineBusy = false
-			-- Retry sooner if the prompt is still up (hold missed); back off after success.
-			shrineNext = os.clock() + ((bestPrompt.Parent and bestPrompt.Enabled) and 2.5 or 10)
+			if shrineAlreadyUsed(bestModel, bestPos) then
+				shrineNext = os.clock() + 8
+			else
+				-- Hold missed — try again shortly, do not immediately re-warp.
+				shrineNext = os.clock() + 2.5
+			end
 		end)
 	end
 
@@ -9979,7 +10013,30 @@ local BlessPick = (function()
 		end
 		if api.open() then
 			farmLabel = 'blessing'
-			pcall(api.run, true)
+			local picked = api.run(true) == true
+			if picked then
+				local root = routeRoot()
+				local bestM, bestP, bestD = nil, nil, 9e9
+				for _, gen in ipairs(workspace:GetChildren()) do
+					if type(gen.Name) == 'string' and gen.Name:sub(1, 10) == 'Generated_' then
+						for _, child in ipairs(gen:GetChildren()) do
+							local low = string.lower(child.Name)
+							if low:find('bless', 1, true) or low:find('shrine', 1, true) then
+								local ok, pos = pcall(function()
+									return child:GetPivot().Position
+								end)
+								if ok and pos and root then
+									local d = (pos - root.Position).Magnitude
+									if d < bestD then
+										bestM, bestP, bestD = child, pos, d
+									end
+								end
+							end
+						end
+					end
+				end
+				markShrineUsed(bestM, bestP)
+			end
 			return true
 		end
 		rt.blessFromFarm = true

@@ -1,6 +1,6 @@
 {
-    "version":  "1.0.57",
-    "message":  "skip hallway Room_N tiles; wait only in combat rooms",
+    "version":  "1.0.58",
+    "message":  "bless first, skip used shrines/chests, stand inside chests",
     "files":  [
                   "dungeon-lootr/launch.lua",
                   "dungeon-lootr/DungeonLootr.lua",
