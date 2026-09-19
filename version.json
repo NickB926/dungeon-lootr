@@ -1,6 +1,6 @@
 {
-    "version":  "1.0.79",
-    "message":  "fix 4fps freeze: gate blessing UI scan on shrine proximity + cache open check",
+    "version":  "1.0.41",
+    "message":  "fix loot-phase deadlock, sweep rooms in number order, forward-declare room helpers",
     "files":  [
                   "dungeon-lootr/launch.lua",
                   "dungeon-lootr/DungeonLootr.lua",

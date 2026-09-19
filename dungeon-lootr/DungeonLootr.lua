@@ -93,7 +93,7 @@ Library.ToggleKeybind = { Value = 'Home' }
 Library.Animations = Library.Animations or {}
 Library.Animations.TabSwitch = false
 
-local DL_BUILD = '1.0.79'
+local DL_BUILD = '1.0.41'
 getgenv().DLBuild = DL_BUILD
 
 local Window = Library:CreateWindow({
@@ -2550,9 +2550,15 @@ local function lootClearedRoom(roomIdx, dungeon)
 		local ready = false
 		local sawChest = false
 		local pending = false
+		-- A chest standing inside this room can carry a neighbour's RoomIndex.
+		-- collectChestRoute filters strictly on that attribute, so route it under
+		-- the number it claims — asking for this room's index queued nothing and
+		-- the tour stood still on "looting Room_N" forever.
+		local routeIdx = roomIdx
 		for _, child in ipairs(dungeon:GetChildren()) do
 			if child:GetAttribute('DungeonChest') == true or child.Name:sub(1, 13) == 'DungeonChest' then
-				local belongs = tonumber(child:GetAttribute('RoomIndex')) == roomIdx
+				local attrIdx = tonumber(child:GetAttribute('RoomIndex'))
+				local belongs = attrIdx == roomIdx
 				if not belongs then
 					local pos = chestStandPos(child)
 					belongs = pos ~= nil and Rooms.posInRoom(dungeon, roomIdx, pos)
@@ -2562,6 +2568,7 @@ local function lootClearedRoom(roomIdx, dungeon)
 					if chestClaimCandidate(child) then
 						ready = true
 						pending = true
+						routeIdx = attrIdx or roomIdx
 						break
 					end
 					if not chestIsClaimed(child) then
@@ -2572,7 +2579,7 @@ local function lootClearedRoom(roomIdx, dungeon)
 		end
 		if ready then
 			rt.chestFast = true
-			local ok = collectChestRoute(true, roomIdx)
+			local ok = collectChestRoute(true, routeIdx)
 			rt.chestFast = false
 			return ok
 		end
@@ -7360,6 +7367,11 @@ rt.npcInCorridor = function(npc)
 	return val
 end
 
+-- Defined further down with the room-sweep helpers, but target picking and the
+-- star fallback both need them. Without this they resolved to nil globals and
+-- the calls blew up inside a pcall that swallowed the error.
+local roomIsSwept, roomHasPendingChest
+
 local function pickFarmTarget()
 	local root = routeRoot()
 	if not root then
@@ -8560,9 +8572,36 @@ local function goToOpenStar(dungeon, maxRoom)
 		return false
 	end
 	local star
-	pcall(function()
-		star = Rooms.nextStarRoom(dungeon) or Rooms.nextGapRoom(dungeon)
-	end)
+	-- Ordered sweep: take the lowest room number that still has work. The star
+	-- list is HUD layout order, which sends the farm back and forth across the
+	-- floor (Room_4, then 13, then 2) even though every room is equally close.
+	if on('DLRoomsInOrder') then
+		for i = 1, maxRoom or Rooms.maxRoom(dungeon) do
+			if Rooms.isCorridor(dungeon, i) or Rooms.isStartRoom(dungeon, i) then
+				continue
+			end
+			if (rt.lootBan and rt.lootBan[i] or 0) > os.clock() then
+				continue
+			end
+			if Rooms.aliveCount(dungeon, i) > 0
+				or Rooms.dormantCount(dungeon, i) > 0
+				or roomHasPendingChest(dungeon, i)
+			then
+				star = i
+				break
+			end
+			local room = dungeon:FindFirstChild('Room_' .. tostring(i))
+			if room and room:GetAttribute('IsLootRoom') == true and not roomIsSwept(dungeon, i) then
+				star = i
+				break
+			end
+		end
+	end
+	if not star then
+		pcall(function()
+			star = Rooms.nextStarRoom(dungeon) or Rooms.nextGapRoom(dungeon)
+		end)
+	end
 	if not star then
 		for i = 1, maxRoom or Rooms.maxRoom(dungeon) do
 			if Rooms.isCorridor(dungeon, i) or Rooms.isStartRoom(dungeon, i) then
@@ -8604,7 +8643,7 @@ local function markRoomSwept(dungeon, idx)
 	clearSweepMark(idx)
 end
 
-local function roomIsSwept(dungeon, idx)
+function roomIsSwept(dungeon, idx)
 	if not idx then
 		return false
 	end
@@ -8626,7 +8665,7 @@ local function chestBelongsToRoom(dungeon, idx, model)
 	return pos ~= nil and Rooms.posInRoom(dungeon, idx, pos)
 end
 
-local function roomHasPendingChest(dungeon, idx)
+function roomHasPendingChest(dungeon, idx)
 	if not dungeon or not idx then
 		return false
 	end
@@ -9045,8 +9084,28 @@ local function tourFarmRooms(dungeon)
 		rt.farmRoomIdx = idx + 1
 		rt.farmRoomPhase = 'wait'
 		rt.farmRoomFilter = nil
+		rt.lootStallIdx = nil
 	else
 		rt.farmRoomPhase = 'loot'
+		-- Loot can report "work left here" while the router refuses the chest
+		-- (unreachable anchor, mismatched room number, a prompt the server never
+		-- arms). That combination parked the farm on one room indefinitely, which
+		-- reads as auto farm being off. Move on instead of standing still.
+		if rt.lootStallIdx ~= idx then
+			rt.lootStallIdx = idx
+			rt.lootStallAt = os.clock()
+		elseif os.clock() - (rt.lootStallAt or 0) > 10 then
+			rt.lootStallIdx = nil
+			-- Ban it for a while too, or the ordered sweep picks the same room
+			-- back up on the next pass and the stall just repeats.
+			rt.lootBan = rt.lootBan or {}
+			rt.lootBan[idx] = os.clock() + 120
+			markRoomSwept(dungeon, idx)
+			rt.farmRoomIdx = idx + 1
+			rt.farmRoomPhase = 'wait'
+			rt.farmRoomFilter = nil
+			farmLabel = ('skip stuck Room_%d'):format(idx)
+		end
 	end
 end
 
@@ -13965,6 +14024,13 @@ FarmBox:AddToggle('DLAutoFarm', {
 		rt.farmStarted = false
 		Library:Notify(('Auto farm off — %d kills'):format(farmKills))
 	end
+end)
+FarmBox:AddToggle('DLRoomsInOrder', {
+	Text = 'Rooms in order',
+	Default = true,
+	Tooltip = 'Sweep rooms by number (Room_1, Room_2, ...) instead of following the HUD star order, which jumps back and forth across the floor. Blessing shrines and enemies that aggro you still interrupt.',
+}):OnChanged(function(v)
+	Library:Notify(v and 'Rooms in order on' or 'Rooms in order off — HUD star order')
 end)
 FarmBox:AddToggle('DLSweepMarks', {
 	Text = 'Room sweep markers',
