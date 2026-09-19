@@ -141,7 +141,7 @@ Library.ToggleKeybind = { Value = 'Home' }
 Library.Animations = Library.Animations or {}
 Library.Animations.TabSwitch = false
 
-local DL_BUILD = '1.0.46'
+local DL_BUILD = '1.0.47'
 getgenv().DLBuild = DL_BUILD
 -- Do NOT wipe DLShrineSkipKeys on every reload — that re-warps spent altars.
 
@@ -6015,8 +6015,12 @@ local function autoParryTick()
 end
 
 local function skillIsReady(n)
-	if not on('DLSkill' .. n) then
-		return false
+	-- If every skill toggle was left off, treat all as on when Auto skill is active.
+	local anySlot = on('DLSkill1') or on('DLSkill2') or on('DLSkill3') or on('DLSkill4')
+	if anySlot then
+		if not on('DLSkill' .. n) then
+			return false
+		end
 	end
 	local prefix = 'Skill' .. n
 	local charges = tonumber(LocalPlayer:GetAttribute(prefix .. '_Charges'))
@@ -6024,32 +6028,73 @@ local function skillIsReady(n)
 	if type(maxC) == 'number' and maxC > 1 then
 		return (type(charges) == 'number' and charges or 0) >= 1
 	end
-	if LocalPlayer:GetAttribute(prefix .. '_OnCooldown') == true then
-		local rem = tonumber(LocalPlayer:GetAttribute(prefix .. '_CooldownRemaining')) or 0
+	local rem = tonumber(LocalPlayer:GetAttribute(prefix .. '_CooldownRemaining'))
+	local onCd = LocalPlayer:GetAttribute(prefix .. '_OnCooldown') == true
+	-- Prefer the live remaining timer. ends-os.clock() drifted on some clients
+	-- and kept skills "busy" forever (or ready forever).
+	if type(rem) == 'number' then
+		return rem <= 0.12
+	end
+	if onCd then
 		local ends = tonumber(LocalPlayer:GetAttribute(prefix .. '_CooldownEnd'))
 		if type(ends) == 'number' then
-			rem = math.max(0, ends - os.clock())
+			return (ends - os.clock()) <= 0.12
 		end
-		return rem <= 0.08
+		return false
 	end
 	return true
 end
 
-local function anyEnemyInRange()
+-- Wider than parry range: skills should dump whenever a pack is near the stand,
+-- not only when a telegraph is in parry arm distance.
+local function skillMobNearby(maxDist)
+	maxDist = tonumber(maxDist) or 58
+	if rt.farmFighting then
+		return true
+	end
+	local fight = rt.farmFightNpc or rt.farmReturnNpc
+	if fight and enemyAlive(fight) and enemyRoot(fight) then
+		return true
+	end
+	local myRoot = myRootPart() or routeRoot()
+	if not myRoot then
+		return false
+	end
+	local me = myRoot.Position
+	local r2 = maxDist * maxDist
 	local found = false
-	eachEnemy(function(npc)
-		if not found and enemyInRange(npc) then
+	local function consider(npc)
+		if found or not npc or not npc.Parent then
+			return
+		end
+		if farmSkipped(npc) then
+			return
+		end
+		if not enemyAlive(npc) then
+			return
+		end
+		-- Dormant packs still count — skills wake / clear them.
+		local part = enemyRoot(npc)
+		if not part then
+			return
+		end
+		local dx = part.Position.X - me.X
+		local dz = part.Position.Z - me.Z
+		if dx * dx + dz * dz <= r2 then
 			found = true
 		end
-	end)
+	end
+	eachEnemy(consider)
 	return found
+end
+
+local function anyEnemyInRange()
+	return skillMobNearby(parryRange())
 end
 
 local function fireSkill(slot)
 	local rem = combatRemote('Skill')
-	if not rem then
-		return false
-	end
+	local fired = false
 	-- New weapons (Awakened Devil EX, etc.) want press/release. Skill2 is a hold.
 	-- Old weapons ignore the boolean. Do not yield here — this runs on Heartbeat.
 	local hold = false
@@ -6058,33 +6103,62 @@ local function fireSkill(slot)
 	elseif type(slot) == 'string' then
 		hold = LocalPlayer:GetAttribute('Skill' .. slot .. '_HasHold') == true
 	end
-	-- Bare FireServer(slot) is what 1–4 actually consume. Extra true/false used
-	-- to cancel the same cast 60ms later (release) on press/hold weapons.
-	pcall(function()
-		rem:FireServer(slot)
-	end)
-	if hold then
-		pcall(function()
-			rem:FireServer(slot, true)
+	if rem then
+		-- Bare FireServer(slot) is what 1–4 actually consume. Extra true/false used
+		-- to cancel the same cast 60ms later (release) on press/hold weapons.
+		fired = pcall(function()
+			rem:FireServer(slot)
 		end)
-		task.delay(0.45, function()
+		if hold then
 			pcall(function()
-				rem:FireServer(slot, false)
+				rem:FireServer(slot, true)
+			end)
+			task.delay(0.45, function()
+				pcall(function()
+					rem:FireServer(slot, false)
+				end)
+			end)
+		end
+	end
+	-- Key fallback for clients where Inputs.Skill is missing / renamed.
+	if type(slot) == 'number' and slot >= 1 and slot <= 4 then
+		local keys = {
+			Enum.KeyCode.One,
+			Enum.KeyCode.Two,
+			Enum.KeyCode.Three,
+			Enum.KeyCode.Four,
+		}
+		local key = keys[slot]
+		pcall(function()
+			local vim = game:GetService('VirtualInputManager')
+			vim:SendKeyEvent(true, key, false, game)
+			task.delay(hold and 0.4 or 0.05, function()
+				pcall(function()
+					vim:SendKeyEvent(false, key, false, game)
+				end)
 			end)
 		end)
+		fired = true
 	end
-	return true
+	return fired
 end
 
 local function autoSkillTick()
-	local wantUlt = on('DLAutoSkill') or on('DLAutoFarm')
+	local wantSkills = on('DLAutoSkill')
+	local wantUlt = wantSkills or on('DLAutoFarm')
 	if not wantUlt then
 		return
 	end
-	if LocalPlayer:GetAttribute('InNoCombatZone') == true then
+	if LocalPlayer:GetAttribute('InNoCombatZone') == true and not farmBusy then
 		return
 	end
-	if LocalPlayer:GetAttribute('InDungeon') ~= true and LocalPlayer:GetAttribute('DungeonRun') ~= true then
+	-- Soft dungeon gate: attribute lag / alternate flags used to starve skills
+	-- for friends while the local client looked fine.
+	local inRun = LocalPlayer:GetAttribute('InDungeon') == true
+		or LocalPlayer:GetAttribute('DungeonRun') == true
+		or farmBusy == true
+		or tostring(LocalPlayer:GetAttribute('CurrentDungeon') or '') ~= ''
+	if not inRun then
 		return
 	end
 	-- Do not gate on char Parry attr — it can stick true mid-farm and starve skills
@@ -6099,7 +6173,7 @@ local function autoSkillTick()
 	end
 	-- Wait out the current skill's iframe so the next FireServer is not ignored.
 	-- Cap it: SkillIFrame has stuck true before and would starve Auto skill.
-	if char:GetAttribute('SkillIFrame') == true and os.clock() - lastSkillFire < 0.85 then
+	if char:GetAttribute('SkillIFrame') == true and os.clock() - lastSkillFire < 0.55 then
 		return
 	end
 	-- Ultimate first. Skill 1–4 used to set lastSkillFire every tick and starve G.
@@ -6107,18 +6181,18 @@ local function autoSkillTick()
 	if wantUlt and type(rt.tryFarmUlt) == 'function' then
 		pcall(rt.tryFarmUlt)
 	end
-	if not on('DLAutoSkill') then
+	if not wantSkills then
 		return
 	end
-	if os.clock() - lastSkillFire < 0.16 then
+	if os.clock() - lastSkillFire < 0.12 then
 		return
 	end
-	if routeBusy then
+	-- Shrine / chest routes can wait; do not hard-block while mid-fight.
+	if routeBusy and not rt.farmFighting and not rt.farmFightNpc then
 		return
 	end
-	-- Only while standing on a live target. farmBusy stays true during chest
-	-- sweeps / room hops, so that flag is not "on a mob".
-	if not rt.farmFighting and not anyEnemyInRange() then
+	-- Nearby mob / live fight target — wider than parry arm range.
+	if not skillMobNearby(58) then
 		return
 	end
 	-- One skill per tick. Dumping 1–4 on the same Heartbeat made the server
@@ -6133,6 +6207,11 @@ local function autoSkillTick()
 		end
 	end
 end
+
+rt.skillMobNearby = skillMobNearby
+rt.autoSkillTick = autoSkillTick
+rt.fireSkill = fireSkill
+rt.skillIsReady = skillIsReady
 
 -- Auto farm. Same shape as the PlayerTools farm: a spawned loop owns movement and
 -- target choice, while attacks/parry/skills stay on their own tick. Nothing here
@@ -8624,6 +8703,12 @@ local function pickFarmTarget()
 	if not root then
 		return nil
 	end
+	-- Already mid-swing on a live target — never hop to a sibling pack member.
+	local held = rt.farmFightNpc
+	if held and rt.farmFighting and enemyAlive(held) and enemyRoot(held) and not farmSkipped(held) then
+		local part = enemyRoot(held)
+		return held, (part.Position - root.Position).Magnitude
+	end
 	local preferBoss = on('DLFarmBoss')
 	local preferRanged = on('DLFarmRanged')
 	local trash, bosses = countFarmSides()
@@ -9879,21 +9964,37 @@ local function holdOnEnemy(npc)
 		local stand = cachedStand
 		local aimAt = cachedAim or live.Position
 		local plant = cachedPlant or live.Position
-		-- Throttle pack math. Recomputing densestCentroid + facing every pin
-		-- frame hopped the stand between clump centres (44 jumps / 45 frames).
 		local lookUp = rt.hoverN() < 0
+		-- Look-up / single-target stick: plant under THIS npc only. Pack centroid
+		-- hopped between siblings every refresh and looked like teleport flicker.
+		if lookUp or enemyRank(npc) >= 3 then
+			plant = live.Position
+			aimAt = live.Position
+			rt.stickyPlant = live.Position
+			rt.farmCrowdAim = live.Position
+			rt.crowdSolo = true
+			stand = lookUp and 0 or math.max(stand, cachedStand or 4)
+			local me = routeRoot()
+			if me then
+				local away = Vector3.new(me.Position.X - live.Position.X, 0, me.Position.Z - live.Position.Z)
+				if away.Magnitude > 0.35 then
+					dir = away.Unit
+					rt.crowdDir = dir
+				end
+			end
+		else
+		-- Frontal fodder only: throttle pack facing so the slab does not orbit.
 		local packNow = os.clock()
-		local refreshPack = packNow - (rt.packRefreshAt or 0) > (lookUp and 0.28 or 0.18)
+		local refreshPack = packNow - (rt.packRefreshAt or 0) > 0.35
 		if refreshPack then
 			rt.packRefreshAt = packNow
 			local pack = crowdPartsNear(npc)
 			local mid, tn = densestCentroid(pack, 16)
 			if mid and tn and tn >= 2 then
 				rt.crowdSolo = false
-				-- Sticky plant: ignore mid jitter under ~5 studs.
 				if typeof(rt.stickyPlant) == 'Vector3' then
 					local jump = Vector3.new(mid.X - rt.stickyPlant.X, 0, mid.Z - rt.stickyPlant.Z).Magnitude
-					if jump < 5 then
+					if jump < 8 then
 						mid = rt.stickyPlant
 					else
 						rt.stickyPlant = mid
@@ -9904,23 +10005,15 @@ local function holdOnEnemy(npc)
 				plant = mid
 				aimAt = mid
 				rt.farmCrowdAim = mid
-				if not lookUp then
-					stand = math.max(stand, cachedStand or 4)
-					dir = bestPackFacing(pack, mid, stand, dir)
-					rt.crowdDir = dir
-				else
-					stand = 0
-					cachedPlant = mid
-				end
+				stand = math.max(stand, cachedStand or 4)
+				dir = bestPackFacing(pack, mid, stand, dir)
+				rt.crowdDir = dir
 			else
 				rt.crowdSolo = true
 				rt.stickyPlant = live.Position
 				plant = live.Position
 				aimAt = live.Position
 				rt.farmCrowdAim = live.Position
-				if lookUp then
-					stand = 0
-				end
 			end
 		else
 			if typeof(rt.stickyPlant) == 'Vector3' then
@@ -9930,13 +10023,10 @@ local function holdOnEnemy(npc)
 				plant = rt.farmCrowdAim
 				aimAt = rt.farmCrowdAim
 			end
-			if lookUp then
-				stand = 0
-			elseif typeof(rt.crowdDir) == 'Vector3' then
+			if typeof(rt.crowdDir) == 'Vector3' then
 				dir = rt.crowdDir
 			end
 		end
-		-- Solo / behind-target every pin frame.
 		if rt.crowdSolo then
 			plant = live.Position
 			aimAt = live.Position
@@ -9948,95 +10038,31 @@ local function holdOnEnemy(npc)
 					dir = away.Unit
 				end
 			end
-		else
-			-- Pack path: if ANY nearby fodder sits behind the slab, flip stand.
-			-- Throttle behind-checks — flipping every frame caused XZ flicker.
-			if refreshPack then
-			local me = routeRoot()
-			if me then
-				local look = Vector3.new(me.CFrame.LookVector.X, 0, me.CFrame.LookVector.Z)
-				if look.Magnitude < 0.05 then
-					look = Vector3.new(me.CFrame.UpVector.X, 0, me.CFrame.UpVector.Z)
-				end
-				if look.Magnitude > 0.05 then
-					look = look.Unit
-					local pack = crowdPartsNear(npc)
-					local behindN, behindMid, bn = 0, nil, 0
-					local sx, sz = 0, 0
-					for _, p in ipairs(pack) do
-						local to = Vector3.new(p.X - me.Position.X, 0, p.Z - me.Position.Z)
-						if to.Magnitude > 1.0 then
-							if look:Dot(to.Unit) < 0.2 then
-								behindN += 1
-								sx += p.X
-								sz += p.Z
-								bn += 1
-							end
-						end
-					end
-					if behindN >= 1 and bn > 0 then
-						behindMid = Vector3.new(sx / bn, plant.Y, sz / bn)
-						rt.crowdAimAt = 0
-						plant = behindMid
-						aimAt = behindMid
-						rt.stickyPlant = behindMid
-						rt.farmCrowdAim = behindMid
-						local away = Vector3.new(me.Position.X - behindMid.X, 0, me.Position.Z - behindMid.Z)
-						if away.Magnitude > 0.35 then
-							dir = away.Unit
-							rt.crowdDir = dir
-						end
-						if not lookUp then
-							stand = math.max(stand, 4)
-						end
-					end
-				end
-			end
-			end
+		end
 		end
 		local goal = Vector3.new(plant.X, y, plant.Z) + Vector3.new(dir.X, 0, dir.Z) * stand
 		local dungeon = activeDungeonRoot()
 		if dungeon and Rooms.posInCorridor(dungeon, goal) then
 			local idx = tonumber(rt.farmRoomFilter) or Rooms.indexOf(npc)
 			if idx and not Rooms.isCorridor(dungeon, idx) then
-				-- The stand offset pushed us into the doorway. Step onto the pack
-				-- instead: warping to the room centre dragged the character away
-				-- from the mobs it was mid-fight with, across the whole room.
 				rt.pinCorridorN = (rt.pinCorridorN or 0) + 1
 				if lookUp then
 					goal = Vector3.new(plant.X, y, plant.Z)
 				else
-					-- Keep a few studs off so the frontal box can hit.
 					goal = Vector3.new(plant.X, y, plant.Z) + Vector3.new(dir.X, 0, dir.Z) * 4
 				end
 			end
 		end
-		-- Soft-follow the pack so the hitbox rides with moving mobs instead of
-		-- hard-snapping once and staring at empty tile.
+		-- Snap onto the locked target. Soft-lerp toward a moving plant was the
+		-- remaining XZ flicker once retarget was removed.
 		local meNow = routeRoot()
 		if meNow then
 			local here = meNow.Position
 			local flatDist = Vector3.new(goal.X - here.X, 0, goal.Z - here.Z).Magnitude
-			if flatDist > 0.35 then
-				-- Look-up: snap when close enough — micro-lerping a sticky plant
-				-- still jittered. Far hops still hard-snap.
-				local t
-				if lookUp then
-					t = flatDist > 6 and 1 or 1
-				else
-					t = math.clamp(0.35 + flatDist * 0.08, 0.35, 0.9)
-					if flatDist > 10 then
-						t = 1
-					end
-				end
-				goal = Vector3.new(
-					here.X + (goal.X - here.X) * t,
-					goal.Y,
-					here.Z + (goal.Z - here.Z) * t
-				)
+			if flatDist > 0.5 then
+				goal = Vector3.new(goal.X, goal.Y, goal.Z)
 			end
 		end
-		-- Yaw must not depend on aim-pos (collapses at stand 0 / look-up bury).
 		local from = (meNow and meNow.Position) or goal
 		local faceAt = aimAt or live.Position
 		local toFace = Vector3.new(faceAt.X - from.X, 0, faceAt.Z - from.Z)
@@ -10046,24 +10072,6 @@ local function holdOnEnemy(npc)
 			rt.farmFaceDir = -Vector3.new(dir.X, 0, dir.Z).Unit
 		elseif typeof(rt.engageDir) == 'Vector3' and rt.engageDir.Magnitude > 0.05 then
 			rt.farmFaceDir = -rt.engageDir.Unit
-		else
-			-- Buried in the clump: average headings to pack members with XZ spread.
-			local pack = crowdPartsNear(npc)
-			local sx, sz, n = 0, 0, 0
-			for _, p in ipairs(pack) do
-				local dx = p.X - from.X
-				local dz = p.Z - from.Z
-				local m2 = dx * dx + dz * dz
-				if m2 > 0.12 then
-					local m = math.sqrt(m2)
-					sx += dx / m
-					sz += dz / m
-					n += 1
-				end
-			end
-			if n > 0 then
-				rt.farmFaceDir = Vector3.new(sx / n, 0, sz / n).Unit
-			end
 		end
 		rt.pinGoal = goal
 		return goal, Vector3.new(aimAt.X, y, aimAt.Z)
@@ -10120,6 +10128,8 @@ local function farmKill(npc)
 	rt.stickyPlant = nil
 	rt.packRefreshAt = 0
 	rt._crowdNpc = nil
+	-- Lock ANY rank until this kill ends — fodder used to retarget mid-swing.
+	farmLock = npc
 	rt.farmFighting = true
 	local function packAlive()
 		if crystalPack then
@@ -10132,6 +10142,7 @@ local function farmKill(npc)
 	end
 	while farmActive() and packAlive() and not routeBusy do
 		local now = os.clock()
+		pcall(autoSkillTick)
 		if rt.refillUrgent or rt.refillBusy then
 			farmLabel = 'potion refill'
 			rt.farmReturnNpc = npc
@@ -10191,29 +10202,9 @@ local function farmKill(npc)
 					end
 					break
 				end
-			elseif not sticky and now - (rt.retargetAt or 0) > 0.55 then
-				-- Other clumps in this room: leave this npc so pickFarmTarget
-				-- can snap onto the denser pack instead of walking.
-				rt.retargetAt = now
-				local other = pickFarmTarget()
-				if other and other ~= npc then
-					local a, b = enemyRoot(other), enemyRoot(npc)
-					local hop = rt.hoverN() < 0 and 5 or 16
-					if a and b then
-						local dist = (a.Position - b.Position).Magnitude
-						local denser = false
-						if rt.hoverN() >= 0 and dist > 4 and enemyRank(npc) < 3 then
-							local _, nA = packAround(other, a, 14)
-							local _, nB = packAround(npc, b, 14)
-							denser = (tonumber(nA) or 0) > (tonumber(nB) or 0) + 1
-						end
-						if dist > hop or denser then
-							farmLabel = ('retarget · %s'):format(other.Name)
-							break
-						end
-					end
-				end
 			end
+			-- Stick to THIS npc until it dies. Mid-fight retarget hopped the stand
+			-- between pack members every ~0.55s (flicker with M1s still landing).
 			if now - lastHit >= attackDelay() then
 				lastHit = now
 				-- SkillIFrame sticks true on some classes and used to skip every M1.
@@ -17205,7 +17196,7 @@ CombatBox:AddSlider('DLParryRange', {
 CombatBox:AddToggle('DLAutoSkill', {
 	Text = 'Auto skill',
 	Default = false,
-	Tooltip = 'Fires skills 1–4 on a live target. Ultimate (G) pops as soon as it is charged — does not wait for a mob or boss. Dark Professor still holds G until the 4 crystals spawn, then dumps from the pack center.',
+	Tooltip = 'Fires skills 1–4 whenever a live mob is within ~58 studs (or you are mid-fight). Uses CooldownRemaining + Inputs.Skill, with 1–4 key fallback. Ultimate (G) also pops when charged — Dark Professor still holds G until crystals. Turn this ON (Auto farm alone does not dump 1–4).',
 }):OnChanged(function(v)
 	Library:Notify(v and 'Auto skill on' or 'Auto skill off')
 end)
