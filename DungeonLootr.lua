@@ -93,7 +93,7 @@ Library.ToggleKeybind = { Value = 'Home' }
 Library.Animations = Library.Animations or {}
 Library.Animations.TabSwitch = false
 
-local DL_BUILD = '1.0.74'
+local DL_BUILD = '1.0.75'
 getgenv().DLBuild = DL_BUILD
 
 local Window = Library:CreateWindow({
@@ -8815,7 +8815,9 @@ local function tourFarmRooms(dungeon)
 		task.wait(0.25)
 		return
 	end
+	rt.farmStep = 'tour:marks'
 	pcall(tickRoomSweepMarks)
+	rt.farmStep = 'tour:rooms'
 	local dname = dungeon.Name
 	if dname and rt.farmDungeonId ~= dname then
 		rt.farmDungeonId = dname
@@ -8985,7 +8987,14 @@ local function farmLoop()
 	farmBusy = true
 	noclipOn = true
 	pcall(setCharNoclip, true)
+	local function step(name)
+		rt.farmStep = name
+		rt.farmStepAt = os.clock()
+	end
+	step('enter')
 	while currentInstance() and on('DLAutoFarm') and inDungeonFarm() do
+		rt.farmTicks = (rt.farmTicks or 0) + 1
+		step('noclip')
 		pcall(setCharNoclip, true)
 		noclipOn = true
 		local aliveChar = character()
@@ -9018,6 +9027,7 @@ local function farmLoop()
 				task.wait(0.4)
 			else
 			local blessHold = false
+			step('bless')
 			pcall(function()
 				if type(rt.blessFarmPriority) == 'function' then
 					blessHold = rt.blessFarmPriority() == true
@@ -9027,21 +9037,26 @@ local function farmLoop()
 				farmLabel = farmLabel or 'blessing'
 				task.wait(0.2)
 			else
+				step('aoe')
 				local aoeOk, aoeHit = pcall(rt.avoidFloorAoe)
 				if aoeOk and aoeHit and typeof(rt.aoeGoal) == 'Vector3' then
 					farmLabel = 'aoe gap'
 					Pin.at(rt.aoeGoal, true)
 				end
+				step('scan')
 				local dungeon = activeDungeonRoot()
 				local specialNpc = findLiveSpecial()
 				local aggroNpc = nearestAggro(60)
 				if specialNpc then
 					rt.farmRoomFilter = nil
+					step('special')
 					farmKillNpc(specialNpc)
 				elseif aggroNpc then
 					rt.farmRoomFilter = nil
+					step('aggro')
 					farmKillNpc(aggroNpc)
 				else
+					step('tour')
 					tourFarmRooms(dungeon)
 				end
 			end
@@ -14744,6 +14759,20 @@ getgenv().DLSetFarm = function(v)
 end
 getgenv().DLFarmStatus = function()
 	return farmLabel, farmKills, farmBusy, rt.farmCrashErr, rt.farmCrashN
+end
+getgenv().DLFarmDebug = function()
+	return {
+		step = rt.farmStep,
+		stepAge = rt.farmStepAt and (os.clock() - rt.farmStepAt) or nil,
+		ticks = rt.farmTicks,
+		label = farmLabel,
+		busy = farmBusy,
+		roomIdx = rt.farmRoomIdx,
+		roomPhase = rt.farmRoomPhase,
+		roomFilter = rt.farmRoomFilter,
+		routeBusy = routeBusy,
+		crash = rt.farmCrashErr,
+	}
 end
 getgenv().DLQuestPending = function()
 	local list, reachable = QuestClaim.pending()

@@ -1,6 +1,6 @@
 {
-    "version":  "1.0.74",
-    "message":  "log auto farm crash to console and back off restarts",
+    "version":  "1.0.75",
+    "message":  "trace auto farm loop step for stall diagnosis",
     "files":  [
                   "dungeon-lootr/launch.lua",
                   "dungeon-lootr/DungeonLootr.lua",
