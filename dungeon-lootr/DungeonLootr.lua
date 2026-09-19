@@ -93,7 +93,7 @@ Library.ToggleKeybind = { Value = 'Home' }
 Library.Animations = Library.Animations or {}
 Library.Animations.TabSwitch = false
 
-local DL_BUILD = '1.0.86'
+local DL_BUILD = '1.0.87'
 getgenv().DLBuild = DL_BUILD
 
 local Window = Library:CreateWindow({
@@ -5169,6 +5169,7 @@ local Rooms = (function()
 	local SPAWN_TIMEOUT = 4
 	local api = {}
 	local hudHasOpenStar
+	local seedLayoutFromController
 	-- Rooms we have seen host at least one awake enemy this run. Empty rooms not
 	-- in this set are candidates for a walk-in activation (hordes).
 	local visited = {}
@@ -6468,7 +6469,7 @@ local Rooms = (function()
 		return nil
 	end
 
-	local function seedLayoutFromController(force)
+	seedLayoutFromController = function(force)
 		-- Stale Done flags left Endless idle↔next-gate while Room_6 was still open.
 		local fresh = os.clock() - (rt.zoneAt or 0) < 3.5
 		if not force and rt.zoneFromGc and type(rt.zoneLayout) == 'table' and #rt.zoneLayout > 0 and fresh then
@@ -8886,7 +8887,11 @@ local function skipTourRoom(dungeon, idx)
 		return nil
 	end
 	-- HUD empty circle for this Index: still go there even if we stamped it swept.
-	if Rooms.layoutRoomOpen(idx) then
+	local hudOpen = false
+	pcall(function()
+		hudOpen = Rooms.layoutRoomOpen(idx) == true
+	end)
+	if hudOpen then
 		return nil
 	end
 	local room = dungeon:FindFirstChild('Room_' .. tostring(idx))
@@ -9059,7 +9064,13 @@ end
 
 local function advanceFromRoom(dungeon, idx)
 	if on('DLRoomsInOrder') then
-		local stars = Rooms.layoutCombatRooms()
+		local stars = {}
+		pcall(function()
+			local list = Rooms.layoutCombatRooms()
+			if type(list) == 'table' then
+				stars = list
+			end
+		end)
 		local slot = tonumber(rt.farmStarSlot) or 1
 		for i, s in ipairs(stars) do
 			if s == idx then
@@ -9124,12 +9135,22 @@ local function tourFarmRooms(dungeon)
 	local maxRoom = Rooms.maxRoom(dungeon)
 	local idx = tonumber(rt.farmRoomIdx) or 1
 	if on('DLRoomsInOrder') then
-		local stars = Rooms.layoutCombatRooms()
+		local stars = {}
+		pcall(function()
+			local list = Rooms.layoutCombatRooms()
+			if type(list) == 'table' then
+				stars = list
+			end
+		end)
 		if #stars > 0 then
 			local slot = tonumber(rt.farmStarSlot)
 			-- An earlier empty HUD star always wins. Matching the current Room_N
 			-- is how Room_2 stayed blank after the farm had already walked past it.
-			if not slot or Rooms.layoutRoomOpen(stars[1]) then
+			local firstOpen = false
+			pcall(function()
+				firstOpen = Rooms.layoutRoomOpen(stars[1]) == true
+			end)
+			if not slot or firstOpen then
 				slot = 1
 			end
 			while slot <= #stars do
@@ -9293,7 +9314,11 @@ local function tourFarmRooms(dungeon)
 		end
 	end
 	pcall(lootRoomAndChildren, dungeon, idx)
-	if roomSweepComplete(dungeon, idx) and not Rooms.layoutRoomOpen(idx) then
+	local stillOpen = false
+	pcall(function()
+		stillOpen = Rooms.layoutRoomOpen(idx) == true
+	end)
+	if roomSweepComplete(dungeon, idx) and not stillOpen then
 		markRoomSwept(dungeon, idx)
 		advanceFromRoom(dungeon, idx)
 	else
