@@ -93,7 +93,7 @@ Library.ToggleKeybind = { Value = 'Home' }
 Library.Animations = Library.Animations or {}
 Library.Animations.TabSwitch = false
 
-local DL_BUILD = '1.0.87'
+local DL_BUILD = '1.0.88'
 getgenv().DLBuild = DL_BUILD
 
 local Window = Library:CreateWindow({
@@ -2186,7 +2186,12 @@ local function chestClaimCandidate(model)
 		end
 	end
 	if (rt.chestSkip and rt.chestSkip[model] or 0) > os.clock() then
-		return false
+		-- Farm loot must still walk to an Enabled prompt. Skip only hid the
+		-- chest and left the character parked in the room zone.
+		local prompt = chestPrompt(model)
+		if not (farmBusy and prompt and prompt.Enabled == true and chestActionOk(prompt)) then
+			return false
+		end
 	end
 	local prompt = chestPrompt(model)
 	return prompt ~= nil and chestActionOk(prompt)
@@ -2457,14 +2462,15 @@ local function collectChestRoute(silent, roomOnly)
 							markChestDone(model)
 							rt.chestSkip[model] = os.clock() + 120
 						else
-							-- Failed this pass — retry soon, do not park the chest 3 min.
-							rt.chestSkip[model] = os.clock() + 6
+							-- Failed this pass. Keep the skip tiny so the next loot
+							-- tick walks back instead of standing in the zone.
+							rt.chestSkip[model] = os.clock() + 0.35
 						end
 					elseif chestIsClaimed(model) then
 						markChestDone(model)
 						rt.chestSkip[model] = os.clock() + 90
 					else
-						rt.chestSkip[model] = os.clock() + 6
+						rt.chestSkip[model] = os.clock() + 0.35
 					end
 				end
 			end
@@ -2597,14 +2603,23 @@ local function lootClearedRoom(roomIdx, dungeon)
 				end
 				if belongs then
 					sawChest = true
-					if chestClaimCandidate(child) then
+					if chestIsClaimed(child) then
+						continue
+					end
+					pending = true
+					-- A failed fire used to park the chest on chestSkip for 6s.
+					-- lootClearedRoom then saw "not a candidate" and never called
+					-- collectChestRoute, so the farm stood still on looting Room_N
+					-- with an Enabled Loot prompt 60+ studs away.
+					local prompt = chestPrompt(child)
+					local livePrompt = prompt and prompt.Enabled == true and chestActionOk(prompt)
+					if livePrompt or chestClaimCandidate(child) then
+						if rt.chestSkip then
+							rt.chestSkip[child] = nil
+						end
 						ready = true
-						pending = true
 						routeIdx = attrIdx or roomIdx
 						break
-					end
-					if not chestIsClaimed(child) then
-						pending = true
 					end
 				end
 			end
@@ -9323,23 +9338,17 @@ local function tourFarmRooms(dungeon)
 		advanceFromRoom(dungeon, idx)
 	else
 		rt.farmRoomPhase = 'loot'
-		-- Enabled chests still out: keep trying. Only leave a dry room that the
-		-- HUD already marked done — skipping Room_2 here left an empty star.
-		local pending = roomHasPendingChest(dungeon, idx)
-		local hudOpen = Rooms.layoutRoomOpen(idx)
 		if rt.lootStallIdx ~= idx then
 			rt.lootStallIdx = idx
 			rt.lootStallAt = os.clock()
-		elseif os.clock() - (rt.lootStallAt or 0) > (pending and 18 or 8) then
+		elseif os.clock() - (rt.lootStallAt or 0) > 12 then
+			-- Do not retry forever. A live chest is walked every loot pass now;
+			-- if it still will not claim, leave so the farm cannot sit on
+			-- "looting Room_N" with ticks climbing and no movement.
 			rt.lootStallIdx = nil
-			if hudOpen or pending then
-				farmLabel = ('retry loot Room_%d'):format(idx)
-				rt.lootStallAt = os.clock()
-			else
-				markRoomSwept(dungeon, idx)
-				advanceFromRoom(dungeon, idx)
-				farmLabel = ('skip stuck Room_%d'):format(idx)
-			end
+			markRoomSwept(dungeon, idx)
+			advanceFromRoom(dungeon, idx)
+			farmLabel = ('leave loot Room_%d'):format(idx)
 		end
 	end
 end

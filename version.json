@@ -1,6 +1,6 @@
 {
-    "version":  "1.0.87",
-    "message":  "stop farm crash: declare room-layout helper before any call",
+    "version":  "1.0.88",
+    "message":  "unstick loot: walk to enabled chests instead of skip-looping in the zone",
     "files":  [
                   "dungeon-lootr/launch.lua",
                   "dungeon-lootr/DungeonLootr.lua",
