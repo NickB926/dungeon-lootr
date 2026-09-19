@@ -1,6 +1,6 @@
 {
-    "version":  "1.0.82",
-    "message":  "pick the approach angle whose swing box covers the most mobs",
+    "version":  "1.0.83",
+    "message":  "stay in numbered rooms, pin on densest pack not the zone box",
     "files":  [
                   "dungeon-lootr/launch.lua",
                   "dungeon-lootr/DungeonLootr.lua",

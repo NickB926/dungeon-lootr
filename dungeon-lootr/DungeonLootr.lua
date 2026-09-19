@@ -93,7 +93,7 @@ Library.ToggleKeybind = { Value = 'Home' }
 Library.Animations = Library.Animations or {}
 Library.Animations.TabSwitch = false
 
-local DL_BUILD = '1.0.82'
+local DL_BUILD = '1.0.83'
 getgenv().DLBuild = DL_BUILD
 
 local Window = Library:CreateWindow({
@@ -6073,7 +6073,6 @@ local Rooms = (function()
 			return false
 		end
 		local zone = api.zone(dungeon, idx)
-		Pin.at(standingSpot(goal, 0), true)
 		local function pokeZone()
 			local my = routeRoot()
 			if not my then
@@ -6087,8 +6086,6 @@ local Rooms = (function()
 				pcall(firetouchinterest, my, zone, 1)
 			end
 		end
-		rt.holdCollideUntil = os.clock() + (tonumber(seconds) or 1) + 1
-		pokeZone()
 		local function awakeHere()
 			local n = 0
 			eachNpc(dungeon, function(npc)
@@ -6103,9 +6100,14 @@ local Rooms = (function()
 			end)
 			return n > 0
 		end
+		-- Pack is already up: do not pin on the Zone (the green room box).
+		-- That parked the character in empty space while mobs stood elsewhere.
 		if awakeHere() then
 			return true
 		end
+		Pin.at(standingSpot(goal, 0), true)
+		rt.holdCollideUntil = os.clock() + (tonumber(seconds) or 1) + 1
+		pokeZone()
 		local deadline = os.clock() + (tonumber(seconds) or 1)
 		local poked = 0
 		while os.clock() < deadline do
@@ -7495,7 +7497,7 @@ local function pickFarmTarget()
 	end
 	-- Fodder: stand in the densest clump, not on a lone nearest beetle.
 	if picked and enemyRank(picked) < 3 and not preferRanged then
-		local CROWD_R = 22
+		local CROWD_R = 28
 		local best, bestN, bestD = picked, 0, pickedD or 9e9
 		local counts = {}
 		local parts = {}
@@ -8136,6 +8138,34 @@ local function bestPackFacing(pack, centre, stand, current)
 	return bestDir
 end
 
+local function packAround(npc, live, radius)
+	local sx, sz, n = live.Position.X, live.Position.Z, 1
+	local pack = { live.Position }
+	local room = Rooms.indexOf(npc)
+	eachFarmNpc(function(other)
+		if other == npc or not enemyAlive(other) or farmSkipped(other) then
+			return
+		end
+		if enemyRank(other) >= 3 then
+			return
+		end
+		local p = enemyRoot(other)
+		if not p then
+			return
+		end
+		if room and Rooms.indexOf(other) ~= room then
+			return
+		end
+		if (p.Position - live.Position).Magnitude <= radius then
+			sx += p.Position.X
+			sz += p.Position.Z
+			n += 1
+			pack[#pack + 1] = p.Position
+		end
+	end)
+	return pack, n, Vector3.new(sx / n, live.Position.Y, sz / n)
+end
+
 -- Hold station next to one enemy for the whole fight. The approach side is locked in
 -- once here on purpose: the old code recomputed it from our own live position every
 -- tick, which fed the previous write's error back into the next goal and made the
@@ -8151,6 +8181,22 @@ local function holdOnEnemy(npc)
 		flat = Vector3.new(0, 0, 1)
 	end
 	local dir = flat.Unit
+	local stand0 = Options.DLFarmStand and tonumber(Options.DLFarmStand.Value) or 5
+	local roomIdx = Rooms.indexOf(npc)
+	if part and enemyRank(npc) < 3 then
+		local pack, n, mid = packAround(npc, part, 28)
+		if n >= 2 then
+			dir = bestPackFacing(pack, mid, stand0, dir)
+		end
+	end
+	-- Same room, same approach. Re-picking the side every kill walked the
+	-- character around the pack instead of through it.
+	if roomIdx and rt.packRoom == roomIdx and typeof(rt.packDir) == 'Vector3' then
+		dir = rt.packDir
+	else
+		rt.packDir = dir
+		rt.packRoom = roomIdx
+	end
 	local char = character()
 	local hum = char and char:FindFirstChildOfClass('Humanoid')
 	local rootPart = char and char:FindFirstChild('HumanoidRootPart')
@@ -8243,34 +8289,11 @@ local function holdOnEnemy(npc)
 			cachedStand = stand
 			cachedAim = nil
 			-- Face the clump, not a stray on the edge. Same-room fodder within 28.
+			-- Approach `dir` stays locked for the room — only the aim point updates.
 			if enemyRank(npc) < 3 then
-				local sx, sz, n = live.Position.X, live.Position.Z, 1
-				local pack = { live.Position }
-				local room = Rooms.indexOf(npc)
-				eachFarmNpc(function(other)
-					if other == npc or not enemyAlive(other) or farmSkipped(other) then
-						return
-					end
-					if enemyRank(other) >= 3 then
-						return
-					end
-					local p = enemyRoot(other)
-					if not p then
-						return
-					end
-					if room and Rooms.indexOf(other) ~= room then
-						return
-					end
-					if (p.Position - live.Position).Magnitude <= 28 then
-						sx += p.Position.X
-						sz += p.Position.Z
-						n += 1
-						pack[#pack + 1] = p.Position
-					end
-				end)
+				local _, n, mid = packAround(npc, live, 28)
 				if n >= 2 then
-					cachedAim = Vector3.new(sx / n, live.Position.Y, sz / n)
-					dir = bestPackFacing(pack, cachedAim, stand, dir)
+					cachedAim = mid
 				end
 			end
 		end
@@ -9038,6 +9061,8 @@ local function tourFarmRooms(dungeon)
 		rt.farmRoomIdx = idx
 		rt.farmRoomPhase = 'wait'
 		rt.farmRoomFilter = nil
+		rt.packDir = nil
+		rt.packRoom = nil
 	end
 	if idx > maxRoom then
 		local okStar, went = pcall(goToOpenStar, dungeon, maxRoom)
@@ -9081,6 +9106,10 @@ local function tourFarmRooms(dungeon)
 				end
 			end
 			task.wait(0.35)
+			return
+		end
+		if Rooms.aliveCount(dungeon, idx) > 0 then
+			rt.farmRoomPhase = 'fight'
 			return
 		end
 		local spawned = Rooms.holdRoom(dungeon, idx, 1)
@@ -9132,6 +9161,8 @@ local function tourFarmRooms(dungeon)
 		rt.farmRoomPhase = 'wait'
 		rt.farmRoomFilter = nil
 		rt.lootStallIdx = nil
+		rt.packDir = nil
+		rt.packRoom = nil
 	else
 		rt.farmRoomPhase = 'loot'
 		-- Loot can report "work left here" while the router refuses the chest
@@ -9151,6 +9182,8 @@ local function tourFarmRooms(dungeon)
 			rt.farmRoomIdx = idx + 1
 			rt.farmRoomPhase = 'wait'
 			rt.farmRoomFilter = nil
+			rt.packDir = nil
+			rt.packRoom = nil
 			farmLabel = ('skip stuck Room_%d'):format(idx)
 		end
 	end
@@ -9226,38 +9259,45 @@ local function farmLoop()
 				task.wait(0.2)
 			else
 				step('aoe')
-				local aoeOk, aoeHit = pcall(rt.avoidFloorAoe)
-				if aoeOk and aoeHit and typeof(rt.aoeGoal) == 'Vector3' then
-					farmLabel = 'aoe gap'
-					Pin.at(rt.aoeGoal, true)
+				-- holdOnEnemy already steps off floor discs. Pin.at here mid-fight
+				-- yanked the character off the pack every time a telegraph spawned.
+				if not rt.farmFighting then
+					local aoeOk, aoeHit = pcall(rt.avoidFloorAoe)
+					if aoeOk and aoeHit and typeof(rt.aoeGoal) == 'Vector3' then
+						farmLabel = 'aoe gap'
+						Pin.at(rt.aoeGoal, true)
+					end
 				end
 				step('scan')
 				local dungeon = activeDungeonRoot()
-				local specialNpc = findLiveSpecial()
-				local aggroNpc = nearestAggro(60)
-				if specialNpc then
-					rt.farmRoomFilter = nil
-					step('special')
-					farmKillNpc(specialNpc)
-				elseif aggroNpc then
-					rt.farmRoomFilter = nil
-					step('aggro')
-					-- Swing at the middle of the pack that is on us, not whichever
-					-- body happens to be closest. pickFarmTarget already scores by
-					-- crowd size; only take its answer if it is not dragging us off
-					-- somewhere else entirely.
-					local packNpc, packD = pickFarmTarget()
-					local aggroPart = enemyRoot(aggroNpc)
-					local here = routeRoot()
-					local aggroD = (aggroPart and here) and (aggroPart.Position - here.Position).Magnitude or 0
-					if packNpc and packD and packD <= aggroD + 30 then
-						farmKillNpc(packNpc)
-					else
-						farmKillNpc(aggroNpc)
-					end
-				else
+				-- Rooms-in-order: stay on Room_N until it is done. Map-wide special
+				-- / aggro used to clear the room filter and hop across the floor.
+				if on('DLRoomsInOrder') then
 					step('tour')
 					tourFarmRooms(dungeon)
+				else
+					local specialNpc = findLiveSpecial()
+					local aggroNpc = nearestAggro(60)
+					if specialNpc then
+						rt.farmRoomFilter = nil
+						step('special')
+						farmKillNpc(specialNpc)
+					elseif aggroNpc then
+						rt.farmRoomFilter = nil
+						step('aggro')
+						local packNpc, packD = pickFarmTarget()
+						local aggroPart = enemyRoot(aggroNpc)
+						local here = routeRoot()
+						local aggroD = (aggroPart and here) and (aggroPart.Position - here.Position).Magnitude or 0
+						if packNpc and packD and packD <= aggroD + 30 then
+							farmKillNpc(packNpc)
+						else
+							farmKillNpc(aggroNpc)
+						end
+					else
+						step('tour')
+						tourFarmRooms(dungeon)
+					end
 				end
 			end
 			end
@@ -14087,7 +14127,7 @@ end)
 FarmBox:AddToggle('DLRoomsInOrder', {
 	Text = 'Rooms in order',
 	Default = true,
-	Tooltip = 'Sweep rooms by number (Room_1, Room_2, ...) instead of following the HUD star order, which jumps back and forth across the floor. Blessing shrines and enemies that aggro you still interrupt.',
+	Tooltip = 'Sweep Room_1, Room_2, ... in number order. Blessings still interrupt. Specials and nearby packs wait until that room is up — they no longer yank you across the floor.',
 }):OnChanged(function(v)
 	Library:Notify(v and 'Rooms in order on' or 'Rooms in order off — HUD star order')
 end)
