@@ -1,6 +1,6 @@
 {
-    "version":  "1.0.76",
-    "message":  "stop farm parking on a hung GetSessionInfo remote",
+    "version":  "1.0.77",
+    "message":  "fix client freeze: cache corridor tests, throttle sweep marks, yield each farm pass",
     "files":  [
                   "dungeon-lootr/launch.lua",
                   "dungeon-lootr/DungeonLootr.lua",

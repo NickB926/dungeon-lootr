@@ -93,7 +93,7 @@ Library.ToggleKeybind = { Value = 'Home' }
 Library.Animations = Library.Animations or {}
 Library.Animations.TabSwitch = false
 
-local DL_BUILD = '1.0.76'
+local DL_BUILD = '1.0.77'
 getgenv().DLBuild = DL_BUILD
 
 local Window = Library:CreateWindow({
@@ -5478,7 +5478,7 @@ local Rooms = (function()
 	end
 
 	-- Skinny Zones are hallways even when tagged Checkpoint / Loot.
-	function api.isCorridor(dungeon, idx)
+	local function computeCorridor(dungeon, idx)
 		local room = dungeon and dungeon:FindFirstChild('Room_' .. tostring(idx))
 		if not room then
 			return false
@@ -5534,6 +5534,31 @@ local Rooms = (function()
 			return skinny(sz.X, sz.Z)
 		end
 		return false
+	end
+
+	-- Every farm tick asked this for each NPC and each room, and the fallback path
+	-- runs GetBoundingBox on a whole room model. That was thousands of model walks
+	-- per second once the loop stopped stalling, which is what froze the client.
+	local corridorCache, corridorFor = {}, nil
+	function api.isCorridor(dungeon, idx)
+		if not dungeon or not idx then
+			return false
+		end
+		if corridorFor ~= dungeon.Name then
+			corridorFor = dungeon.Name
+			corridorCache = {}
+		end
+		local cached = corridorCache[idx]
+		if cached ~= nil then
+			return cached
+		end
+		local val = computeCorridor(dungeon, idx) == true
+		-- An answer taken before the Zone streamed in is a guess, so do not keep it.
+		local room = dungeon:FindFirstChild('Room_' .. tostring(idx))
+		if room and room:FindFirstChild('Zone') then
+			corridorCache[idx] = val
+		end
+		return val
 	end
 
 	-- Courtyard / Player_Spawn pad. No pack, not a HUD star — do not tour it.
@@ -7306,6 +7331,10 @@ end
 -- are not locked — their summoned pack has to be cleared first.
 local farmLock = nil
 
+-- farmSkipped calls this for every NPC on every farm tick, and the position
+-- fallback sweeps every room zone. Hold the answer briefly per NPC.
+local corrSeen = setmetatable({}, { __mode = 'k' })
+
 rt.npcInCorridor = function(npc)
 	if not npc or isFinalBoss(npc) then
 		return false
@@ -7314,12 +7343,21 @@ rt.npcInCorridor = function(npc)
 	if not d then
 		return false
 	end
+	local now = os.clock()
+	local hit = corrSeen[npc]
+	if hit and now - hit.at < 0.6 then
+		return hit.val
+	end
+	local val = false
 	local idx = Rooms.indexOf(npc)
 	if idx and Rooms.isCorridor(d, idx) then
-		return true
+		val = true
+	else
+		local p = enemyRoot(npc)
+		val = p ~= nil and Rooms.posInCorridor(d, p.Position) == true
 	end
-	local p = enemyRoot(npc)
-	return p ~= nil and Rooms.posInCorridor(d, p.Position) == true
+	corrSeen[npc] = { at = now, val = val }
+	return val
 end
 
 local function pickFarmTarget()
@@ -8416,6 +8454,16 @@ local function nearestAggro(maxD)
 	if not root then
 		return nil
 	end
+	local now = os.clock()
+	if rt.aggroAt and now - rt.aggroAt < 0.25 then
+		local held = rt.aggroNpc
+		if not held then
+			return nil
+		end
+		if enemyAlive(held) and not farmSkipped(held) and enemyRoot(held) then
+			return held
+		end
+	end
 	maxD = tonumber(maxD) or 55
 	local best, bestD = nil, maxD
 	eachFarmNpc(function(npc)
@@ -8434,6 +8482,8 @@ local function nearestAggro(maxD)
 			best, bestD = npc, d
 		end
 	end)
+	rt.aggroAt = now
+	rt.aggroNpc = best
 	return best
 end
 
@@ -8770,7 +8820,7 @@ local function ensureSweepMark(dungeon, idx)
 	m.lab.TextColor3 = color
 end
 
-local function tickRoomSweepMarks()
+local function tickRoomSweepMarks(force)
 	if not sweepMarksOn() then
 		clearAllSweepMarks()
 		return
@@ -8780,6 +8830,13 @@ local function tickRoomSweepMarks()
 		clearAllSweepMarks()
 		return
 	end
+	-- A full pass re-reads every room's chests, gates and altar particles. Re-running
+	-- it on every farm pass was most of the frame time.
+	local now = os.clock()
+	if not force and rt.sweepMarkAt and now - rt.sweepMarkAt < 0.5 then
+		return
+	end
+	rt.sweepMarkAt = now
 	local maxR = Rooms.maxRoom(dungeon)
 	local keep = {}
 	for i = 1, maxR do
@@ -9075,6 +9132,10 @@ local function farmLoop()
 			end
 			end
 		end
+		-- Phase transitions return without waiting, so this used to re-run the whole
+		-- scan several times per frame. One yield per pass keeps the client alive.
+		step('yield')
+		task.wait()
 	end
 	farmBusy = false
 	farmLabel = nil
