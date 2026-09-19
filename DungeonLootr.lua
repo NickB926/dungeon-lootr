@@ -141,7 +141,7 @@ Library.ToggleKeybind = { Value = 'Home' }
 Library.Animations = Library.Animations or {}
 Library.Animations.TabSwitch = false
 
-local DL_BUILD = '1.0.44'
+local DL_BUILD = '1.0.45'
 getgenv().DLBuild = DL_BUILD
 
 local Window = Library:CreateWindow({
@@ -1560,21 +1560,31 @@ function rt.hoverN()
 	return tonumber(rt.hoverVal) or 0
 end
 
--- Slider hover only while fighting. Chest / gate / potion pins used to keep
--- fy+hover and sit under the prompt (negative hover = unreachable chests).
+-- Slider hover only while farming. Chest / gate / potion pins need prompt height.
+-- Negative bury must NOT drop to 0 on healWait or the farmFighting=false gap
+-- between kills — that is what yanked you onto the floor with live mobs.
 function rt.combatHover()
-	if routeBusy or rt.refillBusy or rt.refillUrgent or rt.healWait or rt.chestLooting then
+	local h = rt.hoverN()
+	if routeBusy or rt.chestLooting then
+		return 0
+	end
+	-- Potion station stand needs the prompt; bury would miss it.
+	if rt.refillBusy or rt.refillUrgent then
 		return 0
 	end
 	if not farmBusy then
-		return rt.hoverN()
+		return h
 	end
-	-- Stale farmFightNpc after a wipe still applied bury during room loot
-	-- because lootRoomChests never sets routeBusy.
-	if not rt.farmFighting then
+	if h < 0 then
+		return h
+	end
+	if rt.healWait then
 		return 0
 	end
-	return rt.hoverN()
+	if not rt.farmFighting and not rt.farmFightNpc then
+		return 0
+	end
+	return h
 end
 
 function rt.farmPitchWanted()
@@ -1808,9 +1818,11 @@ function rt.farmHoldCf(pos, aim, keep)
 	rt.farmFace = flat
 	-- combatHover: 0 during chest/loot so Pin.at / snapRoot stay at prompt height.
 	local hover = rt.combatHover()
-	-- Never rewrite chest/gate/potion stand height with fight bury / AutoHigh.
-	if farmBusy and (rt.farmFighting or rt.farmFightNpc)
-		and not routeBusy and not rt.chestLooting
+	-- Apply bury / fight height whenever farm owns the pin — not only while
+	-- farmFighting is true. The false gap between kills left goal Y on the
+	-- floor and farmHoldCf skipped the rewrite, so you popped up mid-pack.
+	if farmBusy and not routeBusy and not rt.chestLooting
+		and (math.abs(hover) >= 0.5 or rt.farmFighting or rt.farmFightNpc)
 	then
 		-- Explicit hover (non-zero) is floor + slider only. AutoHigh used to
 		-- stack on top and read as +13 at hover 1. Hover 0 still uses the
@@ -1856,7 +1868,12 @@ function rt.farmHoldCf(pos, aim, keep)
 			if newY < minY then
 				newY = live.Position.Y + math.clamp(hover, -18, 0)
 			elseif newY > maxY then
-				newY = live.Position.Y + math.min(hover, 8)
+				-- Never pull a negative bury UP to the enemy.
+				if hover < 0 then
+					newY = fy + hover
+				else
+					newY = live.Position.Y + math.min(hover, 8)
+				end
 			end
 		elseif type(rt._lastGoodStandY) == 'number' and (rt._lastGoodStandY - newY) > 40 then
 			newY = rt._lastGoodStandY
@@ -4290,16 +4307,22 @@ rt.avoidFloorAoe = function()
 		end
 		return false
 	end
-	-- Already clear of discs: keep a sticky safe park. Do not rewrite aoeGoal every
-	-- scan — that made Pin thrash and ate M1 / skill input.
+	-- Already clear of discs: do NOT steal the fight pin. Returning true with a
+	-- floor-Y aoeGoal is what yanked negative-hover back onto the pack.
 	if not covered(me.X, me.Z, 2.5) then
-		if typeof(rt.aoeGoal) ~= 'Vector3' or covered(rt.aoeGoal.X, rt.aoeGoal.Z, 2.5) then
-			local fy = rt.refreshFarmFloor(me)
-			local y = type(fy) == 'number' and (fy + math.max(rt.combatHover(), 0)) or me.Y
-			rt.aoeGoal = Vector3.new(me.X, y, me.Z)
+		rt.aoeUntil = 0
+		rt.aoeGoal = nil
+		return false
+	end
+	local hover = rt.combatHover()
+	local function standY(fy, fallback)
+		if type(fy) == 'number' then
+			if hover ~= 0 then
+				return fy + hover
+			end
+			return fy + 3
 		end
-		rt.aoeUntil = os.clock() + 0.9
-		return true
+		return fallback
 	end
 	local best, bestD = nil, nil
 	local function tryAt(x, z)
@@ -4312,8 +4335,7 @@ rt.avoidFloorAoe = function()
 		if not bestD or d < bestD then
 			bestD = d
 			local fy = rt.refreshFarmFloor(Vector3.new(x, me.Y, z))
-			local y = type(fy) == 'number' and fy + 3 or me.Y
-			best = Vector3.new(x, y, z)
+			best = Vector3.new(x, standY(fy, me.Y), z)
 		end
 	end
 	for i = 1, #circles do
