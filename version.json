@@ -1,6 +1,6 @@
 {
-    "version":  "1.0.83",
-    "message":  "stay in numbered rooms, pin on densest pack not the zone box",
+    "version":  "1.0.84",
+    "message":  "follow HUD star order, loot child rooms, do not skip an empty star",
     "files":  [
                   "dungeon-lootr/launch.lua",
                   "dungeon-lootr/DungeonLootr.lua",

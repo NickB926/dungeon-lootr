@@ -93,7 +93,7 @@ Library.ToggleKeybind = { Value = 'Home' }
 Library.Animations = Library.Animations or {}
 Library.Animations.TabSwitch = false
 
-local DL_BUILD = '1.0.83'
+local DL_BUILD = '1.0.84'
 getgenv().DLBuild = DL_BUILD
 
 local Window = Library:CreateWindow({
@@ -5462,6 +5462,7 @@ local Rooms = (function()
 		rt.farmRoomIdx = 1
 		rt.farmRoomPhase = 'wait'
 		rt.farmRoomFilter = nil
+		rt.farmStarSlot = nil
 		rt.farmDungeonId = nil
 		rt.shrineUsed = {}
 		rt.chestDone = {}
@@ -6273,6 +6274,51 @@ local Rooms = (function()
 	-- tour empty Room_1→N and sit in the last hallway instead of the boss pad.
 	function api.hudHasOpenStar()
 		return hudHasOpenStar()
+	end
+
+	-- Combat stars in HUD order (Room_2, Room_6, …). Halls are not on this list.
+	function api.layoutCombatRooms()
+		seedLayoutFromController()
+		local out = {}
+		if type(rt.zoneLayout) ~= 'table' then
+			return out
+		end
+		for _, z in ipairs(rt.zoneLayout) do
+			local i = z and tonumber(z.Index)
+			if i and z.IsBoss ~= true then
+				out[#out + 1] = i
+			end
+		end
+		return out
+	end
+
+	function api.layoutRoomOpen(idx)
+		if not idx then
+			return false
+		end
+		seedLayoutFromController()
+		if type(rt.zoneLayout) ~= 'table' then
+			return false
+		end
+		for _, z in ipairs(rt.zoneLayout) do
+			if z and tonumber(z.Index) == idx and z.IsBoss ~= true then
+				return z.Done ~= true and z.Completed ~= true
+			end
+		end
+		return false
+	end
+
+	function api.layoutBossRoom()
+		seedLayoutFromController()
+		if type(rt.zoneLayout) ~= 'table' then
+			return nil
+		end
+		for _, z in ipairs(rt.zoneLayout) do
+			if z and z.IsBoss == true then
+				return tonumber(z.Index)
+			end
+		end
+		return nil
 	end
 
 	function api.starsHold()
@@ -8646,22 +8692,15 @@ local function goToOpenStar(dungeon, maxRoom)
 	-- list is HUD layout order, which sends the farm back and forth across the
 	-- floor (Room_4, then 13, then 2) even though every room is equally close.
 	if on('DLRoomsInOrder') then
-		for i = 1, maxRoom or Rooms.maxRoom(dungeon) do
-			if Rooms.isCorridor(dungeon, i) or Rooms.isStartRoom(dungeon, i) then
-				continue
-			end
+		for _, i in ipairs(Rooms.layoutCombatRooms()) do
 			if (rt.lootBan and rt.lootBan[i] or 0) > os.clock() then
 				continue
 			end
-			if Rooms.aliveCount(dungeon, i) > 0
+			if Rooms.layoutRoomOpen(i)
+				or Rooms.aliveCount(dungeon, i) > 0
 				or Rooms.dormantCount(dungeon, i) > 0
 				or roomHasPendingChest(dungeon, i)
 			then
-				star = i
-				break
-			end
-			local room = dungeon:FindFirstChild('Room_' .. tostring(i))
-			if room and room:GetAttribute('IsLootRoom') == true and not roomIsSwept(dungeon, i) then
 				star = i
 				break
 			end
@@ -8812,6 +8851,10 @@ local function skipTourRoom(dungeon, idx)
 	-- Incomplete HUD stars (loot / empty circle) must still be visited even if
 	-- we already stamped the room swept after a dry loot pass.
 	if Rooms.dormantCount(dungeon, idx) > 0 or roomHasPendingChest(dungeon, idx) then
+		return nil
+	end
+	-- HUD empty circle for this Index: still go there even if we stamped it swept.
+	if Rooms.layoutRoomOpen(idx) then
 		return nil
 	end
 	local room = dungeon:FindFirstChild('Room_' .. tostring(idx))
@@ -8982,7 +9025,44 @@ local function farmKillNpc(npc)
 	end
 end
 
--- Room_1→N once: wait 1s (cut short if THIS room wakes), hover-kill, gate, chests.
+local function advanceFromRoom(dungeon, idx)
+	if on('DLRoomsInOrder') then
+		local stars = Rooms.layoutCombatRooms()
+		local slot = tonumber(rt.farmStarSlot) or 1
+		for i, s in ipairs(stars) do
+			if s == idx then
+				slot = i
+				break
+			end
+		end
+		rt.farmStarSlot = slot + 1
+		rt.farmRoomIdx = stars[slot + 1] or (idx + 1)
+	else
+		rt.farmRoomIdx = idx + 1
+	end
+	rt.farmRoomPhase = 'wait'
+	rt.farmRoomFilter = nil
+	rt.lootStallIdx = nil
+	rt.packDir = nil
+	rt.packRoom = nil
+end
+
+local function lootRoomAndChildren(dungeon, idx)
+	pcall(lootClearedRoom, idx, dungeon)
+	if not dungeon then
+		return
+	end
+	for _, child in ipairs(dungeon:GetChildren()) do
+		if child.Name:sub(1, 5) == 'Room_' and child:GetAttribute('IsLootRoom') == true then
+			local childIdx = tonumber(child.Name:match('Room_(%d+)'))
+			if childIdx and tonumber(child:GetAttribute('ParentRoomIndex')) == idx then
+				pcall(lootClearedRoom, childIdx, dungeon)
+			end
+		end
+	end
+end
+
+-- HUD star order when Rooms in order: Room_2 → 6 → 8, not every hallway Room_N.
 local function tourFarmRooms(dungeon)
 	if inBossRushFarm() and not dungeon then
 		farmLabel = 'boss rush · waiting'
@@ -9006,10 +9086,38 @@ local function tourFarmRooms(dungeon)
 			rt.farmRoomIdx = 1
 			rt.farmRoomPhase = 'wait'
 			rt.farmRoomFilter = nil
+			rt.farmStarSlot = nil
 		end
 	end
 	local maxRoom = Rooms.maxRoom(dungeon)
 	local idx = tonumber(rt.farmRoomIdx) or 1
+	if on('DLRoomsInOrder') then
+		local stars = Rooms.layoutCombatRooms()
+		if #stars > 0 then
+			local slot = tonumber(rt.farmStarSlot)
+			-- An earlier empty HUD star always wins. Matching the current Room_N
+			-- is how Room_2 stayed blank after the farm had already walked past it.
+			if not slot or Rooms.layoutRoomOpen(stars[1]) then
+				slot = 1
+			end
+			while slot <= #stars do
+				local okSkip, why = pcall(skipTourRoom, dungeon, stars[slot])
+				if okSkip and why then
+					slot += 1
+				else
+					break
+				end
+			end
+			rt.farmStarSlot = slot
+			if slot <= #stars then
+				idx = stars[slot]
+				rt.farmRoomIdx = idx
+			else
+				idx = maxRoom + 1
+				rt.farmRoomIdx = idx
+			end
+		end
+	end
 	if maxRoom < 1 then
 		farmLabel = ('idle · %d kills'):format(farmKills)
 		task.wait(0.25)
@@ -9152,39 +9260,29 @@ local function tourFarmRooms(dungeon)
 			rt.chestRoomOpen[idx] = true
 		end
 	end
-	if roomHasPendingChest(dungeon, idx) or on('DLChestAnywhere') then
-		pcall(lootClearedRoom, idx, dungeon)
-	end
-	if roomSweepComplete(dungeon, idx) then
+	pcall(lootRoomAndChildren, dungeon, idx)
+	if roomSweepComplete(dungeon, idx) and not Rooms.layoutRoomOpen(idx) then
 		markRoomSwept(dungeon, idx)
-		rt.farmRoomIdx = idx + 1
-		rt.farmRoomPhase = 'wait'
-		rt.farmRoomFilter = nil
-		rt.lootStallIdx = nil
-		rt.packDir = nil
-		rt.packRoom = nil
+		advanceFromRoom(dungeon, idx)
 	else
 		rt.farmRoomPhase = 'loot'
-		-- Loot can report "work left here" while the router refuses the chest
-		-- (unreachable anchor, mismatched room number, a prompt the server never
-		-- arms). That combination parked the farm on one room indefinitely, which
-		-- reads as auto farm being off. Move on instead of standing still.
+		-- Enabled chests still out: keep trying. Only leave a dry room that the
+		-- HUD already marked done — skipping Room_2 here left an empty star.
+		local pending = roomHasPendingChest(dungeon, idx)
+		local hudOpen = Rooms.layoutRoomOpen(idx)
 		if rt.lootStallIdx ~= idx then
 			rt.lootStallIdx = idx
 			rt.lootStallAt = os.clock()
-		elseif os.clock() - (rt.lootStallAt or 0) > 10 then
+		elseif os.clock() - (rt.lootStallAt or 0) > (pending and 18 or 8) then
 			rt.lootStallIdx = nil
-			-- Ban it for a while too, or the ordered sweep picks the same room
-			-- back up on the next pass and the stall just repeats.
-			rt.lootBan = rt.lootBan or {}
-			rt.lootBan[idx] = os.clock() + 120
-			markRoomSwept(dungeon, idx)
-			rt.farmRoomIdx = idx + 1
-			rt.farmRoomPhase = 'wait'
-			rt.farmRoomFilter = nil
-			rt.packDir = nil
-			rt.packRoom = nil
-			farmLabel = ('skip stuck Room_%d'):format(idx)
+			if hudOpen or pending then
+				farmLabel = ('retry loot Room_%d'):format(idx)
+				rt.lootStallAt = os.clock()
+			else
+				markRoomSwept(dungeon, idx)
+				advanceFromRoom(dungeon, idx)
+				farmLabel = ('skip stuck Room_%d'):format(idx)
+			end
 		end
 	end
 end
@@ -13895,7 +13993,7 @@ end)
 local ChestBox = RunTab:AddLeftGroupbox('Chests')
 ChestBox:AddToggle('DLChestAnywhere', {
 	Text = 'Auto collect chests',
-	Default = false,
+	Default = true,
 	Tooltip = 'Farm: Nightmare waits until the floor boss is next, then sweeps. Endless loots each room as soon as that pack is dead. Manual Collect still works anytime. Locked-room chests are skipped unless Open locked gates is on.',
 }):OnChanged(function(v)
 	Library:Notify(v and 'Auto chest route on' or 'Auto chest route off')
