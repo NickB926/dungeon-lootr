@@ -141,7 +141,7 @@ Library.ToggleKeybind = { Value = 'Home' }
 Library.Animations = Library.Animations or {}
 Library.Animations.TabSwitch = false
 
-local DL_BUILD = '1.0.42'
+local DL_BUILD = '1.0.43'
 getgenv().DLBuild = DL_BUILD
 
 local Window = Library:CreateWindow({
@@ -809,17 +809,25 @@ local function fireChestPrompt(prompt)
 		return false
 	end
 	local now = os.clock()
-	if (chestFiredAt[prompt] or 0) + 1.2 > now then
+	if (chestFiredAt[prompt] or 0) + 0.35 > now then
 		return false
 	end
 	chestFiredAt[prompt] = now
+	pcall(function()
+		prompt.RequiresLineOfSight = false
+		prompt.MaxActivationDistance = math.max(tonumber(prompt.MaxActivationDistance) or 8, 16)
+	end)
 	local hold = math.max(tonumber(prompt.HoldDuration) or 0, 0)
 	if type(fireproximityprompt) == 'function' then
 		if hold > 0 then
 			pcall(fireproximityprompt, prompt, hold)
 			pcall(fireproximityprompt, prompt, 0, hold)
+		else
+			-- Instant Loot prompts: several executor signatures.
+			pcall(fireproximityprompt, prompt)
+			pcall(fireproximityprompt, prompt, 0)
+			pcall(fireproximityprompt, prompt, 1)
 		end
-		pcall(fireproximityprompt, prompt)
 	elseif type(fireProximityPrompt) == 'function' then
 		if hold > 0 then
 			pcall(fireProximityPrompt, prompt, hold)
@@ -829,7 +837,7 @@ local function fireChestPrompt(prompt)
 	pcall(function()
 		prompt:InputHoldBegin()
 	end)
-	task.wait(hold > 0 and (hold + 0.12) or 0.05)
+	task.wait(hold > 0 and (hold + 0.12) or 0.08)
 	pcall(function()
 		prompt:InputHoldEnd()
 	end)
@@ -1555,13 +1563,15 @@ end
 -- Slider hover only while fighting. Chest / gate / potion pins used to keep
 -- fy+hover and sit under the prompt (negative hover = unreachable chests).
 function rt.combatHover()
-	if routeBusy or rt.refillBusy or rt.refillUrgent or rt.healWait then
+	if routeBusy or rt.refillBusy or rt.refillUrgent or rt.healWait or rt.chestLooting then
 		return 0
 	end
 	if not farmBusy then
 		return rt.hoverN()
 	end
-	if not rt.farmFighting and not rt.farmFightNpc then
+	-- Stale farmFightNpc after a wipe still applied bury during room loot
+	-- because lootRoomChests never sets routeBusy.
+	if not rt.farmFighting then
 		return 0
 	end
 	return rt.hoverN()
@@ -1798,7 +1808,10 @@ function rt.farmHoldCf(pos, aim, keep)
 	rt.farmFace = flat
 	-- combatHover: 0 during chest/loot so Pin.at / snapRoot stay at prompt height.
 	local hover = rt.combatHover()
-	if farmBusy and (rt.farmFighting or rt.farmFightNpc) then
+	-- Never rewrite chest/gate/potion stand height with fight bury / AutoHigh.
+	if farmBusy and (rt.farmFighting or rt.farmFightNpc)
+		and not routeBusy and not rt.chestLooting
+	then
 		-- Explicit hover (non-zero) is floor + slider only. AutoHigh used to
 		-- stack on top and read as +13 at hover 1. Hover 0 still uses the
 		-- hold goal (auto high/low / special bury).
@@ -2572,11 +2585,16 @@ KeyDoor = (function()
 	return api
 end)()
 
--- ChestPrompt MaxActivationDistance is 8 and the server wants you inside the
--- chest volume. Standing beside the bbox left the prompt just out of range.
+-- ChestPrompt MaxActivationDistance is 8 and the server measures from the
+-- prompt Attachment — stand on that, not only the mesh bbox center.
 local function chestStandPos(model)
 	if not model then
 		return nil
+	end
+	local anchor = chestAnchor(model)
+	if typeof(anchor) == 'Vector3' then
+		-- Slight lift so HRP is inside the activation bubble, not under the floor.
+		return anchor + Vector3.new(0, 1.5, 0)
 	end
 	local ok, cf, size = pcall(function()
 		return model:GetBoundingBox()
@@ -2584,11 +2602,7 @@ local function chestStandPos(model)
 	if ok and typeof(cf) == 'CFrame' and typeof(size) == 'Vector3' and size.Magnitude > 0.5 then
 		return cf.Position
 	end
-	local anchor = chestAnchor(model)
-	if not anchor then
-		return nil
-	end
-	return anchor + Vector3.new(0, 2.2, 0)
+	return nil
 end
 
 local function chestActionOk(prompt)
@@ -2857,6 +2871,7 @@ local function collectChestRoute(silent, roomOnly)
 
 	routeBusy = true
 	rt.routeBusyAt = os.clock()
+	rt.chestLooting = true
 	local home = root.CFrame
 	local wasNoclip = noclipOn
 	local got = 0
@@ -2921,6 +2936,7 @@ local function collectChestRoute(silent, roomOnly)
 						if fightFirst() then
 							Pin.stop()
 							routeBusy = false
+							rt.chestLooting = false
 							routeLabel = nil
 							return got > 0
 						end
@@ -2931,6 +2947,7 @@ local function collectChestRoute(silent, roomOnly)
 						if fightFirst() then
 							Pin.stop()
 							routeBusy = false
+							rt.chestLooting = false
 							routeLabel = nil
 							return got > 0
 						end
@@ -2996,17 +3013,30 @@ local function collectChestRoute(silent, roomOnly)
 		Pin.stop()
 		routeLabel = nil
 		routeBusy = false
+		rt.chestLooting = false
 		routeDoneAt = os.clock()
 		lastChestGrab = os.clock()
 		if not silent or got > 0 then
 			Library:Notify(('Chest route: %d/%d looted'):format(got, #queue))
 		end
 	end
+	local okRun, errRun = pcall(function()
+		if roomOnly or farmBusy then
+			run()
+			return
+		end
+		task.spawn(run)
+	end)
+	if not okRun then
+		routeBusy = false
+		rt.chestLooting = false
+		routeLabel = nil
+		warn('[DL] chest route', errRun)
+		return false
+	end
 	if roomOnly or farmBusy then
-		run()
 		return got > 0
 	end
-	task.spawn(run)
 	return true
 end
 
@@ -3253,7 +3283,9 @@ function rt.grabPreBossChests(dungeon)
 		return 0
 	end
 	rt.chestFast = true
+	rt.chestLooting = true
 	local got = 0
+	local okPre, errPre = pcall(function()
 	for i, model in ipairs(list) do
 		if not on('DLAutoFarm') then
 			break
@@ -3268,7 +3300,7 @@ function rt.grabPreBossChests(dungeon)
 		pos = chestStandPos(model) or pos
 		rt.snapRoot(pos)
 		local prompt = chestPrompt(model)
-		local arm = os.clock() + 0.85
+		local arm = os.clock() + 1.2
 		while (not prompt or prompt.Enabled ~= true) and os.clock() < arm do
 			task.wait(0.04)
 			prompt = chestPrompt(model)
@@ -3281,8 +3313,15 @@ function rt.grabPreBossChests(dungeon)
 			pcall(function()
 				prompt.MaxActivationDistance = math.max(tonumber(prompt.MaxActivationDistance) or 8, 16)
 			end)
-			chestFiredAt[prompt] = nil
-			fireChestPrompt(prompt)
+			for _ = 1, 3 do
+				rt.snapRoot(chestStandPos(model) or pos)
+				chestFiredAt[prompt] = nil
+				fireChestPrompt(prompt)
+				task.wait(0.1)
+				if chestIsClaimed(model) or not chestStillOpen(model) then
+					break
+				end
+			end
 			local deadline = os.clock() + 0.45
 			while os.clock() < deadline and chestStillOpen(model) do
 				task.wait(0.03)
@@ -3290,17 +3329,15 @@ function rt.grabPreBossChests(dungeon)
 			if chestIsClaimed(model) or not chestStillOpen(model) then
 				got += 1
 				markChestDone(model)
-			else
-				fireChestPrompt(prompt)
-				task.wait(0.08)
-				if not chestStillOpen(model) then
-					got += 1
-					markChestDone(model)
-				end
 			end
 		end
 	end
+	end)
+	rt.chestLooting = false
 	rt.chestFast = false
+	if not okPre then
+		warn('[DL] grabPreBossChests', errPre)
+	end
 	return got
 end
 
@@ -3384,6 +3421,8 @@ function rt.lootRoomChests(dungeon, idx)
 		return false
 	end
 	local got = 0
+	rt.chestLooting = true
+	local okLoot, errLoot = pcall(function()
 	for i, model in ipairs(list) do
 		if not on('DLAutoFarm') or rt.roomHasLiving(idx) then
 			break
@@ -3394,14 +3433,16 @@ function rt.lootRoomChests(dungeon, idx)
 			continue
 		end
 		rt.snapRoot(pos)
-		task.wait(0.06)
+		task.wait(0.08)
 		pos = chestStandPos(model) or pos
 		rt.snapRoot(pos)
 		local prompt = chestPrompt(model)
-		local armUntil = os.clock() + 0.35
+		-- Negative hover used to bury HRP under the Attachment so Enabled never
+		-- armed / fireproximityprompt was out of the server's 8-stud check.
+		local armUntil = os.clock() + 1.8
 		while (not prompt or prompt.Enabled ~= true) and os.clock() < armUntil do
 			if not on('DLAutoFarm') or rt.farmStop or rt.farmUserOff == true or rt.roomHasLiving(idx) then
-				return false
+				return
 			end
 			task.wait(0.05)
 			prompt = chestPrompt(model)
@@ -3412,12 +3453,21 @@ function rt.lootRoomChests(dungeon, idx)
 			pcall(function()
 				prompt.MaxActivationDistance = math.max(tonumber(prompt.MaxActivationDistance) or 8, 16)
 			end)
-			chestFiredAt[prompt] = nil
-			fireChestPrompt(prompt)
-			local deadline = os.clock() + 0.45
+			-- Stay snapped on the Attachment while firing (Pin Heartbeat can drift).
+			for _ = 1, 4 do
+				pos = chestStandPos(model) or pos
+				rt.snapRoot(pos)
+				chestFiredAt[prompt] = nil
+				fireChestPrompt(prompt)
+				task.wait(0.1)
+				if chestIsClaimed(model) or not chestStillOpen(model) then
+					break
+				end
+			end
+			local deadline = os.clock() + 0.55
 			while os.clock() < deadline and chestStillOpen(model) do
 				if not on('DLAutoFarm') or rt.farmStop or rt.farmUserOff == true then
-					return false
+					return
 				end
 				task.wait(0.05)
 			end
@@ -3425,18 +3475,15 @@ function rt.lootRoomChests(dungeon, idx)
 				got += 1
 				markChestDone(model)
 			else
-				fireChestPrompt(prompt)
-				task.wait(0.12)
-				if not chestStillOpen(model) then
-					got += 1
-					markChestDone(model)
-				else
-					-- Don't thrash the same chest every tour tick.
-					rt.chestSkip = rt.chestSkip or {}
-					rt.chestSkip[model] = os.clock() + 3
-				end
+				rt.chestSkip = rt.chestSkip or {}
+				rt.chestSkip[model] = os.clock() + 3
 			end
 		end
+	end
+	end)
+	rt.chestLooting = false
+	if not okLoot then
+		warn('[DL] lootRoomChests', errLoot)
 	end
 	rt.lootPassDone = rt.lootPassDone or {}
 	rt.lootPassDone[idx] = true
@@ -12876,23 +12923,69 @@ local BlessPick = (function()
 	-- farm path — the old 45-stud BasePart-only scan never reached them.
 	local shrineBusy, shrineNext = false, 0
 
+	local function shrineFloorId()
+		local dungeon = activeDungeonRoot()
+		if dungeon and type(dungeon.Name) == 'string' and dungeon.Name ~= '' then
+			return dungeon.Name
+		end
+		local id = tostring(rt.blessDungeonId or rt.farmDungeonId or '')
+		if id ~= '' then
+			return id
+		end
+		return tostring(LocalPlayer:GetAttribute('CurrentDungeon') or '')
+	end
+
+	local function snapStud(n, g)
+		g = g or 4
+		-- Round half away from zero so negatives match string.format('%.0f') grids.
+		local q = n / g
+		local r = q >= 0 and math.floor(q + 0.5) or math.ceil(q - 0.5)
+		return r * g
+	end
+
 	local function shrinePosKey(pos)
 		if typeof(pos) ~= 'Vector3' then
 			return nil
 		end
-		-- Include floor id — endless continue reuses similar XZ and the old
-		-- global key skipped the new altar.
-		local id = tostring(rt.blessDungeonId or rt.farmDungeonId or '')
-		return string.format('s:%s:%.0f:%.0f:%.0f', id, pos.X, pos.Y, pos.Z)
+		-- Stable floor id + 4-stud grid so pivot wobble / id flicker cannot
+		-- mint a fresh "unclaimed" key and re-warp to spent shrines.
+		local id = shrineFloorId()
+		local x = snapStud(pos.X, 4)
+		local y = snapStud(pos.Y, 4)
+		local z = snapStud(pos.Z, 4)
+		return string.format('s:%s:%d:%d:%d', id, x, y, z)
+	end
+
+	-- Position-only skip (survives Generated_ rename / empty blessDungeonId).
+	local function shrineXZKey(pos)
+		if typeof(pos) ~= 'Vector3' then
+			return nil
+		end
+		return string.format('xz:%d:%d', snapStud(pos.X, 4), snapStud(pos.Z, 4))
+	end
+
+	local function skipBucket()
+		local skip = rawget(getgenv(), 'DLShrineSkipKeys')
+		if type(skip) ~= 'table' then
+			skip = {}
+			getgenv().DLShrineSkipKeys = skip
+		end
+		return skip
 	end
 
 	local function shrineLooksSpent(model, prompt)
-		if prompt and prompt.Enabled == true then
-			return false
+		-- Enabled=false while far away is NORMAL (server arms in range).
+		-- Only treat as spent after we already stood on this altar this floor.
+		if not model and not prompt then
+			return true
 		end
-		-- Enabled=false is enough. Walking every ParticleEmitter under the
-		-- altar each shrineTick was a multi-ms hitch on Generated_ maps.
-		if prompt and prompt.Enabled ~= true then
+		rt.shrineTried = rt.shrineTried or {}
+		local ok, pos = pcall(function()
+			return model and model:GetPivot().Position
+		end)
+		local key = shrinePosKey(ok and pos or nil)
+		local tried = (model and rt.shrineTried[model]) or (key and rt.shrineTried[key])
+		if tried and prompt and prompt.Enabled ~= true then
 			return true
 		end
 		return false
@@ -12903,13 +12996,46 @@ local BlessPick = (function()
 		if model and rt.shrineUsed[model] then
 			return true
 		end
-		-- Do NOT key by model.Name — every floor's Blessing_Altar shares the
-		-- same name, so one claim blacklisted every later floor's shrine.
 		local key = shrinePosKey(pos)
 		if key and rt.shrineUsed[key] == true then
 			return true
 		end
-		return shrineLooksSpent(model, model and model:FindFirstChildWhichIsA('ProximityPrompt', true) or nil)
+		local skip = skipBucket()
+		if key and skip[key] == true then
+			return true
+		end
+		local xz = shrineXZKey(pos)
+		if xz and (skip[xz] == true or rt.shrineUsed[xz] == true) then
+			return true
+		end
+		-- Match any stored full/raw key near this altar (id / grid / %.0f mismatch).
+		if typeof(pos) == 'Vector3' then
+			for k, v in pairs(skip) do
+				if v == true and type(k) == 'string' then
+					local sx, _sy, sz = string.match(k, '^s:[^:]+:(-?%d+):(-?%d+):(-?%d+)$')
+					if sx and math.abs(tonumber(sx) - pos.X) <= 8 and math.abs(tonumber(sz) - pos.Z) <= 8 then
+						return true
+					end
+					local zx, zz = string.match(k, '^xz:(-?%d+):(-?%d+)$')
+					if zx and math.abs(tonumber(zx) - pos.X) <= 8 and math.abs(tonumber(zz) - pos.Z) <= 8 then
+						return true
+					end
+				end
+			end
+			-- Also honor prior-floor %.0f keys that shared this XZ.
+			local used = rt.shrineUsed
+			if type(used) == 'table' then
+				for k, v in pairs(used) do
+					if v == true and type(k) == 'string' then
+						local sx, _sy, sz = string.match(k, '^s:[^:]+:(-?%d+):(-?%d+):(-?%d+)$')
+						if sx and math.abs(tonumber(sx) - pos.X) <= 8 and math.abs(tonumber(sz) - pos.Z) <= 8 then
+							return true
+						end
+					end
+				end
+			end
+		end
+		return false
 	end
 
 	local function markShrineUsed(model, pos)
@@ -12917,9 +13043,46 @@ local BlessPick = (function()
 		if model then
 			rt.shrineUsed[model] = true
 		end
+		local skip = skipBucket()
 		local key = shrinePosKey(pos)
 		if key then
 			rt.shrineUsed[key] = true
+			skip[key] = true
+		end
+		local xz = shrineXZKey(pos)
+		if xz then
+			skip[xz] = true
+			rt.shrineUsed[xz] = true
+		end
+		-- Stamp common id variants so reloads / attribute ids cannot miss.
+		if typeof(pos) == 'Vector3' then
+			local x = snapStud(pos.X, 4)
+			local y = snapStud(pos.Y, 4)
+			local z = snapStud(pos.Z, 4)
+			-- Also stamp %.0f raw keys (legacy) so mid-session tables still hit.
+			local rx = math.floor(pos.X + (pos.X >= 0 and 0.5 or -0.5))
+			local ry = math.floor(pos.Y + (pos.Y >= 0 and 0.5 or -0.5))
+			local rz = math.floor(pos.Z + (pos.Z >= 0 and 0.5 or -0.5))
+			for _, id in ipairs({
+				shrineFloorId(),
+				tostring(LocalPlayer:GetAttribute('CurrentDungeon') or ''),
+				tostring(rt.farmDungeonId or ''),
+				'',
+			}) do
+				skip[string.format('s:%s:%d:%d:%d', id, x, y, z)] = true
+				skip[string.format('s:%s:%d:%d:%d', id, rx, ry, rz)] = true
+			end
+		end
+	end
+
+	local function markShrineTried(model, pos)
+		rt.shrineTried = rt.shrineTried or {}
+		if model then
+			rt.shrineTried[model] = true
+		end
+		local key = shrinePosKey(pos)
+		if key then
+			rt.shrineTried[key] = true
 		end
 	end
 
@@ -12936,6 +13099,7 @@ local BlessPick = (function()
 		end
 		rt.blessDungeonId = id
 		rt.shrineUsed = {}
+		rt.shrineTried = {}
 		shrineNext = 0
 		rt.blessPriAt = 0
 		rt.shrineDeepAt = 0
@@ -12951,6 +13115,7 @@ local BlessPick = (function()
 		end
 	end
 
+	-- Any unclaimed altar on this floor — Enabled may be false until we stand on it.
 	local function liveAltarIn(dungeon)
 		if not dungeon then
 			return nil
@@ -12960,9 +13125,6 @@ local BlessPick = (function()
 				return nil
 			end
 			local prompt = model:FindFirstChildWhichIsA('ProximityPrompt', true)
-			if not (prompt and prompt.Enabled == true) then
-				return nil
-			end
 			local ok, pos = pcall(function()
 				return model:GetPivot().Position
 			end)
@@ -12971,6 +13133,17 @@ local BlessPick = (function()
 			end
 			if shrineAlreadyUsed(model, pos) then
 				return nil
+			end
+			if shrineLooksSpent(model, prompt) then
+				markShrineUsed(model, pos)
+				return nil
+			end
+			-- Prefer Receive Blessing prompts; still force bare altars.
+			if prompt then
+				local blob = (tostring(prompt.ActionText) .. ' ' .. tostring(prompt.ObjectText)):lower()
+				if blob ~= '' and not (blob:find('bless', 1, true) or blob:find('receive', 1, true)) then
+					return nil
+				end
 			end
 			return model
 		end
@@ -12987,18 +13160,35 @@ local BlessPick = (function()
 				end
 			end
 		end
+		-- Nested altar (some floors parent under a room).
+		if os.clock() - (rt.shrineDeepAt or 0) > 1.5 then
+			rt.shrineDeepAt = os.clock()
+			hit = take(dungeon:FindFirstChild('Blessing_Altar', true))
+			if hit then
+				return hit
+			end
+		end
 		return nil
 	end
 
+	local function blessWanted()
+		-- Force while autofarm is on even if the bless toggle was left off —
+		-- user asked to always grab shrines without breaking farm.
+		return on('DLAutoBless') or farmBusy == true
+	end
+
 	function api.shrineTick()
-		if not on('DLAutoBless') or shrineBusy or routeBusy or rt.refillBusy or rt.refillUrgent then
+		if not blessWanted() or shrineBusy or rt.refillBusy or rt.refillUrgent then
+			return
+		end
+		-- Chest routes can wait one tick; shrines beat everything else.
+		if routeBusy and routeLabel ~= 'blessing shrine' and not rt.blessFromFarm then
 			return
 		end
 		resetShrineFloor(activeDungeonRoot())
-		-- Live unused altar on this floor always wins over shrineNext cooldown
-		-- left over from the previous floor's claim.
 		local dungeonNow = activeDungeonRoot()
-		if liveAltarIn(dungeonNow) then
+		local pending = liveAltarIn(dungeonNow)
+		if pending then
 			shrineNext = 0
 		elseif os.clock() < shrineNext then
 			return
@@ -13011,10 +13201,11 @@ local BlessPick = (function()
 		if not root then
 			return
 		end
-		if api.open() then
+		if api.open(true) then
+			pcall(api.run, true)
 			return
 		end
-		local maxDist = 4000
+		local maxDist = 8000
 		local bestPos, bestDist, bestPrompt, bestModel = nil, maxDist, nil, nil
 		local function consider(model, prompt)
 			local part = prompt and prompt.Parent
@@ -13033,15 +13224,19 @@ local BlessPick = (function()
 				return
 			end
 			if shrineAlreadyUsed(model, pos) then
-				-- Only persist spent when the prompt is actually dead — do not
-				-- mark a still-streaming altar just because a name key matched.
-				if shrineLooksSpent(model, prompt) then
-					markShrineUsed(model, pos)
-				end
 				return
 			end
-			-- Template / spent copies have no live Receive Blessing prompt.
-			if not (prompt and prompt.Enabled == true) then
+			if shrineLooksSpent(model, prompt) then
+				markShrineUsed(model, pos)
+				return
+			end
+			-- FORCE: accept Enabled=false. Server arms the prompt in range.
+			if prompt then
+				local blob = (tostring(prompt.ActionText) .. ' ' .. tostring(prompt.ObjectText)):lower()
+				if blob ~= '' and not (blob:find('bless', 1, true) or blob:find('receive', 1, true) or blob:find('altar', 1, true)) then
+					return
+				end
+			elseif not model then
 				return
 			end
 			local dist = (pos - root.Position).Magnitude
@@ -13051,7 +13246,6 @@ local BlessPick = (function()
 		end
 		for _, gen in ipairs(workspace:GetChildren()) do
 			if type(gen.Name) == 'string' and gen.Name:sub(1, 10) == 'Generated_' then
-				-- Cheap named hits first (Blessing_Altar is top-level on most floors).
 				local named = gen:FindFirstChild('Blessing_Altar')
 				if named then
 					consider(named, named:FindFirstChildWhichIsA('ProximityPrompt', true))
@@ -13066,13 +13260,9 @@ local BlessPick = (function()
 				end
 			end
 		end
-		-- Deep prompt scan is rare. 1.2s while farming was hitching every tick
-		-- that missed a top-level name.
 		if not bestModel then
 			local dungeon = activeDungeonRoot()
-			local gap = 2.5
-			if dungeon and os.clock() - (rt.shrineDeepAt or 0) > gap then
-				rt.shrineDeepAt = os.clock()
+			if dungeon then
 				local altar = dungeon:FindFirstChild('Blessing_Altar', true)
 				if altar then
 					consider(altar, altar:FindFirstChildWhichIsA('ProximityPrompt', true))
@@ -13084,6 +13274,10 @@ local BlessPick = (function()
 		end
 		shrineBusy = true
 		rt.shrineBusyAt = os.clock()
+		-- Keep the farm target so we resume the same fight after the grab.
+		if rt.farmFightNpc and enemyAlive(rt.farmFightNpc) then
+			rt.farmReturnNpc = rt.farmFightNpc
+		end
 		task.spawn(function()
 			local ok, err = pcall(function()
 			local home = root.CFrame
@@ -13094,48 +13288,63 @@ local BlessPick = (function()
 			pcall(setCharNoclip, true)
 			routeLabel = 'blessing shrine'
 			farmLabel = 'blessing shrine'
-			-- Stand on the PromptAttachment itself — altar mesh has CanQuery=false so
-			-- floor snaps can miss and leave you out of the 10-stud hold range.
+			markShrineTried(bestModel, bestPos)
 			local stand = bestPos + Vector3.new(0, 3, 0)
 			if bestPrompt then
 				local ranged = promptStandPos(bestPrompt, bestModel)
-				if ranged and (ranged - bestPos).Magnitude <= 8 then
+				if ranged and (ranged - bestPos).Magnitude <= 12 then
 					stand = ranged
 				end
 			end
+			-- Hard snap onto the altar — soft pin used to leave us short.
 			Pin.at(stand, true)
-			task.wait(0.08)
-			local deadline = os.clock() + 3.5
+			pcall(function()
+				local live = routeRoot()
+				if live then
+					live.CFrame = CFrame.new(stand) * (live.CFrame - live.CFrame.Position)
+					live.AssemblyLinearVelocity = Vector3.zero
+				end
+			end)
+			task.wait(0.12)
+			local deadline = os.clock() + 5.0
 			local opened = false
 			while os.clock() < deadline and currentInstance() do
 				if api.open(true) then
 					opened = true
 					break
 				end
-				if bestPrompt and bestPrompt.Parent and bestPrompt.Enabled then
-					chestFiredAt[bestPrompt] = nil
-					fireChestPrompt(bestPrompt)
-				elseif bestModel then
-					local p = bestModel:FindFirstChildWhichIsA('ProximityPrompt', true)
-					if p and p.Enabled then
-						bestPrompt = p
-						chestFiredAt[p] = nil
-						fireChestPrompt(p)
+				bestPrompt = (bestModel and bestModel:FindFirstChildWhichIsA('ProximityPrompt', true)) or bestPrompt
+				if bestPrompt and bestPrompt.Parent then
+					pcall(function()
+						bestPrompt.MaxActivationDistance = math.max(tonumber(bestPrompt.MaxActivationDistance) or 10, 20)
+						bestPrompt.Enabled = true
+					end)
+					if bestPrompt.Enabled then
+						chestFiredAt[bestPrompt] = nil
+						fireChestPrompt(bestPrompt)
 					end
 				end
-				task.wait(0.08)
+				Pin.at(stand, true)
+				task.wait(0.1)
 			end
 			local picked = false
 			if opened or api.open(true) then
 				picked = api.run(true) == true
+				-- Panel can take a beat after the prompt.
+				if not picked then
+					task.wait(0.15)
+					picked = api.run(true) == true
+				end
 			end
-			if picked or opened or shrineLooksSpent(bestModel, bestPrompt)
-				or (bestPrompt and bestPrompt.Parent and bestPrompt.Enabled ~= true)
-			then
+			if picked or opened then
+				markShrineUsed(bestModel, bestPos)
+			elseif bestPrompt and bestPrompt.Parent and bestPrompt.Enabled ~= true then
+				-- Stood on it; still dead → spent.
 				markShrineUsed(bestModel, bestPos)
 			end
+			-- Resume farm stand. Do not freeze on the altar.
 			local live = routeRoot()
-			if live then
+			if live and not farmBusy then
 				pcall(function()
 					live.CFrame = home
 					live.AssemblyLinearVelocity = Vector3.zero
@@ -13151,16 +13360,24 @@ local BlessPick = (function()
 			elseif farmBusy then
 				noclipOn = true
 			end
-			Pin.stop()
+			-- Farm owns the pin again via holdOnEnemy / tour — do not hard-unbind.
+			if farmBusy then
+				Pin.station()
+			else
+				Pin.stop()
+			end
 			routeLabel = nil
 			if shrineAlreadyUsed(bestModel, bestPos) then
-				shrineNext = os.clock() + 8
+				shrineNext = os.clock() + 6
 			else
-				shrineNext = os.clock() + 2.5
+				shrineNext = os.clock() + 1.5
 			end
 			end)
 			routeBusy = false
 			shrineBusy = false
+			if not ok and err then
+				warn('[DL] shrine', err)
+			end
 		end)
 	end
 
@@ -13170,13 +13387,13 @@ local BlessPick = (function()
 
 	-- True = farm must yield. Blessings beat specials, fight-return, and rooms.
 	function api.farmPriority()
-		if not on('DLAutoBless') then
+		if not blessWanted() then
 			return false
 		end
 		local dungeon = activeDungeonRoot()
 		resetShrineFloor(dungeon)
 		if shrineBusy then
-			if os.clock() - (rt.shrineBusyAt or 0) > 10 then
+			if os.clock() - (rt.shrineBusyAt or 0) > 12 then
 				shrineBusy = false
 				routeBusy = false
 			else
@@ -13186,11 +13403,10 @@ local BlessPick = (function()
 		end
 		local now = os.clock()
 		local pending = liveAltarIn(dungeon)
-		-- New floor / live altar: do not let the 0.75s throttle hand the tour
-		-- to rooms before the shrine trip starts.
+		-- Force: any unclaimed altar holds the farm until the grab finishes.
 		if pending then
 			shrineNext = 0
-			if now - (rt.blessPriAt or 0) >= 0.2 then
+			if now - (rt.blessPriAt or 0) >= 0.15 then
 				rt.blessPriAt = now
 				if api.open(true) then
 					farmLabel = 'blessing'
@@ -13205,12 +13421,9 @@ local BlessPick = (function()
 				farmLabel = 'blessing shrine'
 				return true
 			end
-			-- Altar is up but tick has not claimed yet — still hold the farm.
 			farmLabel = 'blessing shrine'
 			return true
 		end
-		-- Throttle shrine hunts when nothing is pending. Calling shrineTick
-		-- every farm yield scanned Generated_ children constantly.
 		if now - (rt.blessPriAt or 0) < 0.75 then
 			return false
 		end
@@ -13267,6 +13480,37 @@ local BlessPick = (function()
 	rt.blessFarmPriority = api.farmPriority
 	rt.blessBusy = api.busy
 	rt.shrineRoomDone = api.roomIsSpent
+
+	function api.markAllUsed()
+		local dungeon = activeDungeonRoot()
+		resetShrineFloor(dungeon)
+		if not dungeon then
+			return 0
+		end
+		local n = 0
+		local seen = {}
+		local function take(model)
+			if not model or seen[model] then
+				return
+			end
+			seen[model] = true
+			local ok, pos = pcall(function()
+				return model:GetPivot().Position
+			end)
+			markShrineUsed(model, ok and pos or nil)
+			markShrineTried(model, ok and pos or nil)
+			n += 1
+		end
+		take(dungeon:FindFirstChild('Blessing_Altar'))
+		for _, d in ipairs(dungeon:GetDescendants()) do
+			if d.Name == 'Blessing_Altar' and d:IsA('Model') then
+				take(d)
+			end
+		end
+		Library:Notify(('Skipped %d blessing shrine(s)'):format(n))
+		return n
+	end
+	getgenv().DLMarkShrinesUsed = api.markAllUsed
 
 	return api
 end)()
@@ -13741,10 +13985,20 @@ local Replay = (function()
 					-- Same dungeon id can keep the old map name briefly; drop
 					-- shrine blacklist so the new floor altar is first again.
 					rt.shrineUsed = {}
+					rt.shrineTried = {}
 					rt.blessDungeonId = nil
 					rt.blessPriAt = 0
 					rt.shrineDeepAt = 0
 					Library:Notify('Endless continue')
+					-- Force shrine on the new floor before rooms resume.
+					task.defer(function()
+						task.wait(0.6)
+						pcall(function()
+							if type(rt.blessFarmPriority) == 'function' then
+								rt.blessFarmPriority()
+							end
+						end)
+					end)
 				end
 			end)
 			return
@@ -14986,6 +15240,58 @@ local Gear = (function()
 	-- level too, so upgrading an item puts it back in the running.
 	local rejected = {}
 
+	-- EquipmentData.StatDisplayNames.LifeSteal = "Lifesteal". Rolled lines live
+	-- on item.Stats; guaranteed lines use GuaranteedStat.StatKey.
+	isLifestealKey = function(s)
+		s = string.lower((tostring(s or ''):gsub('[^%a]', '')))
+		return s:find('lifesteal', 1, true) ~= nil
+	end
+
+	lifestealAmount = function(item)
+		if type(item) ~= 'table' then
+			return 0
+		end
+		local best = 0
+		local function take(v)
+			if type(v) == 'table' then
+				v = v.Value or v.Amount or v.Magnitude or v.Percent
+			end
+			v = tonumber(v)
+			if v and v > best then
+				best = v
+			end
+		end
+		local function consider(node, depth)
+			if depth > 5 or type(node) ~= 'table' then
+				return
+			end
+			if isLifestealKey(node.StatKey)
+				or isLifestealKey(node.Key)
+				or isLifestealKey(node.Name)
+				or isLifestealKey(node.DisplayName)
+				or isLifestealKey(node.Computed)
+			then
+				take(node)
+			end
+			for k, v in pairs(node) do
+				if isLifestealKey(k) then
+					take(v)
+				end
+				if type(v) == 'table' then
+					consider(v, depth + 1)
+				end
+			end
+		end
+		consider(item.GuaranteedStat, 0)
+		consider(item.Stats, 0)
+		take(item.LifeSteal)
+		return best
+	end
+
+	hasLifesteal = function(item)
+		return lifestealAmount(item) > 0
+	end
+
 	local function rejectKey(slot, item)
 		return ('%s|%s|%s'):format(tostring(slot), tostring(item.GUID), tostring(item.EnchantLevel or 0))
 	end
@@ -15232,75 +15538,34 @@ local Gear = (function()
 		return swapped
 	end
 
-	-- Junk = the equipped piece in that slot would show this item's main stat as
-	-- red (▼). Rings use BaseDamage; Head/Body use GuaranteedStat. LevelReq is
-	-- ignored — a 72 ring with worse damage than the 70 you wear is still junk.
-	-- Locked, Judgement-named, Lifesteal, and weapons stay.
+	-- Junk = roll quality under the keep floor (game Quality %). Uses the same
+	-- EquipmentData.ComputeItemRollQuality the inventory panel paints.
+	-- Locked items and equipped pieces stay. Only Head / Body / Ring.
 	local SELL_SLOTS = { Head = true, Body = true, Ring = true }
-	local KEEP_NAME = {
-		'judgement', 'judgment',
-	}
+	local JUNK_QUALITY = 0.95 -- sell strictly below 95%
 
-	local function itemLabel(item)
-		return (
-			tostring(item.DisplayName or '')
-			.. ' '
-			.. tostring(item.Name or '')
-			.. ' '
-			.. tostring(item.ItemId or '')
-		):lower()
+	local equipDataMod
+	local function equipmentData()
+		if equipDataMod ~= nil then
+			return equipDataMod
+		end
+		local ok, mod = pcall(function()
+			return require(ReplicatedStorage.GameInfo.EquipmentData)
+		end)
+		equipDataMod = (ok and type(mod) == 'table') and mod or false
+		return equipDataMod
 	end
 
-	-- EquipmentData.StatDisplayNames.LifeSteal = "Lifesteal". Rolled lines live
-	-- on item.Stats; guaranteed lines use GuaranteedStat.StatKey.
-	isLifestealKey = function(s)
-		s = string.lower((tostring(s or ''):gsub('[^%a]', '')))
-		return s:find('lifesteal', 1, true) ~= nil
-	end
-
-	lifestealAmount = function(item)
-		if type(item) ~= 'table' then
-			return 0
+	local function rollQuality(item)
+		local ed = equipmentData()
+		if not ed or type(ed.ComputeItemRollQuality) ~= 'function' or type(item) ~= 'table' then
+			return nil
 		end
-		local best = 0
-		local function take(v)
-			if type(v) == 'table' then
-				v = v.Value or v.Amount or v.Magnitude or v.Percent
-			end
-			v = tonumber(v)
-			if v and v > best then
-				best = v
-			end
+		local ok, q = pcall(ed.ComputeItemRollQuality, item)
+		if ok and type(q) == 'number' then
+			return q
 		end
-		local function consider(node, depth)
-			if depth > 5 or type(node) ~= 'table' then
-				return
-			end
-			if isLifestealKey(node.StatKey)
-				or isLifestealKey(node.Key)
-				or isLifestealKey(node.Name)
-				or isLifestealKey(node.DisplayName)
-				or isLifestealKey(node.Computed)
-			then
-				take(node)
-			end
-			for k, v in pairs(node) do
-				if isLifestealKey(k) then
-					take(v)
-				end
-				if type(v) == 'table' then
-					consider(v, depth + 1)
-				end
-			end
-		end
-		consider(item.GuaranteedStat, 0)
-		consider(item.Stats, 0)
-		take(item.LifeSteal)
-		return best
-	end
-
-	hasLifesteal = function(item)
-		return lifestealAmount(item) > 0
+		return nil
 	end
 
 	local function mustKeep(item)
@@ -15313,50 +15578,7 @@ local Gear = (function()
 		if not SELL_SLOTS[tostring(item.Slot or '')] then
 			return true
 		end
-		if hasLifesteal(item) then
-			return true
-		end
-		local label = itemLabel(item)
-		for _, needle in ipairs(KEEP_NAME) do
-			if label:find(needle, 1, true) then
-				return true
-			end
-		end
 		return false
-	end
-
-	-- Same number the inventory paints green ▲ / red ▼ against the worn piece.
-	local function primaryPower(item)
-		if type(item) ~= 'table' then
-			return nil, 0
-		end
-		local bd = tonumber(item.BaseDamage)
-		if bd then
-			return 'BaseDamage', bd
-		end
-		local g = item.GuaranteedStat
-		if type(g) == 'table' then
-			return tostring(g.StatKey or g.Key or 'G'), tonumber(g.Value) or 0
-		end
-		return nil, 0
-	end
-
-	local function isDowngrade(item, eq)
-		if type(eq) ~= 'table' then
-			return false
-		end
-		local ik, iv = primaryPower(item)
-		local ek, ev = primaryPower(eq)
-		if ik and ek and ik == ek then
-			return iv < ev
-		end
-		if ik == 'BaseDamage' and ev then
-			return iv < ev
-		end
-		if iv and (not ev or ev == 0) then
-			return false
-		end
-		return api.score(item) < api.score(eq)
 	end
 
 	function api.junkList()
@@ -15380,13 +15602,18 @@ local Gear = (function()
 				and not wornGuid[item.GUID]
 				and not mustKeep(item)
 			then
-				local eq = worn[item.Slot]
-				if type(eq) == 'table' and isDowngrade(item, eq) then
+				local q = rollQuality(item)
+				if type(q) == 'number' and q < JUNK_QUALITY then
 					list[#list + 1] = item
 				end
 			end
 		end
 		table.sort(list, function(a, b)
+			local qa = rollQuality(a) or 0
+			local qb = rollQuality(b) or 0
+			if qa ~= qb then
+				return qa < qb
+			end
 			return api.score(a) < api.score(b)
 		end)
 		return list
@@ -15674,6 +15901,20 @@ local Gear = (function()
 		end
 		inv.Visible = true
 		inv.Active = true
+		-- Game parks closed panels at Y ≈ -0.98. :open() now flips isOpen /
+		-- Visible without tweening back, so force the saved on-screen slot.
+		local home = obj and typeof(obj.originalPosition) == 'UDim2' and obj.originalPosition
+			or UDim2.new(0.5, 0, 0.5, 0)
+		if inv.Position ~= home then
+			inv.Position = home
+		end
+		if inv.AnchorPoint.X ~= 0.5 or inv.AnchorPoint.Y ~= 0.5 then
+			inv.AnchorPoint = Vector2.new(0.5, 0.5)
+		end
+		-- Absolute Y still off-screen (tween fight / bad originalPosition).
+		if inv.AbsolutePosition.Y < -40 then
+			inv.Position = UDim2.new(0.5, 0, 0.5, 0)
+		end
 		showItemGrid(inv)
 		hideDungeonLootOverlay(main)
 		local btn = hudInvButton(main)
@@ -15791,7 +16032,10 @@ local Gear = (function()
 		local want = force
 		if want == nil then
 			if obj ~= nil then
-				want = obj.isOpen ~= true
+				-- Prefer on-screen visibility: isOpen can be true while the
+				-- panel is still parked at Y ≈ -1 (looks "closed").
+				local off = inv and inv.AbsolutePosition.Y < -40
+				want = obj.isOpen ~= true or off == true or (inv and inv.Visible ~= true)
 			else
 				want = not (rt.invOpen == true)
 			end
@@ -16372,12 +16616,15 @@ PickBox:AddLabel('Takes them left to right; rarity is hidden until opened.')
 local BlessBox = RunTab:AddRightGroupbox('Blessings')
 BlessBox:AddToggle('DLAutoBless', {
 	Text = 'Auto pick best damage blessing',
-	Default = false,
-	Tooltip = 'Teleports to Blessing_Altar prompts in the dungeon (not just nearby), opens the panel, and picks the highest damage buff. Uses farm target range (0 = whole dungeon).',
+	Default = true,
+	Tooltip = 'Force-warps to Blessing_Altar (even when the prompt is still disabled at range), opens the panel, and picks the highest damage buff. Also runs automatically while Auto farm is on. Farm resumes the same fight after.',
 }):OnChanged(function(v)
 	Library:Notify(v and 'Auto blessing on' or 'Auto blessing off')
 	if v then
-		task.spawn(BlessPick.run, true)
+		task.spawn(function()
+			pcall(BlessPick.shrineTick)
+			pcall(BlessPick.run, true)
+		end)
 	end
 end)
 BlessBox:AddButton('Pick blessing now', function()
@@ -16802,7 +17049,7 @@ GearBox:AddDropdown('DLJunkMode', {
 GearBox:AddToggle('DLAutoJunk', {
 	Text = 'Auto clear junk gear',
 	Default = false,
-	Tooltip = 'Sells/deletes Head, Body, or Ring pieces whose main stat is red vs what you wear (worse Base Damage / guaranteed). Sells over-level junk too. Never weapons. Keeps Locked, Judgement, and Lifesteal.',
+	Tooltip = 'Sells/deletes unlocked Head, Body, or Ring pieces under 95% Quality (same % as the inventory panel). Never weapons. Keeps Locked and equipped.',
 }):OnChanged(function(v)
 	Library:Notify(v and 'Auto junk clear on' or 'Auto junk clear off')
 	if v then
@@ -16813,7 +17060,7 @@ end)
 GearBox:AddButton('Clear junk now', function()
 	task.spawn(Gear.sellJunk, false)
 end)
-GearBox:AddLabel('Junk sell: Head / Body / Ring only. Red main-stat (▼) vs equipped = sell. Keeps weapons, Locked, Judgement, Lifesteal.')
+GearBox:AddLabel('Junk sell: Head / Body / Ring under 95% Quality. Keeps Locked + equipped. Never weapons.')
 
 local StatBox = DataTab:AddLeftGroupbox('Skill points')
 Stats.setLabel(StatBox:AddLabel('Level ? · reading…'))
