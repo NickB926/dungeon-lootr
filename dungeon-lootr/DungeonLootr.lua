@@ -93,7 +93,7 @@ Library.ToggleKeybind = { Value = 'Home' }
 Library.Animations = Library.Animations or {}
 Library.Animations.TabSwitch = false
 
-local DL_BUILD = '1.0.77'
+local DL_BUILD = '1.0.78'
 getgenv().DLBuild = DL_BUILD
 
 local Window = Library:CreateWindow({
@@ -9058,8 +9058,20 @@ local function farmLoop()
 	noclipOn = true
 	pcall(setCharNoclip, true)
 	local function step(name)
+		-- Charge the time since the last marker to the step that just ran, so a
+		-- pass that eats the frame can be attributed instead of guessed at.
+		local now = os.clock()
+		local prev = rt.farmStep
+		if prev and rt.farmStepAt then
+			local cost = rt.stepCost
+			if not cost then
+				cost = {}
+				rt.stepCost = cost
+			end
+			cost[prev] = (cost[prev] or 0) + (now - rt.farmStepAt)
+		end
 		rt.farmStep = name
-		rt.farmStepAt = os.clock()
+		rt.farmStepAt = now
 	end
 	step('enter')
 	while currentInstance() and on('DLAutoFarm') and inDungeonFarm() do
@@ -14846,7 +14858,22 @@ getgenv().DLFarmDebug = function()
 		roomFilter = rt.farmRoomFilter,
 		routeBusy = routeBusy,
 		crash = rt.farmCrashErr,
+		cost = rt.stepCost,
 	}
+end
+getgenv().DLFarmCost = function(reset)
+	local out = {}
+	for k, v in pairs(rt.stepCost or {}) do
+		out[#out + 1] = { k, v }
+	end
+	table.sort(out, function(a, b)
+		return a[2] > b[2]
+	end)
+	if reset then
+		rt.stepCost = {}
+		rt.farmTicks = 0
+	end
+	return out, rt.farmTicks
 end
 getgenv().DLQuestPending = function()
 	local list, reachable = QuestClaim.pending()
