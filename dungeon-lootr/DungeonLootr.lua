@@ -93,7 +93,7 @@ Library.ToggleKeybind = { Value = 'Home' }
 Library.Animations = Library.Animations or {}
 Library.Animations.TabSwitch = false
 
-local DL_BUILD = '1.0.73'
+local DL_BUILD = '1.0.74'
 getgenv().DLBuild = DL_BUILD
 
 local Window = Library:CreateWindow({
@@ -9108,6 +9108,12 @@ local function startFarm()
 		farmLabel = nil
 		farmThread = nil
 		if not ok then
+			-- Same-frame restarts hid this: the toast flashed, the label reset, and
+			-- the loop never got far enough to move. Keep the text readable.
+			rt.farmCrashErr = tostring(err)
+			rt.farmCrashAt = os.clock()
+			rt.farmCrashN = (rt.farmCrashN or 0) + 1
+			warn('[DL] auto farm crashed: ' .. tostring(err))
 			Library:Notify('Auto farm stopped: ' .. tostring(err))
 		end
 	end)
@@ -9116,6 +9122,12 @@ end
 -- Watchdog: if the farm thread dies while the toggle is still on, bring it back.
 local function autoFarmTick()
 	if on('DLAutoFarm') then
+		-- Back off after a crash so a repeating error cannot respawn the thread
+		-- every frame (that read as "farm on, doing nothing").
+		if rt.farmCrashAt and os.clock() - rt.farmCrashAt < 1.5 then
+			farmLabel = 'crashed · ' .. tostring(rt.farmCrashErr):sub(-40)
+			return
+		end
 		if not farmThread then
 			startFarm()
 		end
@@ -14731,7 +14743,7 @@ getgenv().DLSetFarm = function(v)
 	end
 end
 getgenv().DLFarmStatus = function()
-	return farmLabel, farmKills, farmBusy
+	return farmLabel, farmKills, farmBusy, rt.farmCrashErr, rt.farmCrashN
 end
 getgenv().DLQuestPending = function()
 	local list, reachable = QuestClaim.pending()

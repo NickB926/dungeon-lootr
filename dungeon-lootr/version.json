@@ -1,6 +1,6 @@
 {
-    "version":  "1.0.73",
-    "message":  "farm M1 despite stuck SkillIFrame; attack nearby aggro packs",
+    "version":  "1.0.74",
+    "message":  "log auto farm crash to console and back off restarts",
     "files":  [
                   "dungeon-lootr/launch.lua",
                   "dungeon-lootr/DungeonLootr.lua",
