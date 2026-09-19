@@ -93,7 +93,7 @@ Library.ToggleKeybind = { Value = 'Home' }
 Library.Animations = Library.Animations or {}
 Library.Animations.TabSwitch = false
 
-local DL_BUILD = '1.0.75'
+local DL_BUILD = '1.0.76'
 getgenv().DLBuild = DL_BUILD
 
 local Window = Library:CreateWindow({
@@ -5160,15 +5160,23 @@ local Rooms = (function()
 		if not rf then
 			return rt.session
 		end
-		local ok, res = pcall(function()
-			return rf:InvokeServer()
-		end)
-		if ok and type(res) == 'table' then
-			rt.session = res
-			rt.sessionAt = now
-			return res
+		-- InvokeServer blocks the calling thread until the server answers, and a
+		-- reply that never comes parked the whole farm loop (farm on, label blank,
+		-- no teleports). Refresh off-thread and keep serving the last answer.
+		local inflight = rt.sessionBusyAt and now - rt.sessionBusyAt < 10
+		if not inflight then
+			rt.sessionBusyAt = now
+			task.spawn(function()
+				local ok, res = pcall(function()
+					return rf:InvokeServer()
+				end)
+				if ok and type(res) == 'table' then
+					rt.session = res
+				end
+				rt.sessionAt = os.clock()
+				rt.sessionBusyAt = nil
+			end)
 		end
-		rt.sessionAt = now
 		return rt.session
 	end
 
@@ -6921,8 +6929,13 @@ local function isFinalBoss(npc)
 	if npc:GetAttribute('IsBoss') == true then
 		return true
 	end
+	-- Attribute checks first: the phase read goes through a remote, and asking for
+	-- it on every fodder in the room is pure overhead.
+	if not isBossEnemy(npc) then
+		return false
+	end
 	local phase = Rooms.sessionPhase()
-	return (phase == 'BossPhase' or phase == 'Boss') and isBossEnemy(npc)
+	return phase == 'BossPhase' or phase == 'Boss'
 end
 
 local function eachFarmNpc(fn)

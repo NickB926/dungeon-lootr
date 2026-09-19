@@ -1,6 +1,6 @@
 {
-    "version":  "1.0.75",
-    "message":  "trace auto farm loop step for stall diagnosis",
+    "version":  "1.0.76",
+    "message":  "stop farm parking on a hung GetSessionInfo remote",
     "files":  [
                   "dungeon-lootr/launch.lua",
                   "dungeon-lootr/DungeonLootr.lua",
