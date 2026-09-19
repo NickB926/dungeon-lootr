@@ -1,6 +1,6 @@
 {
-    "version":  "1.0.78",
-    "message":  "fix client freeze: cache corridor tests, throttle sweep marks, yield each farm pass",
+    "version":  "1.0.79",
+    "message":  "fix 4fps freeze: gate blessing UI scan on shrine proximity + cache open check",
     "files":  [
                   "dungeon-lootr/launch.lua",
                   "dungeon-lootr/DungeonLootr.lua",

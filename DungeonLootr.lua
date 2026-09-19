@@ -93,7 +93,7 @@ Library.ToggleKeybind = { Value = 'Home' }
 Library.Animations = Library.Animations or {}
 Library.Animations.TabSwitch = false
 
-local DL_BUILD = '1.0.78'
+local DL_BUILD = '1.0.79'
 getgenv().DLBuild = DL_BUILD
 
 local Window = Library:CreateWindow({
@@ -10560,11 +10560,14 @@ local BlessPick = (function()
 		end
 		local options = {}
 		local seen = {}
+		-- Order matters: the title lookup is one hash probe, while isVisible and
+		-- skipped both walk ancestors. Filtering on the name first keeps the walks
+		-- off the ~32k labels that are not blessing cards.
 		for _, d in ipairs(pg:GetDescendants()) do
-			if (d:IsA('TextLabel') or d:IsA('TextButton')) and isVisible(d) and not skipped(d) then
+			if d:IsA('TextLabel') or d:IsA('TextButton') then
 				local title = tostring(d.Text)
 				local buff = index[title]
-				if buff and not seen[d] then
+				if buff and not seen[d] and isVisible(d) and not skipped(d) then
 					seen[d] = true
 					local btn = d
 					if not btn:IsA('GuiButton') then
@@ -10603,8 +10606,19 @@ local BlessPick = (function()
 		return options
 	end
 
-	function api.open()
-		return #collectOptions() >= 2
+	-- collectOptions walks every PlayerGui descendant (~32k in a loaded dungeon),
+	-- which costs ~0.2s. The farm loop asks "is a blessing open?" once per pass, so
+	-- an unthrottled answer alone dropped the client to 4 fps. Cache the verdict;
+	-- a card that appears is still caught within a fifth of a second.
+	local openAt, openWas = 0, false
+	function api.open(force)
+		local now = os.clock()
+		if not force and now - openAt < 0.2 then
+			return openWas
+		end
+		openAt = now
+		openWas = #collectOptions() >= 2
+		return openWas
 	end
 
 	function api.run(silent)
@@ -10890,10 +10904,37 @@ local BlessPick = (function()
 				return true
 			end
 		end
-		if api.open() then
-			local root = routeRoot()
-			local near = false
-			if root then
+		-- Proximity first: it is a handful of top-level name compares, while
+		-- api.open() scans the whole PlayerGui tree. Only a player standing at the
+		-- altar can have cards up, so the cheap test gates the expensive one.
+		local root = routeRoot()
+		local near = false
+		if root then
+			for _, gen in ipairs(workspace:GetChildren()) do
+				if type(gen.Name) == 'string' and gen.Name:sub(1, 10) == 'Generated_' then
+					for _, child in ipairs(gen:GetChildren()) do
+						local low = string.lower(child.Name)
+						if low:find('bless', 1, true) or low:find('shrine', 1, true) then
+							local ok, pos = pcall(function()
+								return child:GetPivot().Position
+							end)
+							if ok and typeof(pos) == 'Vector3' and (pos - root.Position).Magnitude < 28 then
+								near = true
+								break
+							end
+						end
+					end
+				end
+				if near then
+					break
+				end
+			end
+		end
+		if near and api.open() then
+			farmLabel = 'blessing'
+			local picked = api.run(true) == true
+			if picked then
+				local bestM, bestP, bestD = nil, nil, 9e9
 				for _, gen in ipairs(workspace:GetChildren()) do
 					if type(gen.Name) == 'string' and gen.Name:sub(1, 10) == 'Generated_' then
 						for _, child in ipairs(gen:GetChildren()) do
@@ -10902,45 +10943,19 @@ local BlessPick = (function()
 								local ok, pos = pcall(function()
 									return child:GetPivot().Position
 								end)
-								if ok and typeof(pos) == 'Vector3' and (pos - root.Position).Magnitude < 28 then
-									near = true
-									break
-								end
-							end
-						end
-					end
-					if near then
-						break
-					end
-				end
-			end
-			if near then
-				farmLabel = 'blessing'
-				local picked = api.run(true) == true
-				if picked then
-					local bestM, bestP, bestD = nil, nil, 9e9
-					for _, gen in ipairs(workspace:GetChildren()) do
-						if type(gen.Name) == 'string' and gen.Name:sub(1, 10) == 'Generated_' then
-							for _, child in ipairs(gen:GetChildren()) do
-								local low = string.lower(child.Name)
-								if low:find('bless', 1, true) or low:find('shrine', 1, true) then
-									local ok, pos = pcall(function()
-										return child:GetPivot().Position
-									end)
-									if ok and pos and root then
-										local d = (pos - root.Position).Magnitude
-										if d < bestD then
-											bestM, bestP, bestD = child, pos, d
-										end
+								if ok and pos and root then
+									local d = (pos - root.Position).Magnitude
+									if d < bestD then
+										bestM, bestP, bestD = child, pos, d
 									end
 								end
 							end
 						end
 					end
-					markShrineUsed(bestM, bestP)
 				end
-				return true
+				markShrineUsed(bestM, bestP)
 			end
+			return true
 		end
 		rt.blessFromFarm = true
 		pcall(api.shrineTick)
