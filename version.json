@@ -1,6 +1,6 @@
 {
-    "version":  "1.0.88",
-    "message":  "unstick loot: walk to enabled chests instead of skip-looping in the zone",
+    "version":  "1.0.41",
+    "message":  "Go to the floor boss instead of touring empty rooms",
     "files":  [
                   "dungeon-lootr/launch.lua",
                   "dungeon-lootr/DungeonLootr.lua",

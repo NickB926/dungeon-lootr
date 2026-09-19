@@ -52,14 +52,62 @@ if type(getgenv().DLConns) == 'table' then
 end
 getgenv().DLConns = {}
 
--- Drop a position hold left behind by a previous instance — unless this is a
--- farm reload, where yanking the pin + collision is what dumps you on the floor.
-if getgenv().DLPinConn and not resumeFarm then
-	pcall(function()
-		getgenv().DLPinConn:Disconnect()
-	end)
-	getgenv().DLPinConn = nil
+-- Always drop the previous pin writers. Leaving them alive on farm-reload
+-- stacked Heartbeat/PreSim (50+ conns) and was the hitch. The new copy
+-- re-binds immediately; resumeFarm only skips the floor dump in Pin.stop.
+for _, key in ipairs({ 'DLPinConn', 'DLPinPreConn' }) do
+	local c = getgenv()[key]
+	if c then
+		pcall(function()
+			c:Disconnect()
+		end)
+		getgenv()[key] = nil
+	end
 end
+-- Older builds never tracked Pin in DLConns. Only disable Heartbeats whose
+-- callback source is our helper — nuking every ConnectionObject broke the
+-- game client and made hitching worse.
+pcall(function()
+	local function srcOf(c)
+		local fn = nil
+		pcall(function()
+			fn = c.Function
+		end)
+		if typeof(fn) ~= 'function' then
+			return nil
+		end
+		local ok, src = pcall(debug.info, fn, 's')
+		return ok and src or nil
+	end
+	local function isOurs(src)
+		if type(src) ~= 'string' then
+			return false
+		end
+		return src:find('DungeonLootr', 1, true) ~= nil
+			or src:find('dungeon-lootr', 1, true) ~= nil
+	end
+	local function killOurs(sig)
+		for _, c in ipairs(getconnections(sig)) do
+			local src = srcOf(c)
+			if isOurs(src) then
+				pcall(function()
+					if type(c.Disable) == 'function' then
+						c:Disable()
+					end
+				end)
+				pcall(function()
+					if type(c.Disconnect) == 'function' then
+						c:Disconnect()
+					end
+				end)
+			end
+		end
+	end
+	killOurs(RunService.Heartbeat)
+	if RunService.PreSimulation then
+		killOurs(RunService.PreSimulation)
+	end
+end)
 
 local function exists(path)
 	return type(isfile) == 'function' and isfile(path) == true
@@ -93,7 +141,7 @@ Library.ToggleKeybind = { Value = 'Home' }
 Library.Animations = Library.Animations or {}
 Library.Animations.TabSwitch = false
 
-local DL_BUILD = '1.0.88'
+local DL_BUILD = '1.0.41'
 getgenv().DLBuild = DL_BUILD
 
 local Window = Library:CreateWindow({
@@ -229,6 +277,8 @@ local farmHome = nil
 local farmKills = 0
 local farmFinished = {}
 local farmBan = {}
+-- Forward decl: farmHoldCf / refreshFarmFloor run before the real body below.
+local activeDungeonRoot
 local function farmSkipped(npc)
 	-- Chest-room mannequins have no Humanoid. Fighting them parks farm on the
 	-- dummy (skipFinal then also hides the floor boss).
@@ -400,9 +450,16 @@ rt.readHp = function()
 		end
 	end
 	local chosen
-	for _, s in ipairs(samples) do
-		if s.pct > 0 and (not chosen or s.pct < chosen.pct) then
-			chosen = s
+	local humPct = hum and hum.MaxHealth > 0 and ((hum.Health / hum.MaxHealth) * 100) or nil
+	-- Full / nearly-full humanoid wins. A leftover HUD "hp / huge max" used
+	-- to be the lowest sample and latched heal-wait at a full bar.
+	if humPct and humPct >= 90 then
+		chosen = { hp = hum.Health, max = hum.MaxHealth, pct = humPct }
+	else
+		for _, s in ipairs(samples) do
+			if s.pct > 0 and (not chosen or s.pct < chosen.pct) then
+				chosen = s
+			end
 		end
 	end
 	if not chosen then
@@ -437,7 +494,7 @@ rt.healResume = function()
 end
 
 -- Latch once HP drops under the drink/flee slider; stay latched until HP is
--- actually over the resume slider so a 40% sip does not send farm back in.
+-- actually at the resume slider so a 40% sip does not send farm back in.
 rt.updateHealWait = function(pct)
 	pct = tonumber(pct)
 	if not pct then
@@ -446,10 +503,18 @@ rt.updateHealWait = function(pct)
 	if pct <= 0 then
 		return false
 	end
+	local resume = rt.healResume()
+	local char = character()
+	local hum = char and char:FindFirstChildOfClass('Humanoid')
+	local humPct = hum and hum.MaxHealth > 0 and ((hum.Health / hum.MaxHealth) * 100) or nil
+	-- `>` never cleared at exactly 100 when resume was high, and a stale HUD
+	-- percent kept the latch while the bar was already full.
+	if pct >= resume or (humPct and humPct >= resume) then
+		rt.healWait = false
+		return false
+	end
 	if pct <= rt.healTrigger() then
 		rt.healWait = true
-	elseif pct > rt.healResume() then
-		rt.healWait = false
 	end
 	return rt.healWait == true
 end
@@ -460,7 +525,8 @@ rt.clearRefillHold = function()
 		n = tonumber(rt.PotionRefill.count()) or -1
 	end
 	local stale = type(rt.refillAt) == 'number' and (os.clock() - rt.refillAt) > 15
-	if n > 0 or stale then
+	local noneLeft = rt.PotionRefill and type(rt.PotionRefill.needs) == 'function' and rt.PotionRefill.needs() ~= true
+	if n > 0 or stale or noneLeft then
 		rt.refillBusy = false
 		rt.refillUrgent = false
 		if routeLabel == 'potion refill' then
@@ -813,7 +879,14 @@ local function scanEsp()
 					stations[#stations + 1] = child
 					if wantPotions then
 						seen[child] = true
-						setMark(child, 'Potion station', RARITY_COLOR.Potion)
+						local used = type(rt.PotionRefill) == 'table'
+							and type(rt.PotionRefill.isSpent) == 'function'
+							and rt.PotionRefill.isSpent(child)
+						if used then
+							setMark(child, 'Used pot', Color3.fromRGB(110, 110, 120))
+						else
+							setMark(child, 'Potion station', RARITY_COLOR.Potion)
+						end
 					end
 				elseif child.Name:sub(1, 7) == 'Locked_' then
 					doors[#doors + 1] = child
@@ -876,7 +949,14 @@ local function scanEsp()
 				end
 				if wantPotions then
 					seen[d] = true
-					setMark(d, 'Potion station', RARITY_COLOR.Potion)
+					local used = type(rt.PotionRefill) == 'table'
+						and type(rt.PotionRefill.isSpent) == 'function'
+						and rt.PotionRefill.isSpent(d)
+					if used then
+						setMark(d, 'Used pot', Color3.fromRGB(110, 110, 120))
+					else
+						setMark(d, 'Potion station', RARITY_COLOR.Potion)
+					end
 				end
 			end
 		end
@@ -1458,6 +1538,303 @@ end
 -- before the next render instead of letting the fall show for a frame.
 -- Callers pass a goal function, which keeps this free of any enemy/UI dependencies
 -- that are not defined until much later in the file.
+-- Negative hover + in a fight: one locked 90° look-up so the M1 box points up.
+-- Rebuild from a stored yaw — lookAt-chasing while pitched rolled the rig
+-- every Heartbeat, and stamping a drifted `here` walked it out of the room.
+function rt.hoverN()
+	-- Live slider wins. A stale hoverVal (and `not 0`) is what made +1
+	-- keep last fight's +13.
+	local s = Options.DLFarmHover and tonumber(Options.DLFarmHover.Value)
+	if s ~= nil then
+		rt.hoverVal = s
+		return s
+	end
+	return tonumber(rt.hoverVal) or 0
+end
+
+-- Slider hover only while fighting. Chest / gate / potion pins used to keep
+-- fy+hover and sit under the prompt (negative hover = unreachable chests).
+function rt.combatHover()
+	if routeBusy or rt.refillBusy or rt.refillUrgent or rt.healWait then
+		return 0
+	end
+	if not farmBusy then
+		return rt.hoverN()
+	end
+	if not rt.farmFighting and not rt.farmFightNpc then
+		return 0
+	end
+	return rt.hoverN()
+end
+
+function rt.farmPitchWanted()
+	return farmBusy == true and rt.combatHover() < 0
+end
+
+function rt.refreshFarmFloor(from)
+	local now = os.clock()
+	-- Floor Y barely moves mid-fight; 0.2s ray spam still cost frames.
+	local gap = farmBusy and 0.55 or 0.25
+	if type(rt.farmFloorY) == 'number' and now - (rt.farmFloorAt or 0) < gap then
+		return rt.farmFloorY
+	end
+	local origin = typeof(from) == 'Vector3' and from or nil
+	if not origin then
+		local root = routeRoot()
+		origin = root and root.Position
+	end
+	if not origin then
+		return rt.farmFloorY
+	end
+	rt.farmFloorAt = now
+	local char = character()
+	local params = RaycastParams.new()
+	params.FilterType = Enum.RaycastFilterType.Exclude
+	local filter = { char }
+	local fight = rt.farmFightNpc
+	if fight then
+		filter[#filter + 1] = fight
+	end
+	local dungeon = (type(activeDungeonRoot) == 'function' and activeDungeonRoot())
+		or (type(rt.activeDungeonRoot) == 'function' and rt.activeDungeonRoot())
+		or nil
+	local npcs = dungeon and dungeon:FindFirstChild('NPCs')
+	if npcs then
+		filter[#filter + 1] = npcs
+	end
+	params.FilterDescendantsInstances = filter
+	params.IgnoreWater = true
+	local function usable(hit)
+		if not hit or not hit.Instance then
+			return false
+		end
+		local n = hit.Instance.Name
+		-- Ceiling Barrier / kill volumes used to become "floor" and float you.
+		if n == 'Barrier' or n == 'KillBrick' or n == 'InvisibleWall' then
+			return false
+		end
+		if hit.Instance:IsA('BasePart') and hit.Instance.Transparency >= 0.95 and hit.Instance.CanCollide == false then
+			return false
+		end
+		return true
+	end
+	local function cast(fromY, dist)
+		local hit = workspace:Raycast(
+			Vector3.new(origin.X, fromY, origin.Z),
+			Vector3.new(0, -dist, 0),
+			params
+		)
+		-- Skip barrier hits by re-casting past them a few times.
+		for _ = 1, 4 do
+			if not hit or usable(hit) then
+				return hit
+			end
+			filter[#filter + 1] = hit.Instance
+			params.FilterDescendantsInstances = filter
+			hit = workspace:Raycast(
+				Vector3.new(origin.X, fromY, origin.Z),
+				Vector3.new(0, -dist, 0),
+				params
+			)
+		end
+		return usable(hit) and hit or nil
+	end
+	-- Prefer a cast from just above the stand down. Sky casts hit Barriers.
+	local hit = cast(origin.Y + 4, 120) or cast(origin.Y + 80, 220)
+	if hit then
+		rt.farmFloorY = hit.Position.Y
+	end
+	return rt.farmFloorY
+end
+
+function rt.setFarmPitchHum(on)
+	local char = LocalPlayer.Character
+	local hum = char and char:FindFirstChildOfClass('Humanoid')
+	if not hum then
+		return
+	end
+	pcall(function()
+		hum.AutoRotate = on ~= true
+		if on then
+			if rt._savedHip == nil then
+				rt._savedHip = hum.HipHeight
+			end
+			-- Hip solver kept the rig on the floor so more-negative hover
+			-- did not bury any further.
+			hum.HipHeight = 0
+			hum:SetStateEnabled(Enum.HumanoidStateType.Running, false)
+			hum:SetStateEnabled(Enum.HumanoidStateType.Landed, false)
+			hum:ChangeState(Enum.HumanoidStateType.Physics)
+		else
+			local restore = type(rt._savedHip) == 'number' and rt._savedHip or 2
+			if restore < 0.5 then
+				restore = 2
+			end
+			hum.HipHeight = restore
+			rt._savedHip = nil
+			hum:SetStateEnabled(Enum.HumanoidStateType.Running, true)
+			hum:SetStateEnabled(Enum.HumanoidStateType.Landed, true)
+			hum:ChangeState(Enum.HumanoidStateType.Running)
+		end
+	end)
+end
+
+function rt.farmHoldCf(pos, aim, keep)
+	if typeof(pos) ~= 'Vector3' then
+		return keep
+	end
+	local pitch = rt.farmPitchWanted()
+	local flat
+	if typeof(aim) == 'Vector3' then
+		flat = Vector3.new(aim.X - pos.X, 0, aim.Z - pos.Z)
+	end
+	if (not flat or flat.Magnitude < 0.05) and keep then
+		-- Look-up makes LookVector vertical; body facing is UpVector XZ.
+		local fromKeep = Vector3.new(keep.LookVector.X, 0, keep.LookVector.Z)
+		if fromKeep.Magnitude < 0.05 then
+			fromKeep = Vector3.new(keep.UpVector.X, 0, keep.UpVector.Z)
+		end
+		flat = fromKeep
+	end
+	if not flat or flat.Magnitude < 0.05 then
+		flat = (typeof(rt.farmFace) == 'Vector3' and rt.farmFace.Magnitude > 0.05)
+			and rt.farmFace
+			or Vector3.new(0, 0, -1)
+	else
+		flat = Vector3.new(flat.X, 0, flat.Z)
+		if flat.Magnitude < 0.05 then
+			flat = Vector3.new(0, 0, -1)
+		else
+			flat = flat.Unit
+		end
+	end
+	-- Authoritative yaw from holdOnEnemy. Look-up bury sits on the same XZ as
+	-- the pack, so aim-pos deltas collapse and a stale farmCrowdAim / keep yaw
+	-- left the yellow slab facing empty air (potion pin + hover < 0).
+	if farmBusy then
+		local faceDir = nil
+		if typeof(rt.farmFaceDir) == 'Vector3' and rt.farmFaceDir.Magnitude > 0.05 then
+			faceDir = Vector3.new(rt.farmFaceDir.X, 0, rt.farmFaceDir.Z)
+			if faceDir.Magnitude > 0.05 then
+				faceDir = faceDir.Unit
+			else
+				faceDir = nil
+			end
+		end
+		local fight = rt.farmFightNpc or rt.farmReturnNpc
+		local live = fight and (rt.enemyRoot and rt.enemyRoot(fight) or nil)
+		local prefer = nil
+		if typeof(rt.farmCrowdAim) == 'Vector3' then
+			prefer = rt.farmCrowdAim
+		elseif typeof(aim) == 'Vector3' then
+			prefer = aim
+		end
+		if live then
+			local toLive = Vector3.new(live.Position.X - pos.X, 0, live.Position.Z - pos.Z)
+			if toLive.Magnitude > 0.75 then
+				local want = toLive.Unit
+				local cur = faceDir or flat
+				if typeof(prefer) == 'Vector3' then
+					local toP = Vector3.new(prefer.X - pos.X, 0, prefer.Z - pos.Z)
+					if toP.Magnitude > 0.75 then
+						local pDir = toP.Unit
+						-- Pack aim only if it still points into the locked target's half.
+						if pDir:Dot(want) > 0.2 then
+							cur = pDir
+						else
+							cur = want
+							rt.farmCrowdAim = live.Position
+							rt.crowdSolo = true
+							rt.crowdAimAt = 0
+						end
+					end
+				end
+				if not cur or cur:Dot(want) < 0.35 then
+					cur = want
+					rt.farmCrowdAim = live.Position
+					rt.crowdSolo = true
+					rt.crowdAimAt = 0
+				end
+				faceDir = cur
+			elseif not faceDir and typeof(prefer) == 'Vector3' then
+				local toP = Vector3.new(prefer.X - pos.X, 0, prefer.Z - pos.Z)
+				if toP.Magnitude > 0.5 then
+					faceDir = toP.Unit
+				end
+			end
+		elseif typeof(prefer) == 'Vector3' then
+			local toCrowd = Vector3.new(prefer.X - pos.X, 0, prefer.Z - pos.Z)
+			if toCrowd.Magnitude > 0.5 then
+				faceDir = toCrowd.Unit
+			end
+		end
+		if faceDir then
+			flat = faceDir
+			rt.farmFaceDir = faceDir
+		end
+	end
+	rt.farmFace = flat
+	-- combatHover: 0 during chest/loot so Pin.at / snapRoot stay at prompt height.
+	local hover = rt.combatHover()
+	if farmBusy and (rt.farmFighting or rt.farmFightNpc) then
+		-- Explicit hover (non-zero) is floor + slider only. AutoHigh used to
+		-- stack on top and read as +13 at hover 1. Hover 0 still uses the
+		-- hold goal (auto high/low / special bury).
+		local fy = rt.refreshFarmFloor(pos)
+		if type(fy) == 'number' and math.abs(hover) >= 0.5 then
+			pos = Vector3.new(pos.X, fy + hover, pos.Z)
+		elseif type(fy) == 'number' and math.abs(hover) < 0.5
+			and not on('DLFarmAutoHigh') and not on('DLFarmAutoLow')
+		then
+			-- No auto height: stay on the floor. Stale AutoHigh / enemy HRP
+			-- Y used to leave you floating ~30 studs up.
+			local hip = 3
+			local char = LocalPlayer.Character
+			local hum = char and char:FindFirstChildOfClass('Humanoid')
+			local rootPart = char and char:FindFirstChild('HumanoidRootPart')
+			if hum and rootPart then
+				local hh = hum.HipHeight
+				if type(hh) ~= 'number' or hh < 0.5 then
+					hh = type(rt._savedHip) == 'number' and rt._savedHip or 2
+				end
+				hip = math.max(2.5, hh + rootPart.Size.Y * 0.5)
+			end
+			pos = Vector3.new(pos.X, fy + hip, pos.Z)
+		end
+	end
+	if farmBusy then
+		-- AutoRotate yanks yaw toward whatever the humanoid last stepped
+		-- at, so a close mob behind the slab never gets a turn.
+		local char = LocalPlayer.Character
+		local hum = char and char:FindFirstChildOfClass('Humanoid')
+		if hum then
+			pcall(function()
+				hum.AutoRotate = false
+			end)
+		end
+	end
+	if pitch then
+		rt.setFarmPitchHum(true)
+		rt._pitchHum = true
+		-- Box points up; `flat` yaws the rig toward the densest clump.
+		local cf = CFrame.lookAt(pos, pos + Vector3.new(0, 1, 0), flat)
+		rt.pinHoldCf = cf
+		return cf
+	end
+	-- Always clear pitch leftovers (HipHeight 0) when not looking up.
+	if not pitch then
+		local char = LocalPlayer.Character
+		local hum = char and char:FindFirstChildOfClass('Humanoid')
+		if rt._pitchHum or (hum and (hum.HipHeight or 0) < 0.5) then
+			rt._pitchHum = nil
+			rt.setFarmPitchHum(false)
+		end
+	end
+	local cf = CFrame.lookAt(pos, pos + flat)
+	rt.pinHoldCf = cf
+	return cf
+end
+
 local Pin = (function()
 	local api = {}
 	local conn, rsConn, goalFn
@@ -1466,11 +1843,15 @@ local Pin = (function()
 
 	local function unbind()
 		if conn then
-			conn:Disconnect()
+			pcall(function()
+				conn:Disconnect()
+			end)
 			conn = nil
 		end
 		if rsConn then
-			rsConn:Disconnect()
+			pcall(function()
+				rsConn:Disconnect()
+			end)
 			rsConn = nil
 		end
 		if getgenv().DLPinConn then
@@ -1479,23 +1860,32 @@ local Pin = (function()
 			end)
 			getgenv().DLPinConn = nil
 		end
+		if getgenv().DLPinPreConn then
+			pcall(function()
+				getgenv().DLPinPreConn:Disconnect()
+			end)
+			getgenv().DLPinPreConn = nil
+		end
 	end
 
 	local bind
 
 	function api.stop()
-		if farmBusy then
+		-- While the farm owns the character, shrine/chest/special cleanups used to
+		-- call Pin.stop and fully unbind — with the hard unbind that left you
+		-- frozen mid-room until the next holdOnEnemy (often never, during loot).
+		if farmBusy and currentInstance() and not rt.farmStop and rt.farmUserOff ~= true then
 			local myRoot = routeRoot()
 			if myRoot then
 				lastGoal = myRoot.Position
 				lastAim = nil
-				-- Loose park. snapExact here CFrame-locked every Heartbeat
-				-- (the farm stutter) and cancelled M1 / skill windups.
 				snapExact = false
 				goalFn = function()
 					return lastGoal
 				end
-				bind()
+				if not conn then
+					bind()
+				end
 				return
 			end
 		end
@@ -1507,11 +1897,10 @@ local Pin = (function()
 
 	local function step()
 		if not currentInstance() then
-			-- Reload handoff: keep the last station until the new copy binds.
-			if getgenv().DLResumeFarm then
-				return
-			end
-			api.stop()
+			-- Stale copy: disconnect immediately. Returning under DLResumeFarm
+			-- left orphan Pin Heartbeats stacking across reloads.
+			unbind()
+			goalFn = nil
 			return
 		end
 		local myRoot = routeRoot()
@@ -1537,6 +1926,9 @@ local Pin = (function()
 		pcall(function()
 			local here = myRoot.Position
 			if os.clock() < (rt.ultLockUntil or 0) then
+				-- Keep the ult pose, but still kill knockback so the rig cannot flop.
+				myRoot.AssemblyLinearVelocity = Vector3.zero
+				myRoot.AssemblyAngularVelocity = Vector3.zero
 				return
 			end
 			local char = myRoot.Parent
@@ -1550,6 +1942,7 @@ local Pin = (function()
 				or st == Enum.HumanoidStateType.FallingDown
 				or st == Enum.HumanoidStateType.GettingUp
 			)
+			local vel = myRoot.AssemblyLinearVelocity.Magnitude
 			if rag then
 				pcall(function()
 					hum.PlatformStand = false
@@ -1562,50 +1955,42 @@ local Pin = (function()
 				end)
 				myRoot.AssemblyLinearVelocity = Vector3.zero
 				myRoot.AssemblyAngularVelocity = Vector3.zero
-				if typeof(aim) == 'Vector3' then
-					myRoot.CFrame = CFrame.lookAt(goal, Vector3.new(aim.X, goal.Y, aim.Z))
-				else
-					myRoot.CFrame = CFrame.new(goal) * (myRoot.CFrame - myRoot.CFrame.Position)
-				end
+				myRoot.CFrame = rt.farmHoldCf(goal, aim, myRoot.CFrame)
 				return
 			end
 			local drift = (here - goal).Magnitude
 			local dodging = os.clock() < (rt.aoeUntil or 0)
-			local tight = snapExact or dodging
-			-- Farm stand: loose hold so we do not CFrame-lock every Heartbeat and
-			-- cancel M1 / skill windups (felt like input lag / skills not casting).
-			local hold = snapExact and 0.18 or (dodging and 0.55 or (farmBusy and 1.35 or 0.55))
+			-- Knockback used to keep velocity after a 1.35 hold, which slid the
+			-- rig while the humanoid stayed Running. Zero it every farm frame.
+			local blown = farmBusy and vel > 12
+			local tight = snapExact or dodging or blown
+			local hold = snapExact and 0.18 or (dodging and 0.55 or (farmBusy and 0.55 or 0.55))
+			if farmBusy then
+				myRoot.AssemblyLinearVelocity = Vector3.zero
+				myRoot.AssemblyAngularVelocity = Vector3.zero
+			end
 			if drift <= hold then
-				-- Still face the pack. Stand-range used to skip lookAt, so a dash /
-				-- skill could leave you looking away and M1s never connected
-				-- (Demon Rogue Daemon: 2 studs off, 0 damage, HitReact frozen).
-				if typeof(aim) == 'Vector3' then
-					local to = Vector3.new(aim.X - here.X, 0, aim.Z - here.Z)
-					if to.Magnitude > 0.25 then
-						local look = Vector3.new(myRoot.CFrame.LookVector.X, 0, myRoot.CFrame.LookVector.Z)
-						-- 0.65 (~49°) rewrote facing every few frames and looked like stutter.
-						if look.Magnitude < 0.05 or look.Unit:Dot(to.Unit) < 0.25 then
-							myRoot.CFrame = CFrame.lookAt(here, Vector3.new(aim.X, here.Y, aim.Z))
-						end
-					end
+				-- Always re-face the crowd while farming. The old 0.85-dot gate
+				-- plus a locked yaw left the rig staring past the pack.
+				local holdPos = (rt.farmPitchWanted() or farmBusy) and goal or here
+				if typeof(aim) == 'Vector3' or farmBusy then
+					myRoot.CFrame = rt.farmHoldCf(holdPos, aim, myRoot.CFrame)
 				end
 				return
 			end
-			-- AOE gap: hard snap. Boss stand: soft lerp so attacks still play.
+			-- AOE / knockback: hard snap. Otherwise a light lerp so M1s still play.
+			-- Pitched fight / far return: snap. A long lerp from extract or a
+			-- mid-air warp is what "struggled" to get back to the boss.
 			local nextPos
-			if tight then
+			if tight or rt.farmPitchWanted() or (farmBusy and drift > 16) then
 				nextPos = goal
 			elseif farmBusy then
-				nextPos = here:Lerp(goal, 0.35)
+				nextPos = here:Lerp(goal, 0.7)
 			else
 				nextPos = here:Lerp(goal, 0.45)
 			end
-			if typeof(aim) == 'Vector3' and (aim - nextPos).Magnitude > 0.05 then
-				myRoot.CFrame = CFrame.lookAt(nextPos, aim)
-			else
-				myRoot.CFrame = CFrame.new(nextPos) * (myRoot.CFrame - myRoot.CFrame.Position)
-			end
-			if tight or drift > 6 then
+			myRoot.CFrame = rt.farmHoldCf(nextPos, aim, myRoot.CFrame)
+			if tight or farmBusy or drift > 6 then
 				myRoot.AssemblyLinearVelocity = Vector3.zero
 				myRoot.AssemblyAngularVelocity = Vector3.zero
 			end
@@ -1649,10 +2034,54 @@ local Pin = (function()
 			return
 		end
 		rt.pinAcc = 1
-		-- Heartbeat only. Re-connecting every Pin.at() hitch the frame (~200ms)
-		-- and the two poses fought, which is the farm stutter.
+		-- Heartbeat corrects after physics. PreSimulation kills knockback
+		-- before it integrates so the stand does not snap-back / flop.
 		conn = RunService.Heartbeat:Connect(step)
 		getgenv().DLPinConn = conn
+		track(conn)
+		if not rsConn then
+			local pre = RunService.PreSimulation or RunService.Stepped
+			rsConn = pre:Connect(function()
+				if not currentInstance() then
+					unbind()
+					return
+				end
+				if not farmBusy then
+					return
+				end
+				local myRoot = routeRoot()
+				if not myRoot or typeof(lastGoal) ~= 'Vector3' then
+					return
+				end
+				myRoot.AssemblyLinearVelocity = Vector3.zero
+				myRoot.AssemblyAngularVelocity = Vector3.zero
+				if os.clock() < (rt.ultLockUntil or 0) then
+					return
+				end
+				-- Only correct CFrame when knocked off the stand. While a fight
+				-- target is live, rebuild look every PreSim — pasting pinHoldCf
+				-- re-applied the engage yaw and left the slab facing empty air.
+				local drift = (myRoot.Position - lastGoal).Magnitude
+				if farmBusy and (rt.farmFightNpc or rt.crowdSolo) then
+					myRoot.CFrame = rt.farmHoldCf(lastGoal, lastAim, myRoot.CFrame)
+					return
+				end
+				if drift < 0.85 and typeof(rt.pinHoldCf) == 'CFrame' then
+					local look = myRoot.CFrame.LookVector
+					local want = rt.pinHoldCf.LookVector
+					if look:Dot(want) > 0.92 then
+						return
+					end
+				end
+				if typeof(rt.pinHoldCf) == 'CFrame' and drift < 2.5 then
+					myRoot.CFrame = rt.pinHoldCf
+				else
+					myRoot.CFrame = rt.farmHoldCf(lastGoal, lastAim, myRoot.CFrame)
+				end
+			end)
+			getgenv().DLPinPreConn = rsConn
+			track(rsConn)
+		end
 	end
 
 	function api.follow(fn)
@@ -1664,10 +2093,17 @@ local Pin = (function()
 	function api.at(pos, exact)
 		snapExact = exact == true
 		lastGoal, lastAim = pos, nil
+		-- Station pins (potion / wait / load) used to keep a stale pack aim and
+		-- yaw the slab into empty air until the next holdOnEnemy.
+		if not rt.farmFightNpc then
+			rt.farmCrowdAim = nil
+			rt.farmFaceDir = nil
+			rt.crowdSolo = nil
+		end
 		local myRoot = routeRoot()
 		if myRoot then
 			pcall(function()
-				myRoot.CFrame = CFrame.new(pos) * (myRoot.CFrame - myRoot.CFrame.Position)
+				myRoot.CFrame = rt.farmHoldCf(pos, lastAim, myRoot.CFrame)
 				myRoot.AssemblyLinearVelocity = Vector3.zero
 				myRoot.AssemblyAngularVelocity = Vector3.zero
 			end)
@@ -2333,6 +2769,9 @@ local function collectChestRoute(silent, roomOnly)
 		if roomOnly and tonumber(model:GetAttribute('RoomIndex')) ~= roomOnly then
 			return
 		end
+		if type(rt.chestInBossRoom) == 'function' and rt.chestInBossRoom(model) then
+			return
+		end
 		local idx = tonumber(model:GetAttribute('RoomIndex'))
 		if idx and rt.roomHasLiving(idx) then
 			return
@@ -2368,6 +2807,7 @@ local function collectChestRoute(silent, roomOnly)
 	end
 
 	routeBusy = true
+	rt.routeBusyAt = os.clock()
 	local home = root.CFrame
 	local wasNoclip = noclipOn
 	local got = 0
@@ -2423,7 +2863,7 @@ local function collectChestRoute(silent, roomOnly)
 					local prompt = chestPrompt(model)
 					local roomIdx = tonumber(model:GetAttribute('RoomIndex'))
 					local function fightFirst()
-						return rt.anyAwakeTrash() or rt.roomHasLiving(roomIdx)
+						return rt.roomHasLiving(roomIdx)
 					end
 					-- Server leaves Enabled=false until you are in the 8-stud bubble
 					-- after the pack is dead. Do not treat that as "already claimed".
@@ -2551,6 +2991,410 @@ local function inEndlessFarm()
 	return rt.endlessHud == true
 end
 
+function rt.snapRoot(pos)
+	local root = routeRoot()
+	if not root or typeof(pos) ~= 'Vector3' then
+		return false
+	end
+	-- Chest / gate snaps must not keep look-up pitch or bury under the prompt.
+	pcall(function()
+		rt.setFarmPitchHum(false)
+	end)
+	Pin.at(pos, true)
+	pcall(function()
+		root.CFrame = CFrame.new(pos) * (root.CFrame - root.CFrame.Position)
+		root.AssemblyLinearVelocity = Vector3.zero
+		root.AssemblyAngularVelocity = Vector3.zero
+	end)
+	return true
+end
+
+function rt.chestInRoom(dungeon, idx, model)
+	if not model or not idx then
+		return false
+	end
+	if tonumber(model:GetAttribute('RoomIndex')) == idx then
+		return true
+	end
+	local pos = chestStandPos(model)
+	if not pos then
+		return false
+	end
+	-- Rooms is a later local. Early loot used the nil global and crashed
+	-- the farm (stuck, never walked to the boss).
+	local api = rt.Rooms
+	if type(api) ~= 'table' or type(api.posInRoom) ~= 'function' then
+		return false
+	end
+	local ok, hit = pcall(api.posInRoom, dungeon, idx, pos)
+	return ok and hit == true
+end
+
+function rt.eachDungeonChest(dungeon, fn)
+	if type(fn) ~= 'function' then
+		return
+	end
+	if not dungeon then
+		for _, root in ipairs(workspace:GetChildren()) do
+			if type(root.Name) == 'string' and root.Name:sub(1, 10) == 'Generated_' then
+				dungeon = root
+				break
+			end
+		end
+	end
+	if not dungeon then
+		return
+	end
+	-- Full GetDescendants every tour/skipTour was 100–200ms on Generated_ maps.
+	local now = os.clock()
+	local list = rt._chestList
+	if not list or rt._chestDungeon ~= dungeon or now - (rt._chestListAt or 0) > 1.25 then
+		list = {}
+		for _, child in ipairs(dungeon:GetDescendants()) do
+			if child:GetAttribute('DungeonChest') == true
+				or (type(child.Name) == 'string' and child.Name:sub(1, 13) == 'DungeonChest')
+			then
+				list[#list + 1] = child
+			end
+		end
+		rt._chestList = list
+		rt._chestDungeon = dungeon
+		rt._chestListAt = now
+	end
+	for i = #list, 1, -1 do
+		local child = list[i]
+		if not (child and child.Parent) then
+			table.remove(list, i)
+		else
+			fn(child)
+		end
+	end
+end
+
+function rt.listRoomChests(dungeon, idx)
+	local out = {}
+	if not dungeon or not idx then
+		return out
+	end
+	rt.eachDungeonChest(dungeon, function(child)
+		if type(rt.chestInBossRoom) == 'function' and rt.chestInBossRoom(child) then
+			return
+		end
+		if rt.chestInRoom(dungeon, idx, child) and not chestIsClaimed(child) then
+			if child:GetAttribute('LockedRoom') == true and not wantOpenGates() then
+				local p = chestPrompt(child)
+				if not (p and p.Enabled == true) then
+					return
+				end
+			end
+			out[#out + 1] = child
+		end
+	end)
+	return out
+end
+
+function rt.bossRoomIdx(dungeon)
+	local api = rt.Rooms
+	if type(api) ~= 'table' then
+		return nil
+	end
+	if type(api.layoutBossRoom) == 'function' then
+		local ok, idx = pcall(api.layoutBossRoom)
+		if ok and tonumber(idx) then
+			return tonumber(idx)
+		end
+	end
+	if dungeon and type(api.isBossRoom) == 'function' then
+		local maxR = type(api.maxRoom) == 'function' and api.maxRoom(dungeon)
+		if tonumber(maxR) then
+			for i = 1, maxR do
+				local ok, hit = pcall(api.isBossRoom, dungeon, i)
+				if ok and hit then
+					return i
+				end
+			end
+		end
+	end
+	return nil
+end
+
+-- HUD Completed can lag a full room after the last pre-boss clear.
+function rt.preBossSwept()
+	local api = rt.Rooms
+	if type(api) ~= 'table' or type(api.layoutCombatRooms) ~= 'function' then
+		return false
+	end
+	local ok, rooms = pcall(api.layoutCombatRooms)
+	if not ok or type(rooms) ~= 'table' or #rooms < 1 then
+		return false
+	end
+	local swept = 0
+	for _, idx in ipairs(rooms) do
+		if rt.roomHasLiving(idx) then
+			return false
+		end
+		if rt.roomSweepDone and rt.roomSweepDone[idx] then
+			swept += 1
+		end
+	end
+	return swept >= #rooms
+end
+
+function rt.chestInBossRoom(model)
+	if not model then
+		return false
+	end
+	local dungeon = activeDungeonRoot()
+	local idx = tonumber(model:GetAttribute('RoomIndex'))
+	local bossIdx = rt.bossRoomIdx(dungeon)
+	if bossIdx and idx == bossIdx then
+		return true
+	end
+	local api = rt.Rooms
+	if dungeon and idx and type(api) == 'table' and type(api.isBossRoom) == 'function' then
+		local ok, hit = pcall(api.isBossRoom, dungeon, idx)
+		if ok and hit then
+			return true
+		end
+	end
+	if dungeon and bossIdx and type(rt.chestInRoom) == 'function' then
+		local ok, hit = pcall(rt.chestInRoom, dungeon, bossIdx, model)
+		if ok and hit then
+			return true
+		end
+	end
+	return false
+end
+
+function rt.chestsNow()
+	-- Walk-to dungeon chests only after every HUD star except the last (boss) is filled.
+	if not on('DLChestAnywhere') then
+		return false
+	end
+	local api = rt.Rooms
+	if type(api) ~= 'table' or type(api.preBossStarsDone) ~= 'function' then
+		return false
+	end
+	local ok, ready = pcall(api.preBossStarsDone)
+	return ok and ready == true
+end
+
+function rt.grabPreBossChests(dungeon)
+	if not dungeon or not rt.chestsNow() then
+		return 0
+	end
+	local list = {}
+	rt.eachDungeonChest(dungeon, function(child)
+		if rt.chestInBossRoom(child) or chestIsClaimed(child) then
+			return
+		end
+		local idx = tonumber(child:GetAttribute('RoomIndex'))
+		if idx and rt.roomHasLiving(idx) then
+			return
+		end
+		if child:GetAttribute('LockedRoom') == true and not wantOpenGates() then
+			local p = chestPrompt(child)
+			if not (p and p.Enabled == true) then
+				return
+			end
+		end
+		list[#list + 1] = child
+	end)
+	if #list == 0 then
+		return 0
+	end
+	rt.chestFast = true
+	local got = 0
+	for i, model in ipairs(list) do
+		if not on('DLAutoFarm') then
+			break
+		end
+		farmLabel = ('pre-boss chest · %d/%d'):format(i, #list)
+		local pos = chestStandPos(model) or chestAnchor(model)
+		if not pos then
+			continue
+		end
+		rt.snapRoot(pos)
+		task.wait(0.06)
+		pos = chestStandPos(model) or pos
+		rt.snapRoot(pos)
+		local prompt = chestPrompt(model)
+		local arm = os.clock() + 0.85
+		while (not prompt or prompt.Enabled ~= true) and os.clock() < arm do
+			task.wait(0.04)
+			prompt = chestPrompt(model)
+			local nextPos = chestStandPos(model)
+			if nextPos then
+				rt.snapRoot(nextPos)
+			end
+		end
+		if prompt and prompt.Enabled == true and chestActionOk(prompt) then
+			pcall(function()
+				prompt.MaxActivationDistance = math.max(tonumber(prompt.MaxActivationDistance) or 8, 16)
+			end)
+			chestFiredAt[prompt] = nil
+			fireChestPrompt(prompt)
+			local deadline = os.clock() + 0.45
+			while os.clock() < deadline and chestStillOpen(model) do
+				task.wait(0.03)
+			end
+			if chestIsClaimed(model) or not chestStillOpen(model) then
+				got += 1
+				markChestDone(model)
+			else
+				fireChestPrompt(prompt)
+				task.wait(0.08)
+				if not chestStillOpen(model) then
+					got += 1
+					markChestDone(model)
+				end
+			end
+		end
+	end
+	rt.chestFast = false
+	return got
+end
+
+function rt.firstChestRoom(dungeon)
+	if not dungeon or not rt.chestsNow() then
+		return nil
+	end
+	local best
+	rt.eachDungeonChest(dungeon, function(child)
+		if chestIsClaimed(child) then
+			return
+		end
+		if child:GetAttribute('LockedRoom') == true and not wantOpenGates() then
+			local p = chestPrompt(child)
+			if not (p and p.Enabled == true) then
+				return
+			end
+		end
+		if (rt.chestSkip and rt.chestSkip[child] or 0) > os.clock() then
+			return
+		end
+		local idx = tonumber(child:GetAttribute('RoomIndex'))
+		if not idx then
+			return
+		end
+		local bossIdx = rt.bossRoomIdx(dungeon)
+		if bossIdx and idx == bossIdx then
+			return
+		end
+		if type(rt.Rooms) == 'table' and type(rt.Rooms.isBossRoom) == 'function' then
+			local okBoss, isBoss = pcall(rt.Rooms.isBossRoom, dungeon, idx)
+			if okBoss and isBoss then
+				return
+			end
+		end
+		-- Never loot a room that still has a pack. roomHasLiving also
+		-- counts HealthOverride fodder, not just Humanoid HP.
+		if rt.roomHasLiving(idx) then
+			return
+		end
+		if type(rt.roomClear) == 'function' and not rt.roomClear(dungeon, idx) then
+			return
+		end
+		if not best or idx < best then
+			best = idx
+		end
+	end)
+	return best
+end
+
+-- Snap onto every chest in this room and fire Loot. The old poll often queued
+-- nothing and left the character standing in the zone.
+function rt.lootRoomChests(dungeon, idx)
+	if not rt.chestsNow() then
+		return true
+	end
+	if not dungeon or not idx or rt.roomHasLiving(idx) then
+		return false
+	end
+	if type(rt.Rooms) == 'table' and type(rt.Rooms.isBossRoom) == 'function' then
+		local okBoss, isBoss = pcall(rt.Rooms.isBossRoom, dungeon, idx)
+		if okBoss and isBoss then
+			return true
+		end
+	end
+	local bossIdx = rt.bossRoomIdx(dungeon)
+	if bossIdx and idx == bossIdx then
+		return true
+	end
+	pcall(scanEspThrottled, 0.4)
+	-- One pass per room until lootStall retries. Re-running every tour yield
+	-- re-snapped every chest (1–3s each) and owned the hitch budget.
+	if rt.lootPassDone and rt.lootPassDone[idx] and os.clock() < (rt.lootPassUntil or 0) then
+		return #rt.listRoomChests(dungeon, idx) == 0
+	end
+	local list = rt.listRoomChests(dungeon, idx)
+	if #list == 0 then
+		-- Chests enable a couple seconds after the last kill. Do NOT block the
+		-- farm loop for 2s here — that was tour:rooms ≈ whole frame budget and
+		-- the hitch while sitting on Room_N · loot. Poll once; lootStall advances.
+		return false
+	end
+	local got = 0
+	for i, model in ipairs(list) do
+		if not on('DLAutoFarm') or rt.roomHasLiving(idx) then
+			break
+		end
+		farmLabel = ('chest Room_%d · %d/%d'):format(idx, i, #list)
+		local pos = chestStandPos(model) or chestAnchor(model)
+		if not pos then
+			continue
+		end
+		rt.snapRoot(pos)
+		task.wait(0.06)
+		pos = chestStandPos(model) or pos
+		rt.snapRoot(pos)
+		local prompt = chestPrompt(model)
+		local armUntil = os.clock() + 0.35
+		while (not prompt or prompt.Enabled ~= true) and os.clock() < armUntil do
+			if not on('DLAutoFarm') or rt.farmStop or rt.farmUserOff == true or rt.roomHasLiving(idx) then
+				return false
+			end
+			task.wait(0.05)
+			prompt = chestPrompt(model)
+			pos = chestStandPos(model) or pos
+			rt.snapRoot(pos)
+		end
+		if prompt and prompt.Enabled == true and chestActionOk(prompt) then
+			pcall(function()
+				prompt.MaxActivationDistance = math.max(tonumber(prompt.MaxActivationDistance) or 8, 16)
+			end)
+			chestFiredAt[prompt] = nil
+			fireChestPrompt(prompt)
+			local deadline = os.clock() + 0.45
+			while os.clock() < deadline and chestStillOpen(model) do
+				if not on('DLAutoFarm') or rt.farmStop or rt.farmUserOff == true then
+					return false
+				end
+				task.wait(0.05)
+			end
+			if chestIsClaimed(model) or not chestStillOpen(model) then
+				got += 1
+				markChestDone(model)
+			else
+				fireChestPrompt(prompt)
+				task.wait(0.12)
+				if not chestStillOpen(model) then
+					got += 1
+					markChestDone(model)
+				else
+					-- Don't thrash the same chest every tour tick.
+					rt.chestSkip = rt.chestSkip or {}
+					rt.chestSkip[model] = os.clock() + 3
+				end
+			end
+		end
+	end
+	rt.lootPassDone = rt.lootPassDone or {}
+	rt.lootPassDone[idx] = true
+	rt.lootPassUntil = os.clock() + 2.5
+	return got > 0 or #rt.listRoomChests(dungeon, idx) == 0
+end
+
 local function lootClearedRoom(roomIdx, dungeon)
 	if not roomIdx then
 		return false
@@ -2574,76 +3418,10 @@ local function lootClearedRoom(roomIdx, dungeon)
 	if not dungeon then
 		return false
 	end
-	farmLabel = ('looting Room_%d'):format(roomIdx)
-	local deadline = os.clock() + (inEndlessFarm() and 1.2 or 2.2)
-	local emptyPolls = 0
-	while os.clock() < deadline do
-		if not on('DLAutoFarm') then
-			return false
-		end
-		if rt.roomHasLiving(roomIdx) or rt.anyAwakeTrash() then
-			return false
-		end
-		pcall(scanEspThrottled, 0.9)
-		local ready = false
-		local sawChest = false
-		local pending = false
-		-- A chest standing inside this room can carry a neighbour's RoomIndex.
-		-- collectChestRoute filters strictly on that attribute, so route it under
-		-- the number it claims — asking for this room's index queued nothing and
-		-- the tour stood still on "looting Room_N" forever.
-		local routeIdx = roomIdx
-		for _, child in ipairs(dungeon:GetChildren()) do
-			if child:GetAttribute('DungeonChest') == true or child.Name:sub(1, 13) == 'DungeonChest' then
-				local attrIdx = tonumber(child:GetAttribute('RoomIndex'))
-				local belongs = attrIdx == roomIdx
-				if not belongs then
-					local pos = chestStandPos(child)
-					belongs = pos ~= nil and Rooms.posInRoom(dungeon, roomIdx, pos)
-				end
-				if belongs then
-					sawChest = true
-					if chestIsClaimed(child) then
-						continue
-					end
-					pending = true
-					-- A failed fire used to park the chest on chestSkip for 6s.
-					-- lootClearedRoom then saw "not a candidate" and never called
-					-- collectChestRoute, so the farm stood still on looting Room_N
-					-- with an Enabled Loot prompt 60+ studs away.
-					local prompt = chestPrompt(child)
-					local livePrompt = prompt and prompt.Enabled == true and chestActionOk(prompt)
-					if livePrompt or chestClaimCandidate(child) then
-						if rt.chestSkip then
-							rt.chestSkip[child] = nil
-						end
-						ready = true
-						routeIdx = attrIdx or roomIdx
-						break
-					end
-				end
-			end
-		end
-		if ready then
-			rt.chestFast = true
-			local ok = collectChestRoute(true, routeIdx)
-			rt.chestFast = false
-			return ok
-		end
-		if sawChest and not pending then
-			return false
-		end
-		if not sawChest then
-			emptyPolls += 1
-			if emptyPolls >= 4 then
-				return false
-			end
-		end
-		task.wait(inEndlessFarm() and 0.08 or 0.2)
+	if not rt.chestsNow() then
+		return true
 	end
-	-- Do not fall through to a map-wide sweep — that looted other rooms
-	-- while packs were still up.
-	return false
+	return rt.lootRoomChests(dungeon, roomIdx)
 end
 
 local spectateName = nil
@@ -3573,12 +4351,15 @@ local function enemyRoot(npc)
 	if part then
 		return part, hum
 	end
-	-- Floor bosses stream out their HRP (Valkskar = accessories only) but keep a
-	-- WorldPivot. Fodder leftovers stay nil so they are not counted as trash.
-	if npc:GetAttribute('IsBoss') == true
+	-- Floor bosses / AnimationController packs stream without a direct BasePart
+	-- (Gatekeeper = accessories only). HealthOverride fodder used to go nil here
+	-- and the farm treated the whole floor as empty → Room_N · loot forever.
+	local ov = tonumber(npc:GetAttribute('HealthOverride')) or 0
+	local bossy = npc:GetAttribute('IsBoss') == true
 		or npc:GetAttribute('IsMiniBoss') == true
 		or npc:GetAttribute('IsSpecialBoss') == true
-	then
+		or ov >= 1e5
+	if bossy or ov > 0 then
 		local ok, cf = pcall(function()
 			return npc:GetPivot()
 		end)
@@ -3598,6 +4379,7 @@ local function enemyRoot(npc)
 	end
 	return nil, hum
 end
+rt.enemyRoot = enemyRoot
 
 -- Bosses run on an AnimationController with no Humanoid and only expose
 -- HealthOverride (their max); current HP is server-side. So liveness for them is
@@ -3621,7 +4403,7 @@ local function enemyAlive(npc)
 	if state == 'dead' or state == 'died' or state == 'dying' then
 		return false
 	end
-	local hp, maxHp = enemyHealth(npc)
+	local hp = enemyHealth(npc)
 	if hp ~= nil then
 		if hp > 0 then
 			return true
@@ -3633,7 +4415,43 @@ local function enemyAlive(npc)
 		end
 		return false
 	end
-	return true
+	-- No Humanoid: AnimationController packs (Demon Archer / Gatekeeper). Live as
+	-- long as HealthOverride is set and the model still has a world pivot.
+	local ov = tonumber(npc:GetAttribute('HealthOverride'))
+	if not (ov and ov > 0) then
+		return false
+	end
+	return enemyRoot(npc) ~= nil
+end
+
+function rt.roomHasLiving(idx)
+	if not idx then
+		return false
+	end
+	for _, root in ipairs(workspace:GetChildren()) do
+		if type(root.Name) == 'string' and root.Name:sub(1, 10) == 'Generated_' then
+			local folder = root:FindFirstChild('NPCs')
+			for _, npc in ipairs(folder and folder:GetChildren() or {}) do
+				if tonumber(npc:GetAttribute('RoomIndex')) == idx then
+					if enemyAlive(npc) or npc:GetAttribute('IsDormant') == true then
+						return true
+					end
+				end
+			end
+			if type(Rooms) == 'table' then
+				local okA, nA = pcall(function()
+					return Rooms.aliveCount(root, idx)
+				end)
+				local okD, nD = pcall(function()
+					return Rooms.dormantCount(root, idx)
+				end)
+				if (okA and (nA or 0) > 0) or (okD and (nD or 0) > 0) then
+					return true
+				end
+			end
+		end
+	end
+	return false
 end
 
 local function isWorldEnemy(npc)
@@ -3674,7 +4492,12 @@ local function isBossEnemy(npc)
 		or id:find('monarch', 1, true)
 		or id:find('imperator', 1, true)
 		or id:find('warden', 1, true)
+		or id:find('gatekeeper', 1, true)
 	then
+		return true
+	end
+	local ov = tonumber(npc:GetAttribute('HealthOverride')) or 0
+	if ov >= 100000 then
 		return true
 	end
 	local _, hum = enemyRoot(npc)
@@ -5157,7 +5980,7 @@ end
 -- The global 'Enemy' tag is not a safe target list: the map has props wearing it
 -- (Boss_Rush.RUSH_SPAWN holds meme models tagged Enemy with a Humanoid). Scope the
 -- farm to the NPCs folder of the dungeon we are actually running.
-local function activeDungeonRoot()
+function activeDungeonRoot()
 	local want = tostring(LocalPlayer:GetAttribute('CurrentDungeon') or '')
 	local fallback = nil
 	for _, root in ipairs(workspace:GetChildren()) do
@@ -5170,6 +5993,7 @@ local function activeDungeonRoot()
 	end
 	return fallback
 end
+rt.activeDungeonRoot = activeDungeonRoot
 
 -- Rooms only wake when the server sees the character inside their Zone part, and
 -- ZoneEntered is a server->client notification so it cannot be faked from here.
@@ -6324,6 +7148,22 @@ local Rooms = (function()
 		return hudHasOpenStar()
 	end
 
+	-- Auto chests wait until every HUD star except the last (boss) is filled.
+	-- A single streamed slot used to return true on Room_1 and loot mid-pack.
+	function api.preBossStarsDone()
+		local slots = hudSlots()
+		if #slots < 2 then
+			return false
+		end
+		for i = 1, #slots - 1 do
+			local completed = slots[i]:FindFirstChild('Completed')
+			if not (completed and completed.Visible) then
+				return false
+			end
+		end
+		return true
+	end
+
 	function api.starsHold()
 		return hudHasOpenStar() or api.specialStarOpen()
 	end
@@ -6490,7 +7330,8 @@ local Rooms = (function()
 		if not force and rt.zoneFromGc and type(rt.zoneLayout) == 'table' and #rt.zoneLayout > 0 and fresh then
 			return true
 		end
-		if not force and os.clock() - (rt.zoneSeedAt or 0) < 2.5 then
+		-- getgc(true) is expensive. 2.5s still re-scanned too often during loot tours.
+		if not force and os.clock() - (rt.zoneSeedAt or 0) < 8 then
 			return type(rt.zoneLayout) == 'table' and #rt.zoneLayout > 0
 		end
 		rt.zoneSeedAt = os.clock()
@@ -6737,6 +7578,7 @@ local Rooms = (function()
 
 	return api
 end)()
+rt.Rooms = Rooms
 
 -- "Next Area" gates and Locked_ key doors between rooms. Cleared rooms often leave
 -- no dormant NPCs in the folder until you cross — and key gates are a separate
@@ -7004,8 +7846,13 @@ local NextArea = (function()
 				task.wait(0.12)
 			end
 		elseif prompt and prompt.Enabled then
-			fireChestPrompt(prompt)
-			task.wait(0.35)
+			local blob = (tostring(prompt.ActionText) .. ' ' .. tostring(prompt.ObjectText)):lower()
+			if blob:find('chest', 1, true) or blob:find('loot', 1, true) then
+				-- Never loot from the gate walker. Auto chests wait for stars.
+			else
+				fireChestPrompt(prompt)
+				task.wait(0.35)
+			end
 		end
 		-- Stand on the pad first so TouchInterest / area load fires, then step through.
 		Pin.at(standingSpot(pos, 0), true)
@@ -7055,6 +7902,14 @@ local function isFinalBoss(npc)
 		return false
 	end
 	if npc:GetAttribute('IsBoss') == true then
+		return true
+	end
+	local id = string.lower(tostring(npc:GetAttribute('ItemId') or npc.Name or ''))
+	if id:find('gatekeeper', 1, true) or id:find('warden', 1, true) then
+		return true
+	end
+	local ov = tonumber(npc:GetAttribute('HealthOverride')) or 0
+	if ov >= 200000 then
 		return true
 	end
 	-- Attribute checks first: the phase read goes through a remote, and asking for
@@ -7425,8 +8280,10 @@ local function holdOnAddPack(anchor)
 		if not mid then
 			return nil
 		end
-		-- Center of the summon wave so M1 / skills splash the whole pack.
-		return mid, mid
+		-- Stand in the wave, look at whichever side holds the most adds.
+		local me = routeRoot()
+		local aim = crowdAimFrom(me and me.Position or mid, list[1])
+		return mid, aim or mid
 	end)
 end
 
@@ -7467,6 +8324,7 @@ end
 -- star fallback both need them. Without this they resolved to nil globals and
 -- the calls blew up inside a pcall that swallowed the error.
 local roomIsSwept, roomHasPendingChest
+local crowdAimFrom
 
 local function pickFarmTarget()
 	local root = routeRoot()
@@ -7590,8 +8448,10 @@ local function pickFarmTarget()
 		farmLock = picked
 	end
 	-- Fodder: stand in the densest clump, not on a lone nearest beetle.
+	-- Negative hover: 14-stud "crowd" is the whole ring, so nearest-to-hole
+	-- wins and we never leave the pit.
 	if picked and enemyRank(picked) < 3 and not preferRanged then
-		local CROWD_R = 28
+		local CROWD_R = rt.hoverN() < 0 and 4.5 or 14
 		local best, bestN, bestD = picked, 0, pickedD or 9e9
 		local counts = {}
 		local parts = {}
@@ -7666,7 +8526,7 @@ local function openDungeonChests()
 end
 
 local function tryChestSweep(why)
-	if not on('DLChestAnywhere') or not farmActive() then
+	if not rt.chestsNow() or not farmActive() then
 		return false
 	end
 	local dungeon = activeDungeonRoot()
@@ -7941,6 +8801,7 @@ local function trySummonSpecial()
 	local wasRoute = routeBusy
 	local wasNoclip = noclipOn
 	routeBusy = true
+	rt.routeBusyAt = os.clock()
 	noclipOn = true
 	pcall(setCharNoclip, true)
 	task.spawn(function()
@@ -8198,7 +9059,7 @@ end
 -- candidate angles around the pack and keep whichever one rakes the box over the
 -- most bodies. Only a strict improvement wins, so the rig does not orbit.
 local function bestPackFacing(pack, centre, stand, current)
-	if #pack < 2 then
+	if #pack < 2 or rt.hoverN() < 0 then
 		return current
 	end
 	local hb = equippedHitboxSize()
@@ -8260,6 +9121,181 @@ local function packAround(npc, live, radius)
 	return pack, n, Vector3.new(sx / n, live.Position.Y, sz / n)
 end
 
+-- Same-room fodder around `npc` (plus the target itself). Used to aim the M1
+-- box at the densest clump from wherever we already stand.
+local function crowdPartsNear(npc)
+	local room = npc and Rooms.indexOf(npc)
+	local parts = {}
+	eachFarmNpc(function(other)
+		if not enemyAlive(other) or farmSkipped(other) then
+			return
+		end
+		if other ~= npc and enemyRank(other) >= 3 then
+			return
+		end
+		if room and Rooms.indexOf(other) ~= room then
+			return
+		end
+		local p = enemyRoot(other)
+		if p then
+			parts[#parts + 1] = p.Position
+		end
+	end)
+	return parts
+end
+
+local function densestCentroid(positions, radius)
+	if #positions == 0 then
+		return nil, 0
+	end
+	if #positions == 1 then
+		return positions[1], 1
+	end
+	local r2 = radius * radius
+	local bestN, bestMid = 0, positions[1]
+	for _, a in ipairs(positions) do
+		local sx, sy, sz, n = 0, 0, 0, 0
+		for _, b in ipairs(positions) do
+			local dx, dz = b.X - a.X, b.Z - a.Z
+			if dx * dx + dz * dz <= r2 then
+				sx += b.X
+				sy += b.Y
+				sz += b.Z
+				n += 1
+			end
+		end
+		if n > bestN then
+			bestN = n
+			bestMid = Vector3.new(sx / n, sy / n, sz / n)
+		end
+	end
+	return bestMid, bestN
+end
+
+local function slabFwd(fwd)
+	if typeof(fwd) ~= 'Vector3' then
+		return nil
+	end
+	fwd = Vector3.new(fwd.X, 0, fwd.Z)
+	if fwd.Magnitude < 0.05 then
+		return nil
+	end
+	return fwd.Unit
+end
+
+local function facesInBox(fromPos, fwd, p)
+	fwd = slabFwd(fwd)
+	if not fwd or typeof(fromPos) ~= 'Vector3' or typeof(p) ~= 'Vector3' then
+		return false
+	end
+	local hb = equippedHitboxSize()
+	local halfW = math.max(hb.X * 0.5, 2)
+	local reach = math.max(hb.Z, 6)
+	local rel = p - fromPos
+	local f = rel.X * fwd.X + rel.Z * fwd.Z
+	local right = Vector3.new(-fwd.Z, 0, fwd.X)
+	local s = rel.X * right.X + rel.Z * right.Z
+	return f >= -2 and f <= reach and math.abs(s) <= halfW
+end
+
+local function hitboxCoverCount(fromPos, fwd, pack)
+	-- Look-up M1 only hits what is above you. Horizontal Z-reach used to
+	-- count the whole ring from the hole and skip teleporting under a body.
+	if rt.hoverN() < 0 then
+		local n = 0
+		for _, p in ipairs(pack) do
+			if Vector3.new(p.X - fromPos.X, 0, p.Z - fromPos.Z).Magnitude <= 4 then
+				n += 1
+			end
+		end
+		return n
+	end
+	local n = 0
+	for _, p in ipairs(pack) do
+		if facesInBox(fromPos, fwd, p) then
+			n += 1
+		end
+	end
+	return n
+end
+
+local function buryUnderPlant(pack, fallback)
+	local best, bestN = fallback, -1
+	if type(pack) ~= 'table' then
+		return fallback
+	end
+	for _, p in ipairs(pack) do
+		local n = 0
+		for _, q in ipairs(pack) do
+			if Vector3.new(p.X - q.X, 0, p.Z - q.Z).Magnitude <= 4.5 then
+				n += 1
+			end
+		end
+		if n > bestN then
+			best, bestN = p, n
+		end
+	end
+	return best or fallback
+end
+
+local function packHalfCount(fromPos, fwd, pack, radius)
+	fwd = slabFwd(fwd)
+	if not fwd then
+		return 0
+	end
+	radius = radius or 45
+	local n = 0
+	for _, p in ipairs(pack) do
+		local rel = Vector3.new(p.X - fromPos.X, 0, p.Z - fromPos.Z)
+		if rel.Magnitude > 0.35 and rel.Magnitude <= radius and rel:Dot(fwd) > 0 then
+			n += 1
+		end
+	end
+	return n
+end
+
+local function denserHalf(fromPos, pack)
+	local bestDir, bestN = Vector3.new(0, 0, -1), -1
+	for i = 0, 15 do
+		local dir = Vector3.new(math.cos(i * math.pi / 8), 0, math.sin(i * math.pi / 8))
+		local n = packHalfCount(fromPos, dir, pack, 45)
+		if n > bestN then
+			bestDir, bestN = dir, n
+		end
+	end
+	return bestDir
+end
+
+-- Face the densest clump, then flip if more of the room is in our back.
+-- In-slab cover was picking the 2 already in the box and yawing 180 from the pile.
+function crowdAimFrom(fromPos, npc)
+	local live = npc and enemyRoot(npc)
+	local pack = crowdPartsNear(npc)
+	if #pack == 0 and live then
+		pack = { live.Position }
+	end
+	local mid = select(1, densestCentroid(pack, 16)) or (live and live.Position)
+	local face
+	if typeof(mid) == 'Vector3' then
+		local to = Vector3.new(mid.X - fromPos.X, 0, mid.Z - fromPos.Z)
+		if to.Magnitude >= 2 then
+			face = to.Unit
+		end
+	end
+	if not face then
+		face = denserHalf(fromPos, pack)
+	end
+	local front = packHalfCount(fromPos, face, pack, 45)
+	local back = packHalfCount(fromPos, -face, pack, 45)
+	if back > front then
+		face = -face
+	end
+	if face.Magnitude < 0.05 then
+		face = Vector3.new(0, 0, -1)
+	end
+	return fromPos + face.Unit * 16
+end
+
 -- Hold station next to one enemy for the whole fight. The approach side is locked in
 -- once here on purpose: the old code recomputed it from our own live position every
 -- tick, which fed the previous write's error back into the next goal and made the
@@ -8268,24 +9304,29 @@ local function holdOnEnemy(npc)
 	local myRoot = routeRoot()
 	local part = enemyRoot(npc)
 	local flat
+	local hadOffset = false
 	if part and myRoot then
 		flat = Vector3.new(myRoot.Position.X - part.Position.X, 0, myRoot.Position.Z - part.Position.Z)
+		if flat.Magnitude >= 0.1 then
+			hadOffset = true
+			rt.engageDir = flat.Unit
+		end
 	end
-	if not flat or flat.Magnitude < 0.1 then
-		flat = Vector3.new(0, 0, 1)
+	if not hadOffset then
+		if typeof(rt.engageDir) == 'Vector3' and rt.engageDir.Magnitude > 0.05 then
+			flat = rt.engageDir
+		else
+			flat = Vector3.new(0, 0, 1)
+		end
 	end
 	local dir = flat.Unit
 	local stand0 = Options.DLFarmStand and tonumber(Options.DLFarmStand.Value) or 5
 	local roomIdx = Rooms.indexOf(npc)
-	if part and enemyRank(npc) < 3 then
-		local pack, n, mid = packAround(npc, part, 28)
-		if n >= 2 then
-			dir = bestPackFacing(pack, mid, stand0, dir)
-		end
-	end
-	-- Same room, same approach. Re-picking the side every kill walked the
-	-- character around the pack instead of through it.
-	if roomIdx and rt.packRoom == roomIdx and typeof(rt.packDir) == 'Vector3' then
+	if part and enemyRank(npc) < 3 and rt.hoverN() >= 0 then
+		rt.packStand = nil
+	elseif roomIdx and rt.packRoom == roomIdx and typeof(rt.packDir) == 'Vector3' then
+		-- Bosses only. Fodder used to keep the first room approach and look
+		-- past the pile at a stray.
 		dir = rt.packDir
 	else
 		rt.packDir = dir
@@ -8304,12 +9345,31 @@ local function holdOnEnemy(npc)
 	if part then
 		local params = RaycastParams.new()
 		params.FilterType = Enum.RaycastFilterType.Exclude
-		params.FilterDescendantsInstances = { char, npc }
+		local filter = { char, npc }
+		local dungeon = activeDungeonRoot()
+		local npcs = dungeon and dungeon:FindFirstChild('NPCs')
+		if npcs then
+			filter[#filter + 1] = npcs
+		end
+		params.FilterDescendantsInstances = filter
 		params.IgnoreWater = true
-		local hit = workspace:Raycast(part.Position + Vector3.new(0, 14, 0), Vector3.new(0, -80, 0), params)
+		local hit = workspace:Raycast(
+			Vector3.new(part.Position.X, part.Position.Y + 4, part.Position.Z),
+			Vector3.new(0, -120, 0),
+			params
+		)
+		if not hit then
+			hit = workspace:Raycast(
+				Vector3.new(part.Position.X, part.Position.Y + 80, part.Position.Z),
+				Vector3.new(0, -220, 0),
+				params
+			)
+		end
 		baseY = hit and (hit.Position.Y + hip) or part.Position.Y
+		rt.farmFloorY = hit and hit.Position.Y or (part.Position.Y - hip)
+		rt.farmFloorAt = os.clock()
 	end
-	local cachedOffY, cachedStand, cachedAt, cachedAim = 0, 5, 0, nil
+	local cachedOffY, cachedStand, cachedAt, cachedAim, cachedPlant = 0, 5, 0, nil, nil
 	Pin.follow(function()
 		local live = enemyRoot(npc)
 		if not live then
@@ -8323,15 +9383,18 @@ local function holdOnEnemy(npc)
 		if typeof(rt.aoeGoal) == 'Vector3' and os.clock() < (rt.aoeUntil or 0) then
 			rt.pinAoeN = (rt.pinAoeN or 0) + 1
 			rt.pinGoal = rt.aoeGoal
-			return rt.aoeGoal
+			return rt.aoeGoal, cachedAim
 		end
 		local now = os.clock()
 		if now - cachedAt > 0.2 then
 			cachedAt = now
 		local stand = Options.DLFarmStand and tonumber(Options.DLFarmStand.Value) or 5
-		local hover = Options.DLFarmHover and tonumber(Options.DLFarmHover.Value) or 0
 		local autoLow = on('DLFarmAutoLow')
 		local autoHigh = on('DLFarmAutoHigh')
+		-- Non-zero hover owns height in farmHoldCf. Don't feed AutoHigh Y into the pin.
+		if math.abs(rt.hoverN()) >= 0.5 then
+			autoLow, autoHigh = false, false
+		end
 		local y
 		-- Special offset is the ice-dodge bury. Auto low/high must still apply
 		-- or Scarlet Knight / Dark Professor sit 11.5 under the hurtbox and
@@ -8375,27 +9438,174 @@ local function holdOnEnemy(npc)
 			else
 				y = lowY
 			end
-			y += hover
 		else
-			y = (baseY or (live.Position.Y + hip)) + hover
+			y = (baseY or (live.Position.Y + hip))
 		end
 			cachedOffY = y - live.Position.Y
 			cachedStand = stand
-			cachedAim = nil
-			-- Face the clump, not a stray on the edge. Same-room fodder within 28.
-			-- Approach `dir` stays locked for the room — only the aim point updates.
-			if enemyRank(npc) < 3 then
-				local _, n, mid = packAround(npc, live, 28)
-				if n >= 2 then
-					cachedAim = mid
+			cachedPlant = live.Position
+			if rt.hoverN() < 0 then
+				-- Look-up M1 only hits what is above you. Do not sit in the
+				-- pack hole / stand-offset: that used horizontal Z-reach.
+				-- NEVER reset dir to +Z — that locked the yellow slab to a
+				-- world axis while mobs sat beside you (stand 0 → no aim delta).
+				cachedStand = 0
+				if enemyRank(npc) < 3 then
+					local pack, n = packAround(npc, live, 28)
+					if n >= 2 then
+						cachedPlant = buryUnderPlant(pack, live.Position)
+					end
+				end
+				local pack = crowdPartsNear(npc)
+				local mid, tn = densestCentroid(pack, 16)
+				if mid and tn and tn >= 2 then
+					rt.crowdSolo = false
+					if now - (rt.crowdAimAt or 0) > 0.55 or not rt.farmCrowdAim then
+						rt.crowdAimAt = now
+						rt.farmCrowdAim = mid
+					end
+					cachedAim = rt.farmCrowdAim or mid
+					cachedPlant = cachedPlant or mid
+				else
+					rt.crowdSolo = true
+					rt.farmCrowdAim = live.Position
+					cachedAim = live.Position
+					cachedPlant = live.Position
+				end
+			else
+				-- Frontal slab: stand off the densest clump and face into it.
+				cachedStand = math.max(stand, 4)
+				local pack = crowdPartsNear(npc)
+				local mid, tn = densestCentroid(pack, 16)
+				if mid and tn >= 2 then
+					rt.crowdSolo = false
+					-- Pack math is O(n^2); refresh a few times a second.
+					if now - (rt.crowdAimAt or 0) > 0.55 or not rt.farmCrowdAim then
+						rt.crowdAimAt = now
+						cachedPlant = mid
+						local rad, nR = 0, 0
+						for _, p in ipairs(pack) do
+							if Vector3.new(p.X - mid.X, 0, p.Z - mid.Z).Magnitude <= 16 then
+								rad += Vector3.new(p.X - mid.X, 0, p.Z - mid.Z).Magnitude
+								nR += 1
+							end
+						end
+						local avgR = nR > 0 and (rad / nR) or 0
+						if avgR > 12 then
+							cachedStand = math.max(cachedStand, avgR - 2)
+						end
+						dir = bestPackFacing(pack, mid, cachedStand, dir)
+						cachedAim = mid
+						rt.farmCrowdAim = cachedAim
+						rt.crowdDir = dir
+						rt.crowdPlant = cachedPlant
+						rt.crowdStand = cachedStand
+					else
+						if typeof(rt.crowdDir) == 'Vector3' then
+							dir = rt.crowdDir
+						end
+						if typeof(rt.crowdPlant) == 'Vector3' then
+							cachedPlant = rt.crowdPlant
+						end
+						if type(rt.crowdStand) == 'number' then
+							cachedStand = rt.crowdStand
+						end
+						cachedAim = rt.farmCrowdAim
+					end
+				else
+					-- Solo / sparse: mark for per-frame yaw tracking below.
+					rt.crowdSolo = true
+					cachedPlant = live.Position
+					cachedAim = live.Position
+					rt.farmCrowdAim = live.Position
+					rt.crowdAimAt = now
+					local me = routeRoot()
+					if me then
+						local away = Vector3.new(me.Position.X - live.Position.X, 0, me.Position.Z - live.Position.Z)
+						if away.Magnitude > 0.35 then
+							dir = away.Unit
+						end
+					end
+					rt.crowdDir = dir
+					rt.crowdPlant = cachedPlant
+					rt.crowdStand = cachedStand
 				end
 			end
 		end
+		-- Hover is applied in farmHoldCf so AOE / Pin.at cannot wipe it.
 		local y = live.Position.Y + cachedOffY
 		local stand = cachedStand
 		local aimAt = cachedAim or live.Position
-		-- `dir` is locked at hold start. Live-position back orbited the pack.
-		local goal = Vector3.new(aimAt.X, y, aimAt.Z) + Vector3.new(dir.X, 0, dir.Z) * stand
+		local plant = cachedPlant or live.Position
+		-- Per-frame pack chase: 0.55s cache left the yellow box on empty floor
+		-- while mobs walked out. Look-up needs XZ under the clump every tick.
+		local lookUp = rt.hoverN() < 0
+		do
+			local pack = crowdPartsNear(npc)
+			local mid, tn = densestCentroid(pack, 16)
+			if mid and tn and tn >= 2 then
+				rt.crowdSolo = false
+				plant = mid
+				aimAt = mid
+				rt.farmCrowdAim = mid
+				if not lookUp then
+					-- Frontal: keep a stand ring but retarget mid every frame.
+					stand = math.max(stand, cachedStand or 4)
+					if typeof(rt.crowdDir) == 'Vector3' and rt.crowdDir.Magnitude > 0.05 then
+						dir = rt.crowdDir
+					else
+						dir = bestPackFacing(pack, mid, stand, dir)
+						rt.crowdDir = dir
+					end
+				else
+					stand = 0
+					cachedPlant = mid
+				end
+			else
+				rt.crowdSolo = true
+				plant = live.Position
+				aimAt = live.Position
+				rt.farmCrowdAim = live.Position
+				if lookUp then
+					stand = 0
+				end
+			end
+		end
+		-- Solo / behind-target every pin frame.
+		if rt.crowdSolo then
+			plant = live.Position
+			aimAt = live.Position
+			rt.farmCrowdAim = live.Position
+			local me = routeRoot()
+			if me then
+				local away = Vector3.new(me.Position.X - live.Position.X, 0, me.Position.Z - live.Position.Z)
+				if away.Magnitude > 0.35 then
+					dir = away.Unit
+				end
+			end
+		else
+			-- Pack path: if the locked npc slipped behind the slab, break the
+			-- 0.55s cache and face them (same bug as solo, just mid-pack).
+			local me = routeRoot()
+			if me and live then
+				local to = Vector3.new(live.Position.X - me.Position.X, 0, live.Position.Z - me.Position.Z)
+				if to.Magnitude > 1.25 then
+					local look = Vector3.new(me.CFrame.LookVector.X, 0, me.CFrame.LookVector.Z)
+					if look.Magnitude < 0.05 then
+						look = Vector3.new(me.CFrame.UpVector.X, 0, me.CFrame.UpVector.Z)
+					end
+					if look.Magnitude > 0.05 and look.Unit:Dot(to.Unit) < 0.25 then
+						rt.crowdSolo = true
+						rt.crowdAimAt = 0
+						plant = live.Position
+						aimAt = live.Position
+						rt.farmCrowdAim = live.Position
+						dir = -to.Unit
+					end
+				end
+			end
+		end
+		local goal = Vector3.new(plant.X, y, plant.Z) + Vector3.new(dir.X, 0, dir.Z) * stand
 		local dungeon = activeDungeonRoot()
 		if dungeon and Rooms.posInCorridor(dungeon, goal) then
 			local idx = tonumber(rt.farmRoomFilter) or Rooms.indexOf(npc)
@@ -8404,7 +9614,58 @@ local function holdOnEnemy(npc)
 				-- instead: warping to the room centre dragged the character away
 				-- from the mobs it was mid-fight with, across the whole room.
 				rt.pinCorridorN = (rt.pinCorridorN or 0) + 1
-				goal = Vector3.new(aimAt.X, y, aimAt.Z)
+				if lookUp then
+					goal = Vector3.new(plant.X, y, plant.Z)
+				else
+					-- Keep a few studs off so the frontal box can hit.
+					goal = Vector3.new(plant.X, y, plant.Z) + Vector3.new(dir.X, 0, dir.Z) * 4
+				end
+			end
+		end
+		-- Soft-follow the pack so the hitbox rides with moving mobs instead of
+		-- hard-snapping once and staring at empty tile.
+		local meNow = routeRoot()
+		if meNow then
+			local here = meNow.Position
+			local flatDist = Vector3.new(goal.X - here.X, 0, goal.Z - here.Z).Magnitude
+			if flatDist > 0.35 then
+				-- Look-up: stick tight under the clump. Frontal: slightly looser.
+				local t = lookUp and math.clamp(0.28 + flatDist * 0.08, 0.28, 0.75)
+					or math.clamp(0.2 + flatDist * 0.05, 0.2, 0.55)
+				goal = Vector3.new(
+					here.X + (goal.X - here.X) * t,
+					goal.Y,
+					here.Z + (goal.Z - here.Z) * t
+				)
+			end
+		end
+		-- Yaw must not depend on aim-pos (collapses at stand 0 / look-up bury).
+		local from = (meNow and meNow.Position) or goal
+		local faceAt = aimAt or live.Position
+		local toFace = Vector3.new(faceAt.X - from.X, 0, faceAt.Z - from.Z)
+		if toFace.Magnitude > 0.35 then
+			rt.farmFaceDir = toFace.Unit
+		elseif typeof(dir) == 'Vector3' and dir.Magnitude > 0.05 then
+			rt.farmFaceDir = -Vector3.new(dir.X, 0, dir.Z).Unit
+		elseif typeof(rt.engageDir) == 'Vector3' and rt.engageDir.Magnitude > 0.05 then
+			rt.farmFaceDir = -rt.engageDir.Unit
+		else
+			-- Buried in the clump: average headings to pack members with XZ spread.
+			local pack = crowdPartsNear(npc)
+			local sx, sz, n = 0, 0, 0
+			for _, p in ipairs(pack) do
+				local dx = p.X - from.X
+				local dz = p.Z - from.Z
+				local m2 = dx * dx + dz * dz
+				if m2 > 0.12 then
+					local m = math.sqrt(m2)
+					sx += dx / m
+					sz += dz / m
+					n += 1
+				end
+			end
+			if n > 0 then
+				rt.farmFaceDir = Vector3.new(sx / n, 0, sz / n).Unit
 			end
 		end
 		rt.pinGoal = goal
@@ -8458,6 +9719,7 @@ local function farmKill(npc)
 	end
 	pcall(watchEnemy, npc)
 	rt.farmFightNpc = npc
+	rt.farmPitchYaw = nil
 	rt.farmFighting = true
 	local function packAlive()
 		if crystalPack then
@@ -8472,6 +9734,7 @@ local function farmKill(npc)
 		local now = os.clock()
 		if rt.refillUrgent or rt.refillBusy then
 			farmLabel = 'potion refill'
+			rt.farmReturnNpc = npc
 			break
 		end
 		if now - started > timeout then
@@ -8489,6 +9752,7 @@ local function farmKill(npc)
 			break
 		elseif (on('DLAutoPotion') or on('DLAutoFlee')) and rt.updateHealWait(myPct) then
 			farmLabel = ('heal · %d%% / %d%%'):format(math.floor(myPct + 0.5), rt.healResume())
+			rt.farmReturnNpc = npc
 			if on('DLAutoFlee') and type(rt.fleeNow) == 'function' then
 				task.spawn(rt.fleeNow, true)
 			end
@@ -8527,6 +9791,28 @@ local function farmKill(npc)
 					end
 					break
 				end
+			elseif not sticky and now - (rt.retargetAt or 0) > 0.55 then
+				-- Other clumps in this room: leave this npc so pickFarmTarget
+				-- can snap onto the denser pack instead of walking.
+				rt.retargetAt = now
+				local other = pickFarmTarget()
+				if other and other ~= npc then
+					local a, b = enemyRoot(other), enemyRoot(npc)
+					local hop = rt.hoverN() < 0 and 5 or 16
+					if a and b then
+						local dist = (a.Position - b.Position).Magnitude
+						local denser = false
+						if rt.hoverN() >= 0 and dist > 4 and enemyRank(npc) < 3 then
+							local _, nA = packAround(other, a, 14)
+							local _, nB = packAround(npc, b, 14)
+							denser = (tonumber(nA) or 0) > (tonumber(nB) or 0) + 1
+						end
+						if dist > hop or denser then
+							farmLabel = ('retarget · %s'):format(other.Name)
+							break
+						end
+					end
+				end
 			end
 			if now - lastHit >= attackDelay() then
 				lastHit = now
@@ -8546,10 +9832,11 @@ local function farmKill(npc)
 					farmLabel = ('skip · %s'):format(npc.Name)
 					break
 				end
-			elseif not readable and not sticky and not crystalPack and not addPack then
-				-- HealthOverride fodder has no HP bar. HitReact still ticks on
-				-- their own swings, so stall must watch OUR damage, not theirs.
-				local stallFor = 6
+			elseif not readable and not crystalPack and not addPack then
+				-- No HP bar: watch our damage. Sticky specials with no Humanoid
+				-- (dead Scarlet Knight shells) never dropped HP and sat the
+				-- full 240s boss timeout.
+				local stallFor = sticky and 8 or 6
 				local dealt = tonumber(LocalPlayer:GetAttribute('Damage_Dealt')) or 0
 				local hits = tonumber(LocalPlayer:GetAttribute('Hit_Count')) or 0
 				if dealt > dealt0 + 0.5 or hits > hits0 then
@@ -8557,8 +9844,17 @@ local function farmKill(npc)
 					hits0 = math.max(hits0, hits)
 					lastDrop = now
 				elseif now - started > stallFor and now - lastDrop > stallFor then
-					farmBan[npc] = os.clock() + 120
-					farmLabel = ('skip · %s'):format(npc.Name)
+					-- No damage usually means we stood in the pack hole. Replant
+					-- on a new side — a 120s ban made the whole ring vanish.
+					rt.packDir = nil
+					rt.packRoom = nil
+					rt.packStand = nil
+					if sticky then
+						farmBan[npc] = os.clock() + 30
+					else
+						farmBan[npc] = os.clock() + 1.5
+					end
+					farmLabel = ('replant · %s'):format(npc.Name)
 					break
 				end
 			end
@@ -8567,12 +9863,34 @@ local function farmKill(npc)
 	end
 	rt.farmFighting = false
 	rt.farmFightNpc = nil
+	rt.farmCrowdAim = nil
+	rt.farmFaceDir = nil
+	rt.crowdSolo = nil
+	rt.crowdDir = nil
+	rt.crowdPlant = nil
+	rt.crowdStand = nil
+	rt.crowdAimAt = nil
+	rt.farmPitchYaw = nil
 	rt.crystalPack = false
 	rt.addPack = false
+	if not (farmBusy and rt.hoverN() < 0) then
+		rt.setFarmPitchHum(false)
+	end
 	-- Stay put after a kill. Do not re-pin onto the pack after a heal break —
 	-- that yanked flee back into the boss.
 	if not rt.healWait then
-		Pin.station()
+		local more = rt.farmRoomFilter and rt.roomHasLiving(rt.farmRoomFilter)
+		if more then
+			-- Keep the hover stand so the next pack snap does not start from the floor.
+		else
+			local root = routeRoot()
+			local anchor = typeof(rt.pinGoal) == 'Vector3' and rt.pinGoal or (root and root.Position)
+			if typeof(anchor) == 'Vector3' then
+				Pin.at(standingSpot(anchor, 0), true)
+			else
+				Pin.station()
+			end
+		end
 	end
 	if crystalPack then
 		if #listRaidCrystals() == 0 then
@@ -8590,6 +9908,9 @@ local function farmKill(npc)
 		farmKills += 1
 		if farmLock == npc then
 			farmLock = nil
+		end
+		if rt.farmReturnNpc == npc then
+			rt.farmReturnNpc = nil
 		end
 		farmFinished[npc] = os.clock() + FARM_FINISHED_COOLDOWN
 		if on('DLHuntSpecial') and isHuntTarget(npc) and type(rt.requestHuntReturn) == 'function' then
@@ -8703,10 +10024,30 @@ local function clearSweepMark(idx)
 	end)
 end
 
+local function destroyOrphanSweepMarks()
+	-- Rare cleanup only. Full dungeon GetDescendants every clearAll was a hitch.
+	if os.clock() - (rt.orphanSweepAt or 0) < 8 then
+		return
+	end
+	rt.orphanSweepAt = os.clock()
+	pcall(function()
+		local dungeon = activeDungeonRoot()
+		if not dungeon then
+			return
+		end
+		for _, inst in ipairs(dungeon:GetDescendants()) do
+			if inst.Name == SWEEP_MARK then
+				inst:Destroy()
+			end
+		end
+	end)
+end
+
 local function clearAllSweepMarks()
 	for idx in pairs(sweepMarks) do
 		clearSweepMark(idx)
 	end
+	destroyOrphanSweepMarks()
 end
 
 local function roomPosKey(dungeon, idx)
@@ -8782,6 +10123,17 @@ local function goToOpenStar(dungeon, maxRoom)
 	rt.farmRoomIdx = star
 	rt.farmRoomPhase = 'wait'
 	rt.farmRoomFilter = nil
+	-- Point the ordered slot at this star. Leaving slot past the end made
+	-- the next tour pass set idx = maxRoom+1 and call us again forever
+	-- (stuck on "star Room_N" after the special).
+	pcall(function()
+		for i, s in ipairs(Rooms.layoutCombatRooms()) do
+			if s == star then
+				rt.farmStarSlot = i
+				break
+			end
+		end
+	end)
 	farmLabel = ('star Room_%d'):format(star)
 	return true
 end
@@ -8796,6 +10148,11 @@ local function markRoomSwept(dungeon, idx)
 	if key then
 		rt.roomSweepDonePos = rt.roomSweepDonePos or {}
 		rt.roomSweepDonePos[key] = true
+	end
+	-- Force skipTour to see 'done' immediately.
+	if type(rt.skipTourCache) == 'table' then
+		rt.skipTourCache.at[idx] = nil
+		rt.skipTourCache.why[idx] = nil
 	end
 	clearSweepMark(idx)
 end
@@ -8826,24 +10183,40 @@ function roomHasPendingChest(dungeon, idx)
 	if not dungeon or not idx then
 		return false
 	end
-	for _, child in ipairs(dungeon:GetChildren()) do
-		if child:GetAttribute('DungeonChest') == true or child.Name:sub(1, 13) == 'DungeonChest' then
-			if chestBelongsToRoom(dungeon, idx, child) then
-				if chestIsClaimed(child) then
-					markChestDone(child)
-					continue
-				end
-				if child:GetAttribute('LockedRoom') == true and not wantOpenGates() then
-					local p = chestPrompt(child)
-					if not (p and p.Enabled == true) then
-						continue
-					end
-				end
-				return true
+	if not rt.chestsNow() then
+		return false
+	end
+	local found = false
+	rt.eachDungeonChest(dungeon, function(child)
+		if found or not chestBelongsToRoom(dungeon, idx, child) then
+			return
+		end
+		if chestIsClaimed(child) then
+			markChestDone(child)
+			return
+		end
+		if child:GetAttribute('LockedRoom') == true and not wantOpenGates() then
+			local p = chestPrompt(child)
+			if not (p and p.Enabled == true) then
+				return
 			end
 		end
+		found = true
+	end)
+	return found
+end
+
+function rt.roomClear(dungeon, idx)
+	if not dungeon or not idx then
+		return false
 	end
-	return false
+	if rt.roomHasLiving(idx) then
+		return false
+	end
+	if Rooms.aliveCount(dungeon, idx) > 0 or Rooms.dormantCount(dungeon, idx) > 0 then
+		return false
+	end
+	return true
 end
 
 local function roomHasPendingGate(dungeon, idx)
@@ -8890,41 +10263,65 @@ local function skipTourRoom(dungeon, idx)
 	if not dungeon or not idx then
 		return nil
 	end
+	-- skipTour walks chests/gates/shrines; tour + sweep marks called it for
+	-- every Room_N every frame. Cache ~0.6s per index.
+	local cache = rt.skipTourCache
+	if type(cache) ~= 'table' or cache.dungeon ~= dungeon then
+		cache = { dungeon = dungeon, at = {}, why = {} }
+		rt.skipTourCache = cache
+	end
+	local now = os.clock()
+	if cache.at[idx] and now - cache.at[idx] < 0.6 then
+		return cache.why[idx]
+	end
+	local why
 	if Rooms.isCorridor(dungeon, idx) then
-		return 'hall'
+		why = 'hall'
+	elseif Rooms.isStartRoom(dungeon, idx) then
+		why = 'start'
+	elseif Rooms.dormantCount(dungeon, idx) > 0 or roomHasPendingChest(dungeon, idx) then
+		why = nil
+	else
+		-- Incomplete HUD stars (loot / empty circle) must still be visited even if
+		-- we already stamped the room swept after a dry loot pass.
+		local hudOpen = false
+		pcall(function()
+			hudOpen = Rooms.layoutRoomOpen(idx) == true
+		end)
+		if hudOpen then
+			-- HUD can stay empty after we already cleared and looted. Going back
+			-- every pass is the "stuck in Room_N" loop.
+			if roomIsSwept(dungeon, idx)
+				and Rooms.aliveCount(dungeon, idx) <= 0
+				and Rooms.dormantCount(dungeon, idx) <= 0
+				and not roomHasPendingChest(dungeon, idx)
+				and not roomHasPendingGate(dungeon, idx)
+			then
+				why = 'done'
+			else
+				why = nil
+			end
+		elseif roomIsSwept(dungeon, idx) then
+			why = 'done'
+		elseif type(rt.shrineRoomDone) == 'function' and rt.shrineRoomDone(dungeon, idx) then
+			why = 'shrine'
+		else
+			local room = dungeon:FindFirstChild('Room_' .. tostring(idx))
+			if room and room:GetAttribute('IsCheckpoint') == true
+				and Rooms.aliveCount(dungeon, idx) <= 0
+				and Rooms.dormantCount(dungeon, idx) <= 0
+				and not roomHasPendingChest(dungeon, idx)
+				and not roomHasPendingGate(dungeon, idx)
+			then
+				why = 'checkpoint'
+			else
+				why = nil
+			end
+		end
 	end
-	if Rooms.isStartRoom(dungeon, idx) then
-		return 'start'
-	end
-	-- Incomplete HUD stars (loot / empty circle) must still be visited even if
-	-- we already stamped the room swept after a dry loot pass.
-	if Rooms.dormantCount(dungeon, idx) > 0 or roomHasPendingChest(dungeon, idx) then
-		return nil
-	end
-	-- HUD empty circle for this Index: still go there even if we stamped it swept.
-	local hudOpen = false
-	pcall(function()
-		hudOpen = Rooms.layoutRoomOpen(idx) == true
-	end)
-	if hudOpen then
-		return nil
-	end
-	local room = dungeon:FindFirstChild('Room_' .. tostring(idx))
-	if roomIsSwept(dungeon, idx) then
-		return 'done'
-	end
-	if type(rt.shrineRoomDone) == 'function' and rt.shrineRoomDone(dungeon, idx) then
-		return 'shrine'
-	end
-	if room and room:GetAttribute('IsCheckpoint') == true
-		and Rooms.aliveCount(dungeon, idx) <= 0
-		and Rooms.dormantCount(dungeon, idx) <= 0
-		and not roomHasPendingChest(dungeon, idx)
-		and not roomHasPendingGate(dungeon, idx)
-	then
-		return 'checkpoint'
-	end
-	return nil
+	cache.at[idx] = now
+	cache.why[idx] = why
+	return why
 end
 
 local function sweepKindColor(dungeon, idx)
@@ -8942,12 +10339,9 @@ local function sweepKindColor(dungeon, idx)
 end
 
 local function sweepMarksOn()
-	if LocalPlayer:GetAttribute('InDungeon') == true or farmBusy then
-		return true
-	end
 	local t = Toggles and Toggles.DLSweepMarks
 	if t == nil then
-		return true
+		return false
 	end
 	return t.Value == true
 end
@@ -9093,14 +10487,16 @@ local function advanceFromRoom(dungeon, idx)
 				break
 			end
 		end
-		rt.farmStarSlot = slot + 1
-		rt.farmRoomIdx = stars[slot + 1] or (idx + 1)
+		local curSlot = tonumber(rt.farmStarSlot) or 1
+		rt.farmStarSlot = math.max(curSlot, slot + 1)
+		rt.farmRoomIdx = stars[rt.farmStarSlot] or (idx + 1)
 	else
 		rt.farmRoomIdx = idx + 1
 	end
 	rt.farmRoomPhase = 'wait'
 	rt.farmRoomFilter = nil
 	rt.lootStallIdx = nil
+	rt.lootStallTries = nil
 	rt.packDir = nil
 	rt.packRoom = nil
 end
@@ -9132,9 +10528,9 @@ local function tourFarmRooms(dungeon)
 		task.wait(0.25)
 		return
 	end
-	rt.farmStep = 'tour:marks'
-	pcall(tickRoomSweepMarks)
 	rt.farmStep = 'tour:rooms'
+	-- Sweep marks live on the combat heartbeat (throttled). Calling them here
+	-- every tour pass re-walked every Room_N skipTour + chest GetDescendants.
 	local dname = dungeon.Name
 	if dname and rt.farmDungeonId ~= dname then
 		rt.farmDungeonId = dname
@@ -9159,13 +10555,7 @@ local function tourFarmRooms(dungeon)
 		end)
 		if #stars > 0 then
 			local slot = tonumber(rt.farmStarSlot)
-			-- An earlier empty HUD star always wins. Matching the current Room_N
-			-- is how Room_2 stayed blank after the farm had already walked past it.
-			local firstOpen = false
-			pcall(function()
-				firstOpen = Rooms.layoutRoomOpen(stars[1]) == true
-			end)
-			if not slot or firstOpen then
+			if not slot then
 				slot = 1
 			end
 			while slot <= #stars do
@@ -9180,6 +10570,8 @@ local function tourFarmRooms(dungeon)
 			if slot <= #stars then
 				idx = stars[slot]
 				rt.farmRoomIdx = idx
+			elseif tonumber(rt.farmRoomIdx) and rt.farmRoomIdx <= maxRoom then
+				idx = rt.farmRoomIdx
 			else
 				idx = maxRoom + 1
 				rt.farmRoomIdx = idx
@@ -9192,19 +10584,24 @@ local function tourFarmRooms(dungeon)
 		return
 	end
 	if idx > maxRoom then
-		local okStar, went = pcall(goToOpenStar, dungeon, maxRoom)
-		if okStar and went then
-			return
-		end
-		if Rooms.hudHasOpenStar() then
-			farmLabel = 'waiting · stars'
-			task.wait(0.4)
-			return
-		end
+		local backChest = rt.firstChestRoom(dungeon)
+		if backChest and rt.roomClear(dungeon, backChest) then
+			idx = backChest
+			rt.farmRoomIdx = backChest
+			rt.farmRoomPhase = 'loot'
+		elseif backChest then
+			idx = backChest
+			rt.farmRoomIdx = backChest
+			rt.farmRoomPhase = 'fight'
+		else
 		rt.farmRoomFilter = nil
 		local boss = findFloorBoss()
 		if boss then
 			farmKillNpc(boss)
+			return
+		end
+		local okStar, went = pcall(goToOpenStar, dungeon, maxRoom)
+		if okStar and went then
 			return
 		end
 		local leftover = pickFarmTarget()
@@ -9215,6 +10612,7 @@ local function tourFarmRooms(dungeon)
 		farmLabel = ('idle · %d kills'):format(farmKills)
 		task.wait(0.25)
 		return
+		end
 	end
 	while idx <= maxRoom do
 		local okSkip, why = pcall(skipTourRoom, dungeon, idx)
@@ -9241,18 +10639,46 @@ local function tourFarmRooms(dungeon)
 		rt.packRoom = nil
 	end
 	if idx > maxRoom then
+		local backChest = rt.firstChestRoom(dungeon)
+		if backChest and rt.roomClear(dungeon, backChest) then
+			idx = backChest
+			rt.farmRoomIdx = backChest
+			rt.farmRoomPhase = 'loot'
+		elseif backChest then
+			idx = backChest
+			rt.farmRoomIdx = backChest
+			rt.farmRoomPhase = 'fight'
+		else
+		rt.farmRoomFilter = nil
+		local boss = findFloorBoss()
+		if boss then
+			farmKillNpc(boss)
+			return
+		end
 		local okStar, went = pcall(goToOpenStar, dungeon, maxRoom)
 		if okStar and went then
 			return
 		end
-		if Rooms.hudHasOpenStar() then
-			farmLabel = 'waiting · stars'
-			task.wait(0.4)
+		local leftover = pickFarmTarget()
+		if leftover then
+			farmKillNpc(leftover)
 			return
 		end
 		return
+		end
 	end
 	local phase = rt.farmRoomPhase or 'wait'
+	-- Leftover chests only after THIS room is dead. Yanking to a chest
+	-- during wait/load skipped the pack.
+	if rt.chestsNow() and phase ~= 'fight' and rt.roomClear(dungeon, idx) then
+		local backChest = rt.firstChestRoom(dungeon)
+		if backChest and backChest ~= idx and rt.roomClear(dungeon, backChest) then
+			idx = backChest
+			rt.farmRoomIdx = backChest
+			rt.farmRoomPhase = 'loot'
+			phase = 'loot'
+		end
+	end
 	local roomModel = dungeon:FindFirstChild('Room_' .. tostring(idx))
 	if roomModel and roomModel:GetAttribute('IsLootRoom') == true
 		and Rooms.aliveCount(dungeon, idx) <= 0
@@ -9265,20 +10691,25 @@ local function tourFarmRooms(dungeon)
 	if phase == 'wait' then
 		farmLabel = ('Room_%d · wait'):format(idx)
 		local model = dungeon:FindFirstChild('Room_' .. tostring(idx))
-		if not model or not Rooms.zone(dungeon, idx) then
+		if not model then
+			-- Layout can name a Room_N that was never generated (Scarlet Knight
+			-- leftover sat on Room_24 with no folder).
+			farmLabel = ('skip missing Room_%d'):format(idx)
+			advanceFromRoom(dungeon, idx)
+			return
+		end
+		if not Rooms.zone(dungeon, idx) then
 			farmLabel = ('Room_%d · load'):format(idx)
 			-- Do not pushForward to a neighboring streamed room — that was a
 			-- ~100-stud snap every few seconds (the load-phase stutter).
-			if model then
-				local ok, pivot = pcall(function()
-					return model:GetPivot().Position
-				end)
-				if ok and typeof(pivot) == 'Vector3' then
-					local stand = standingSpot(pivot, 0)
-					local here = routeRoot()
-					if not here or (here.Position - stand).Magnitude > 8 then
-						Pin.at(stand, true)
-					end
+			local ok, pivot = pcall(function()
+				return model:GetPivot().Position
+			end)
+			if ok and typeof(pivot) == 'Vector3' then
+				local stand = standingSpot(pivot, 0)
+				local here = routeRoot()
+				if not here or (here.Position - stand).Magnitude > 8 then
+					Pin.at(stand, true)
 				end
 			end
 			task.wait(0.35)
@@ -9303,6 +10734,11 @@ local function tourFarmRooms(dungeon)
 		end
 		local target = pickFarmTarget()
 		if not target then
+			if Rooms.dormantCount(dungeon, idx) > 0 then
+				farmLabel = ('Room_%d · wake'):format(idx)
+				pcall(Rooms.holdRoom, dungeon, idx, 1)
+				return
+			end
 			rt.farmRoomPhase = 'loot'
 			return
 		end
@@ -9318,7 +10754,10 @@ local function tourFarmRooms(dungeon)
 		return
 	end
 	farmLabel = ('Room_%d · loot'):format(idx)
-	if wantOpenGates() then
+	-- Gate unlock at most once/sec here. fireKeyPrompt waits HoldDuration (~0.8s)
+	-- and was burning the loot tour every frame when Open gates was on.
+	if wantOpenGates() and os.clock() - (rt.lootGateAt or 0) > 1.0 then
+		rt.lootGateAt = os.clock()
 		local opened = false
 		pcall(function()
 			opened = KeyDoor.unlockForRoom(idx) == true
@@ -9328,12 +10767,15 @@ local function tourFarmRooms(dungeon)
 			rt.chestRoomOpen[idx] = true
 		end
 	end
-	pcall(lootRoomAndChildren, dungeon, idx)
-	local stillOpen = false
-	pcall(function()
-		stillOpen = Rooms.layoutRoomOpen(idx) == true
-	end)
-	if roomSweepComplete(dungeon, idx) and not stillOpen then
+	-- Loot at most ~2/s. Re-snapping every tour yield thrashed the pin + FPS.
+	local nowLoot = os.clock()
+	if (rt.lootTryIdx ~= idx) or (nowLoot - (rt.lootTryAt or 0) > 0.45) then
+		rt.lootTryIdx = idx
+		rt.lootTryAt = nowLoot
+		pcall(lootRoomAndChildren, dungeon, idx)
+	end
+	-- HUD stars lag after a clear. Do not sit here waiting for Done=true.
+	if roomSweepComplete(dungeon, idx) then
 		markRoomSwept(dungeon, idx)
 		advanceFromRoom(dungeon, idx)
 	else
@@ -9341,10 +10783,38 @@ local function tourFarmRooms(dungeon)
 		if rt.lootStallIdx ~= idx then
 			rt.lootStallIdx = idx
 			rt.lootStallAt = os.clock()
-		elseif os.clock() - (rt.lootStallAt or 0) > 12 then
-			-- Do not retry forever. A live chest is walked every loot pass now;
-			-- if it still will not claim, leave so the farm cannot sit on
-			-- "looting Room_N" with ticks climbing and no movement.
+			rt.lootStallTries = 0
+		end
+		local stalled = os.clock() - (rt.lootStallAt or 0)
+		local noLiving = Rooms.aliveCount(dungeon, idx) <= 0 and Rooms.dormantCount(dungeon, idx) <= 0
+		-- Empty room: leave loot in 1.5s. Do not babysit Enabled chest prompts
+		-- for 8–24s while a live pack sits in another room.
+		local limit = noLiving and 1.5 or 8.0
+		if stalled > limit then
+			if not noLiving then
+				rt.lootStallIdx = nil
+				rt.farmRoomPhase = 'fight'
+				return
+			end
+			if rt.chestsNow() and roomHasPendingChest(dungeon, idx) then
+				rt.lootStallTries = (rt.lootStallTries or 0) + 1
+				if rt.lootStallTries < 2 then
+					if rt.lootPassDone then
+						rt.lootPassDone[idx] = nil
+					end
+					rt.lootPassUntil = nil
+					pcall(lootRoomAndChildren, dungeon, idx)
+					-- Do not reset lootStallAt — retries used to stretch one room
+					-- into 24s of frozen "Room_N · loot".
+					return
+				end
+				rt.chestSkip = rt.chestSkip or {}
+				rt.eachDungeonChest(dungeon, function(child)
+					if rt.chestInRoom(dungeon, idx, child) then
+						rt.chestSkip[child] = os.clock() + 90
+					end
+				end)
+			end
 			rt.lootStallIdx = nil
 			markRoomSwept(dungeon, idx)
 			advanceFromRoom(dungeon, idx)
@@ -9377,7 +10847,9 @@ local function farmLoop()
 		rt.farmStepAt = now
 	end
 	step('enter')
-	while currentInstance() and on('DLAutoFarm') and inDungeonFarm() do
+	while currentInstance() and on('DLAutoFarm') and rt.farmUserOff ~= true
+		and inDungeonFarm() and not rt.farmSoftRestart and not rt.farmStop
+	do
 		rt.farmTicks = (rt.farmTicks or 0) + 1
 		step('noclip')
 		pcall(setCharNoclip, true)
@@ -9396,6 +10868,13 @@ local function farmLoop()
 			task.wait(0.2)
 		elseif routeBusy then
 			farmLabel = 'paused · route'
+			-- Shrine/chest/special must clear routeBusy. If a pcall aborted early,
+			-- farm sat here forever and looked "broken".
+			if os.clock() - (rt.routeBusyAt or 0) > 12 then
+				routeBusy = false
+				routeLabel = nil
+				rt.shrineBusyAt = nil
+			end
 			task.wait(0.3)
 		elseif os.clock() < (rt.combatHold or 0) then
 			farmLabel = 'waiting · recover'
@@ -9418,9 +10897,22 @@ local function farmLoop()
 					blessHold = rt.blessFarmPriority() == true
 				end
 			end)
-			if blessHold then
-				farmLabel = farmLabel or 'blessing'
-				task.wait(0.2)
+			-- Blessings first — before fight-return, specials, or rooms.
+			if blessHold or (type(rt.blessBusy) == 'function' and rt.blessBusy()) then
+				farmLabel = farmLabel or 'blessing shrine'
+				task.wait(0.15)
+			else
+			local back = rt.farmReturnNpc
+			if back and (not back.Parent or not enemyAlive(back) or farmSkipped(back) or not enemyRoot(back)) then
+				if rt.farmReturnNpc == back then
+					rt.farmReturnNpc = nil
+				end
+				back = nil
+			end
+			if back then
+				step('return')
+				rt.farmReturnNpc = nil
+				farmKillNpc(back)
 			else
 				step('aoe')
 				-- holdOnEnemy already steps off floor discs. Pin.at here mid-fight
@@ -9434,19 +10926,49 @@ local function farmLoop()
 				end
 				step('scan')
 				local dungeon = activeDungeonRoot()
-				-- Rooms-in-order: stay on Room_N until it is done. Map-wide special
-				-- / aggro used to clear the room filter and hop across the floor.
-				if on('DLRoomsInOrder') then
+				-- Floor order: blessings (above) → special → rooms (kill, gates,
+				-- chests). Rooms-in-order used to skip the special and never
+				-- leave the first star.
+				local specialNpc = findLiveSpecial()
+				if specialNpc then
+					rt.farmRoomFilter = nil
+					step('special')
+					farmKillNpc(specialNpc)
+				else
+				local floorBoss = findFloorBoss()
+				local awakeLeft = false
+				if floorBoss then
+					eachFarmNpc(function(npc)
+						if awakeLeft or npc == floorBoss or not enemyAlive(npc) or farmSkipped(npc) then
+							return
+						end
+						if npc:GetAttribute('IsDormant') == true then
+							return
+						end
+						awakeLeft = true
+					end)
+				end
+				if floorBoss and not awakeLeft then
+					-- Walk-to chests: only after pre-boss stars, never the last room.
+					if rt.chestsNow() and dungeon and rt.firstChestRoom(dungeon) then
+						step('chests')
+						pcall(rt.grabPreBossChests, dungeon)
+						if rt.firstChestRoom(dungeon) then
+							rt.farmRoomIdx = rt.firstChestRoom(dungeon)
+							rt.farmRoomPhase = 'loot'
+							tourFarmRooms(dungeon)
+						end
+					else
+						rt.farmRoomFilter = nil
+						step('boss')
+						farmKillNpc(floorBoss)
+					end
+				elseif on('DLRoomsInOrder') then
 					step('tour')
 					tourFarmRooms(dungeon)
 				else
-					local specialNpc = findLiveSpecial()
 					local aggroNpc = nearestAggro(60)
-					if specialNpc then
-						rt.farmRoomFilter = nil
-						step('special')
-						farmKillNpc(specialNpc)
-					elseif aggroNpc then
+					if aggroNpc then
 						rt.farmRoomFilter = nil
 						step('aggro')
 						local packNpc, packD = pickFarmTarget()
@@ -9463,6 +10985,8 @@ local function farmLoop()
 						tourFarmRooms(dungeon)
 					end
 				end
+				end
+			end
 			end
 			end
 		end
@@ -9473,6 +10997,11 @@ local function farmLoop()
 	end
 	farmBusy = false
 	farmLabel = nil
+	pcall(rt.setFarmPitchHum, false)
+	-- Soft stuck-restart: keep pin/noclip. Caller restarts the farm thread.
+	if rt.farmSoftRestart then
+		return
+	end
 	-- Reload stole this copy's epoch so the new farm can take over. Do not
 	-- drop noclip / pin / Return-on-stop or the character lands on the floor.
 	if not currentInstance() or getgenv().DLResumeFarm then
@@ -9486,13 +11015,16 @@ local function farmLoop()
 		if hum then
 			hum:SetStateEnabled(Enum.HumanoidStateType.Jumping, true)
 			hum:SetStateEnabled(Enum.HumanoidStateType.Freefall, true)
+			hum.AutoRotate = true
 		end
 	end)
 	-- Go home while still noclipped. Restoring collision first lets the rig land
 	-- wedged in whatever geometry is at the home spot, which reads as being frozen.
 	-- Only when the user turned the toggle off (still in dungeon) — never on death.
 	local live = routeRoot()
-	if live and farmHome and on('DLFarmReturn') and LocalPlayer:GetAttribute('InDungeon') == true then
+	if live and farmHome and on('DLFarmReturn') and LocalPlayer:GetAttribute('InDungeon') == true
+		and rt.farmUserOff == true
+	then
 		pcall(function()
 			live.CFrame = farmHome
 			live.AssemblyLinearVelocity = Vector3.zero
@@ -9500,7 +11032,9 @@ local function farmLoop()
 		end)
 		task.wait(0.2)
 	end
-	if not wasNoclip then
+	-- User Off always restores collision. wasNoclip stayed true across restarts
+	-- and left you floating after toggle off.
+	if rt.farmUserOff == true or rt.farmStop == true or not wasNoclip then
 		noclipOn = false
 		pcall(setCharNoclip, false)
 		pcall(fixMovement)
@@ -9508,6 +11042,9 @@ local function farmLoop()
 end
 
 local function startFarm()
+	if rt.farmStop or rt.farmUserOff == true then
+		return
+	end
 	if farmThread then
 		return
 	end
@@ -9516,6 +11053,7 @@ local function startFarm()
 		farmFinished = {}
 		farmBan = {}
 		farmLock = nil
+		rt.farmReturnNpc = nil
 		pcall(Rooms.reset)
 		rt.farmStarted = true
 		rt.farmChestSwept = false
@@ -9525,6 +11063,7 @@ local function startFarm()
 		rt.chestRoomOpen = {}
 		rt.specialNext = 0
 	end
+	rt.farmStop = nil
 	farmThread = task.spawn(function()
 		local ok, err = pcall(farmLoop)
 		farmBusy = false
@@ -9542,11 +11081,45 @@ local function startFarm()
 	end)
 end
 
+-- Hard stop: toggle Off used to only flip the flag and wait for the next
+-- farmLoop yield. Loot/key waits ignored it, so Off→On looked dead.
+local function stopFarm(userOff)
+	if userOff then
+		rt.farmUserOff = true
+		rt.farmIntentOn = false
+	end
+	rt.farmStop = true
+	rt.farmSoftRestart = nil
+	rt.farmStuckRestarting = false
+	rt.farmStarted = false
+	farmBusy = false
+	farmLabel = nil
+	pcall(Pin.stop)
+	pcall(rt.setFarmPitchHum, false)
+	noclipOn = false
+	pcall(setCharNoclip, false)
+	pcall(function()
+		local char = character()
+		local hum = char and char:FindFirstChildOfClass('Humanoid')
+		if hum then
+			hum:SetStateEnabled(Enum.HumanoidStateType.Jumping, true)
+			hum:SetStateEnabled(Enum.HumanoidStateType.Freefall, true)
+			hum.AutoRotate = true
+		end
+	end)
+	pcall(fixMovement)
+end
+
 -- Watchdog: if the farm thread dies while the toggle is still on, bring it back.
 local function autoFarmTick()
-	if on('DLAutoFarm') then
-		-- Back off after a crash so a repeating error cannot respawn the thread
-		-- every frame (that read as "farm on, doing nothing").
+	if on('DLAutoFarm') and rt.farmUserOff ~= true then
+		-- stopFarm left farmStop set after the loop exited; clear it so On can run.
+		if rt.farmStop and not farmBusy and not farmThread then
+			rt.farmStop = nil
+		end
+		if rt.farmStop then
+			return
+		end
 		if rt.farmCrashAt and os.clock() - rt.farmCrashAt < 1.5 then
 			farmLabel = 'crashed · ' .. tostring(rt.farmCrashErr):sub(-40)
 			return
@@ -9554,7 +11127,96 @@ local function autoFarmTick()
 		if not farmThread then
 			startFarm()
 		end
+	elseif (not on('DLAutoFarm') or rt.farmUserOff == true) and (farmBusy or farmThread) then
+		pcall(stopFarm, true)
 	end
+end
+
+-- Stuck mid-fight ~10s with no kills/damage → soft-restart the farm thread.
+-- Does not flip the Auto farm toggle (that Pin.stopped you onto the floor).
+local function stuckFarmTick()
+	if not on('DLFarmStuckRestart') then
+		rt.stuckAnchor = nil
+		return
+	end
+	if rt.farmStuckRestarting or rt.farmSoftRestart then
+		return
+	end
+	if rt.farmUserOff == true or rt.farmIntentOn ~= true then
+		rt.stuckAnchor = nil
+		return
+	end
+	if not on('DLAutoFarm') or not farmBusy or not farmThread then
+		rt.stuckAnchor = nil
+		return
+	end
+	if LocalPlayer:GetAttribute('InDungeon') ~= true then
+		rt.stuckAnchor = nil
+		return
+	end
+	if os.clock() < (rt.stuckRestartCool or 0) then
+		return
+	end
+	-- Only mid-fight. Loot / bless / wait / tour idle is not a stuck farm
+	-- (false positives were toggling every 10s and hitching).
+	if not rt.farmFighting then
+		rt.stuckAnchor = nil
+		return
+	end
+	if rt.healWait or rt.refillBusy or rt.refillUrgent or rt.potionBusy or routeBusy then
+		rt.stuckAnchor = nil
+		return
+	end
+	local now = os.clock()
+	if now - (rt.stuckSampleAt or 0) < 1.0 then
+		return
+	end
+	rt.stuckSampleAt = now
+	local root = routeRoot()
+	if not root then
+		return
+	end
+	local pos = root.Position
+	local dealt = tonumber(LocalPlayer:GetAttribute('Damage_Dealt')) or 0
+	local hits = tonumber(LocalPlayer:GetAttribute('Hit_Count')) or 0
+	local kills = farmKills or 0
+	local a = rt.stuckAnchor
+	if type(a) ~= 'table' then
+		rt.stuckAnchor = { pos = pos, at = now, dealt = dealt, hits = hits, kills = kills }
+		return
+	end
+	if kills ~= a.kills or dealt > (a.dealt or 0) + 0.5 or hits > (a.hits or 0) then
+		rt.stuckAnchor = { pos = pos, at = now, dealt = dealt, hits = hits, kills = kills }
+		return
+	end
+	local moved = Vector3.new(pos.X - a.pos.X, 0, pos.Z - a.pos.Z).Magnitude
+	if moved > 8 then
+		rt.stuckAnchor = { pos = pos, at = now, dealt = dealt, hits = hits, kills = kills }
+		return
+	end
+	if now - (a.at or now) < 10 then
+		return
+	end
+	rt.stuckRestartCool = now + 20
+	rt.stuckAnchor = nil
+	rt.farmStuckRestarting = true
+	rt.farmSoftRestart = true
+	farmLabel = 'stuck · restart farm'
+	Library:Notify('Auto farm stuck — soft restart')
+	task.spawn(function()
+		local deadline = os.clock() + 2.5
+		while farmThread and os.clock() < deadline do
+			task.wait(0.05)
+		end
+		farmThread = nil
+		farmBusy = false
+		rt.farmSoftRestart = nil
+		if rt.farmIntentOn == true and rt.farmUserOff ~= true and on('DLAutoFarm') then
+			pcall(startFarm)
+		end
+		rt.farmStuckRestarting = false
+		rt.stuckAnchor = nil
+	end)
 end
 
 local function listClassNames()
@@ -10149,7 +11811,9 @@ end
 return {
 	usePotion = usePotion,
 	autoFarmTick = autoFarmTick,
+	stuckFarmTick = stuckFarmTick,
 	startFarm = startFarm,
+	stopFarm = stopFarm,
 	autoRollTick = autoRollTick,
 	autoPotionTick = autoPotionTick,
 	trySummonSpecial = trySummonSpecial,
@@ -10171,11 +11835,19 @@ end)()
 rt.PotionRefill = (function()
 	local api = {}
 	local nextTry = 0
-	local spent = setmetatable({}, { __mode = 'k' })
+	-- Strong keys. Weak-key spent forgot used cauldrons (prompt stays Enabled)
+	-- and the farm warped back to the same pot forever.
+	local spent = {}
+	local spentPos = {}
 	local spentDungeon
 	local emptyWarned = 0
+	local floorGaveUp = false
 
 	local function dungeonId()
+		local want = tostring(LocalPlayer:GetAttribute('CurrentDungeon') or '')
+		if want ~= '' then
+			return want
+		end
 		for _, root in ipairs(workspace:GetChildren()) do
 			if type(root.Name) == 'string' and root.Name:sub(1, 10) == 'Generated_' then
 				return root.Name
@@ -10184,18 +11856,107 @@ rt.PotionRefill = (function()
 		return nil
 	end
 
+	local function persistBucket()
+		local g = getgenv()
+		g.DLPotionSpent = g.DLPotionSpent or {}
+		local id = dungeonId() or '_'
+		local bucket = g.DLPotionSpent[id]
+		if type(bucket) ~= 'table' then
+			bucket = {}
+			g.DLPotionSpent[id] = bucket
+		end
+		return bucket
+	end
+
+	local function stationKey(model)
+		if not model then
+			return nil
+		end
+		local ok, pos = pcall(function()
+			return model:GetPivot().Position
+		end)
+		if ok and typeof(pos) == 'Vector3' then
+			-- 4-stud grid so a wobbling pivot cannot mint a fresh "unused" key.
+			local g = 4
+			return string.format(
+				'%d:%d:%d',
+				math.floor(pos.X / g + 0.5) * g,
+				math.floor(pos.Y / g + 0.5) * g,
+				math.floor(pos.Z / g + 0.5) * g
+			)
+		end
+		return model.Name
+	end
+
+	-- Prompt stays Enabled after use. The green swirl emitter (My_jjk_texture)
+	-- turns off on a spent cauldron — that is the reliable client signal.
+	local function stationLooksUsed(model)
+		if not model or not model.Parent then
+			return true
+		end
+		local saw = false
+		for _, d in ipairs(model:GetDescendants()) do
+			if d:IsA('ParticleEmitter') then
+				local n = string.lower(tostring(d.Name or ''))
+				if n:find('jjk', 1, true) or n:find('my_jjk', 1, true) then
+					saw = true
+					if d.Enabled == true then
+						return false
+					end
+				end
+			end
+		end
+		return saw
+	end
+
 	local function resetSpent()
 		local id = dungeonId()
 		if id ~= spentDungeon then
 			spentDungeon = id
-			spent = setmetatable({}, { __mode = 'k' })
+			spent = {}
+			spentPos = {}
+			floorGaveUp = false
+			-- Restore marks from prior reloads this same dungeon.
+			local bucket = persistBucket()
+			for k, v in pairs(bucket) do
+				if v == true then
+					spentPos[k] = true
+				end
+			end
 		end
+	end
+
+	local function isSpent(model)
+		if not model then
+			return true
+		end
+		if spent[model] then
+			return true
+		end
+		local k = stationKey(model)
+		if k and spentPos[k] == true then
+			return true
+		end
+		if stationLooksUsed(model) then
+			return true
+		end
+		return false
 	end
 
 	local function markSpent(model)
 		if model then
 			spent[model] = true
 		end
+		local k = stationKey(model)
+		if k then
+			spentPos[k] = true
+			persistBucket()[k] = true
+		end
+	end
+
+	function api.isSpent(model)
+		resetSpent()
+		return isSpent(model)
 	end
 
 	pcall(function()
@@ -10286,8 +12047,10 @@ rt.PotionRefill = (function()
 			or LocalPlayer:GetAttribute('DungeonRun') == true
 		local best, bestD
 		for _, model in ipairs(potionStations) do
-			if model and model.Parent and not spent[model] then
-				if (not dungeon) or inGenerated(model) then
+			if model and model.Parent then
+				if isSpent(model) or stationLooksUsed(model) then
+					markSpent(model)
+				elseif (not dungeon) or inGenerated(model) then
 					local prompt = stationPrompt(model)
 					if prompt and prompt.Enabled then
 						local stand = promptStandPos(prompt, model)
@@ -10313,6 +12076,10 @@ rt.PotionRefill = (function()
 		if LocalPlayer:GetAttribute('InDungeon') ~= true
 			and LocalPlayer:GetAttribute('DungeonRun') ~= true
 		then
+			return false
+		end
+		resetSpent()
+		if floorGaveUp then
 			return false
 		end
 		if api.count() ~= 0 then
@@ -10346,22 +12113,36 @@ rt.PotionRefill = (function()
 		local station = nearestStation(root.Position)
 		if not station then
 			rt.refillUrgent = false
+			rt.refillBusy = false
+			floorGaveUp = true
 			if os.clock() - emptyWarned > 20 then
 				emptyWarned = os.clock()
 				Library:Notify('No unused cauldrons left')
 			end
-			nextTry = os.clock() + 12
+			nextTry = os.clock() + 90
+			return false
+		end
+		-- Refuse a trip if the swirl is already off (used) — nearestStation
+		-- should have filtered these; belt-and-suspenders.
+		if stationLooksUsed(station) then
+			markSpent(station)
+			rt.refillUrgent = false
 			return false
 		end
 		local prompt = stationPrompt(station)
 		local stand = prompt and promptStandPos(prompt, station)
 		if not stand then
+			markSpent(station)
 			return false
 		end
 		rt.refillBusy = true
 		rt.refillUrgent = true
 		rt.refillAt = os.clock()
+		-- Used on arrival. Prompt stays Enabled after a spent pot, so waiting
+		-- to mark let us warp here again every low-HP tick.
+		markSpent(station)
 		routeBusy = true
+		rt.routeBusyAt = os.clock()
 		noclipOn = true
 		pcall(setCharNoclip, true)
 		farmLabel = 'potion refill'
@@ -10375,6 +12156,10 @@ rt.PotionRefill = (function()
 			end)
 			local deadline = os.clock() + 10
 			while os.clock() < deadline and currentInstance() and api.count() == 0 do
+				-- Cauldron spent mid-wait (FX off) — stop hammering the prompt.
+				if stationLooksUsed(station) then
+					break
+				end
 				Pin.at(stand, true)
 				if prompt and prompt.Parent then
 					chestFiredAt[prompt] = nil
@@ -10540,6 +12325,7 @@ local Flee = (function()
 		Pin.stop()
 		pcall(scanEspThrottled, 1.0)
 		routeBusy = true
+		rt.routeBusyAt = os.clock()
 		local wasNoclip = noclipOn
 		noclipOn = true
 		pcall(setCharNoclip, true)
@@ -10655,6 +12441,7 @@ end)
 local ChestPick = (function()
 	local api = {}
 	local lastAt = 0
+	local busy = false
 
 	local function panel()
 		local gui = LocalPlayer:FindFirstChild('PlayerGui')
@@ -10663,7 +12450,8 @@ local ChestPick = (function()
 		return hud and hud:FindFirstChild('Chest_Selection') or nil
 	end
 
-	-- The panel is never destroyed, just faded, so Visible alone is not enough.
+	-- Visible as soon as the boss dies. Waiting for the fade (t < 0.5) sat
+	-- on SELECT 2/3 CHESTS for a full second.
 	function api.open()
 		local p = panel()
 		if not p or p.Visible ~= true then
@@ -10672,36 +12460,61 @@ local ChestPick = (function()
 		local ok, t = pcall(function()
 			return p.GroupTransparency
 		end)
-		return (not ok) or t < 0.5
+		return (not ok) or t < 0.98
 	end
 
-	-- "SELECT 2 CHESTS:" -> 2. The third slot is a gamepass, so never assume 3.
+	local function headerNeed(p)
+		if not p then
+			return nil
+		end
+		for _, d in ipairs(p:GetDescendants()) do
+			if d:IsA('TextLabel') or d:IsA('TextButton') then
+				local n = tostring(d.Text):match('SELECT%s*(%d+)%s*CHEST')
+					or tostring(d.Text):match('(%d+)%s*CHEST')
+				if n then
+					return math.clamp(tonumber(n) or 2, 1, 3)
+				end
+			end
+		end
+		return nil
+	end
+
+	-- "SELECT 2 CHESTS" vs "SELECT 3 CHESTS" (extra-chest gamepass).
 	local function wanted(p)
-		local lab = p and p:FindFirstChild('TextLabel')
-		local n = lab and tostring(lab.Text):match('(%d+)')
-		return math.clamp(tonumber(n) or 2, 1, 3)
+		return headerNeed(p) or 2
 	end
 
-	local function click(btn)
+	local function fireBtn(btn)
 		if not btn then
 			return false
 		end
-		if type(firesignal) == 'function' then
-			local ok = pcall(firesignal, btn.MouseButton1Click)
-			if ok then
-				return true
-			end
-		end
-		local ok, conns = pcall(getconnections, btn.MouseButton1Click)
-		if not ok then
-			return false
-		end
 		local fired = false
-		for _, c in ipairs(conns) do
-			if c.Function then
-				-- The handlers yield on a remote, so they must not run inline.
-				task.spawn(c.Function)
+		if btn:IsA('GuiButton') then
+			pcall(function()
+				btn:Activate()
 				fired = true
+			end)
+		end
+		for _, sigName in ipairs({ 'Activated', 'MouseButton1Click', 'MouseButton1Down', 'MouseButton1Up' }) do
+			local okSig, sig = pcall(function()
+				return btn[sigName]
+			end)
+			if okSig and sig then
+				if type(firesignal) == 'function' then
+					pcall(firesignal, sig)
+					fired = true
+				end
+				local ok, conns = pcall(getconnections, sig)
+				if ok then
+					for _, c in ipairs(conns) do
+						if c.Function then
+							pcall(function()
+								task.spawn(c.Function)
+							end)
+							fired = true
+						end
+					end
+				end
 			end
 		end
 		return fired
@@ -10715,9 +12528,10 @@ local ChestPick = (function()
 			end
 			return 0
 		end
-		if os.clock() - lastAt < 0.12 then
+		if busy or os.clock() - lastAt < 0.04 then
 			return 0
 		end
+		busy = true
 		lastAt = os.clock()
 		local need = wanted(p)
 		local took = 0
@@ -10726,17 +12540,15 @@ local ChestPick = (function()
 				break
 			end
 			local btn = p:FindFirstChild('Chest_' .. i)
-			if btn and btn.Visible and click(btn) then
+			if btn and btn.Visible and fireBtn(btn) then
 				took += 1
 			end
 		end
-		if took > 0 then
-			-- Finish on the same pass. The old 0.3s-per-chest + 0.4s wait made
-			-- the reward panel sit there for over a second.
-			if api.open() then
-				click(p:FindFirstChild('Finish'))
-			end
+		local finish = p:FindFirstChild('Finish')
+		if took > 0 and finish then
+			fireBtn(finish)
 		end
+		busy = false
 		if not silent then
 			Library:Notify(('Chest pick: took %d of %d'):format(took, need))
 		end
@@ -10744,8 +12556,8 @@ local ChestPick = (function()
 	end
 
 	function api.tick()
-		if on('DLAutoChestPick') and api.open() then
-			task.spawn(api.run, true)
+		if on('DLAutoChestPick') and api.open() and not busy then
+			api.run(true)
 		end
 	end
 
@@ -10991,36 +12803,12 @@ local BlessPick = (function()
 		if prompt and prompt.Enabled == true then
 			return false
 		end
-		-- Unused template keeps emitters on and Enabled=true. Claimed live
-		-- altars disable Receive Blessing and turn every ParticleEmitter off.
-		if not model then
-			return false
+		-- Enabled=false is enough. Walking every ParticleEmitter under the
+		-- altar each shrineTick was a multi-ms hitch on Generated_ maps.
+		if prompt and prompt.Enabled ~= true then
+			return true
 		end
-		local onN, saw = 0, false
-		local ok, desc = pcall(function()
-			return model:GetDescendants()
-		end)
-		if not ok or type(desc) ~= 'table' then
-			return false
-		end
-		for _, d in ipairs(desc) do
-			local isPe = false
-			pcall(function()
-				isPe = typeof(d) == 'Instance' and d:IsA('ParticleEmitter') == true
-			end)
-			if isPe then
-				saw = true
-				local enabled = false
-				pcall(function()
-					enabled = d.Enabled == true
-				end)
-				if enabled then
-					onN += 1
-					break
-				end
-			end
-		end
-		return saw and onN == 0
+		return false
 	end
 
 	local function shrineAlreadyUsed(model, pos)
@@ -11097,27 +12885,31 @@ local BlessPick = (function()
 		end
 		for _, gen in ipairs(workspace:GetChildren()) do
 			if type(gen.Name) == 'string' and gen.Name:sub(1, 10) == 'Generated_' then
+				-- Cheap named hits first (Blessing_Altar is top-level on most floors).
+				local named = gen:FindFirstChild('Blessing_Altar')
+				if named then
+					consider(named, named:FindFirstChildWhichIsA('ProximityPrompt', true))
+				end
 				for _, child in ipairs(gen:GetChildren()) do
-					local low = string.lower(child.Name)
-					if low:find('bless', 1, true) or low:find('shrine', 1, true) then
-						consider(child, child:FindFirstChildWhichIsA('ProximityPrompt', true))
+					if child ~= named then
+						local low = string.lower(child.Name)
+						if low:find('bless', 1, true) or low:find('shrine', 1, true) or low:find('altar', 1, true) then
+							consider(child, child:FindFirstChildWhichIsA('ProximityPrompt', true))
+						end
 					end
 				end
 			end
 		end
-		-- Fallback: prompt text under the active dungeon (expensive). Skip while
-		-- autofarm is moving — top-level Bless/Shrine names are enough mid-run.
-		if not bestModel and not farmBusy then
+		-- Deep prompt scan is rare. 1.2s while farming was hitching every tick
+		-- that missed a top-level name.
+		if not bestModel then
 			local dungeon = activeDungeonRoot()
-			if dungeon and os.clock() - (rt.shrineDeepAt or 0) > 8 then
+			local gap = 8
+			if dungeon and os.clock() - (rt.shrineDeepAt or 0) > gap then
 				rt.shrineDeepAt = os.clock()
-				for _, d in ipairs(dungeon:GetDescendants()) do
-					if d:IsA('ProximityPrompt') then
-						local action = (tostring(d.ActionText) .. ' ' .. tostring(d.ObjectText)):lower()
-						if action:find('bless', 1, true) or action:find('shrine', 1, true) or action:find('pray', 1, true) or action:find('boon', 1, true) then
-							consider(d:FindFirstAncestorOfClass('Model'), d)
-						end
-					end
+				local altar = dungeon:FindFirstChild('Blessing_Altar', true)
+				if altar then
+					consider(altar, altar:FindFirstChildWhichIsA('ProximityPrompt', true))
 				end
 			end
 		end
@@ -11131,6 +12923,7 @@ local BlessPick = (function()
 			local home = root.CFrame
 			local wasNoclip = noclipOn
 			routeBusy = true
+			rt.routeBusyAt = os.clock()
 			noclipOn = true
 			pcall(setCharNoclip, true)
 			routeLabel = 'blessing shrine'
@@ -11209,13 +13002,13 @@ local BlessPick = (function()
 		return shrineBusy == true
 	end
 
-	-- True = farm must yield. Blessings beat specials and room walking.
+	-- True = farm must yield. Blessings beat specials, fight-return, and rooms.
 	function api.farmPriority()
 		if not on('DLAutoBless') then
 			return false
 		end
 		if shrineBusy then
-			if os.clock() - (rt.shrineBusyAt or 0) > 8 then
+			if os.clock() - (rt.shrineBusyAt or 0) > 10 then
 				shrineBusy = false
 				routeBusy = false
 			else
@@ -11223,57 +13016,16 @@ local BlessPick = (function()
 				return true
 			end
 		end
-		-- Proximity first: it is a handful of top-level name compares, while
-		-- api.open() scans the whole PlayerGui tree. Only a player standing at the
-		-- altar can have cards up, so the cheap test gates the expensive one.
-		local root = routeRoot()
-		local near = false
-		if root then
-			for _, gen in ipairs(workspace:GetChildren()) do
-				if type(gen.Name) == 'string' and gen.Name:sub(1, 10) == 'Generated_' then
-					for _, child in ipairs(gen:GetChildren()) do
-						local low = string.lower(child.Name)
-						if low:find('bless', 1, true) or low:find('shrine', 1, true) then
-							local ok, pos = pcall(function()
-								return child:GetPivot().Position
-							end)
-							if ok and typeof(pos) == 'Vector3' and (pos - root.Position).Magnitude < 28 then
-								near = true
-								break
-							end
-						end
-					end
-				end
-				if near then
-					break
-				end
-			end
+		local now = os.clock()
+		-- Throttle shrine hunts. Calling shrineTick every farm yield scanned
+		-- Generated_ children constantly and hitching the client.
+		if now - (rt.blessPriAt or 0) < 0.75 then
+			return false
 		end
-		if near and api.open(true) then
+		rt.blessPriAt = now
+		if api.open(true) then
 			farmLabel = 'blessing'
-			local picked = api.run(true) == true
-			if picked then
-				local bestM, bestP, bestD = nil, nil, 9e9
-				for _, gen in ipairs(workspace:GetChildren()) do
-					if type(gen.Name) == 'string' and gen.Name:sub(1, 10) == 'Generated_' then
-						for _, child in ipairs(gen:GetChildren()) do
-							local low = string.lower(child.Name)
-							if low:find('bless', 1, true) or low:find('shrine', 1, true) then
-								local ok, pos = pcall(function()
-									return child:GetPivot().Position
-								end)
-								if ok and pos and root then
-									local d = (pos - root.Position).Magnitude
-									if d < bestD then
-										bestM, bestP, bestD = child, pos, d
-									end
-								end
-							end
-						end
-					end
-				end
-				markShrineUsed(bestM, bestP)
-			end
+			pcall(api.run, true)
 			return true
 		end
 		rt.blessFromFarm = true
@@ -11321,6 +13073,7 @@ local BlessPick = (function()
 	end
 
 	rt.blessFarmPriority = api.farmPriority
+	rt.blessBusy = api.busy
 	rt.shrineRoomDone = api.roomIsSpent
 
 	return api
@@ -14057,7 +15810,7 @@ local ChestBox = RunTab:AddLeftGroupbox('Chests')
 ChestBox:AddToggle('DLChestAnywhere', {
 	Text = 'Auto collect chests',
 	Default = true,
-	Tooltip = 'Farm: Nightmare waits until the floor boss is next, then sweeps. Endless loots each room as soon as that pack is dead. Manual Collect still works anytime. Locked-room chests are skipped unless Open locked gates is on.',
+	Tooltip = 'Waits until every HUD star except the last (boss) is filled, then warps to leftover chests and loots. Off skips chests. Locked-room chests need Open locked gates. The Collect all button still works anytime.',
 }):OnChanged(function(v)
 	Library:Notify(v and 'Auto chest route on' or 'Auto chest route off')
 end)
@@ -14276,19 +16029,40 @@ FarmBox:AddToggle('DLAutoFarm', {
 	Tooltip = 'Walks the nearest enemy down with Inputs.Attack, then moves to the next. Turn on Auto parry / Auto dodge / Auto skill alongside it.',
 }):OnChanged(function(v)
 	if v then
+		rt.farmStop = nil
+		rt.farmIntentOn = true
+		rt.farmUserOff = false
+		rt.stuckAnchor = nil
 		Library:Notify('Auto farm on')
-		-- Start immediately — do not wait on the Heartbeat watchdog (throttle /
-		-- stacked connections used to leave the toggle on with no farm thread).
+		-- Already running: do not kill/restart (that left farmStop stuck and
+		-- the next On did nothing).
+		if farmThread and farmBusy then
+			return
+		end
+		farmThread = nil
+		farmBusy = false
 		pcall(RunLoops.startFarm)
 	else
-		rt.farmStarted = false
 		Library:Notify(('Auto farm off — %d kills'):format(farmKills))
+		if rt.farmStuckRestarting then
+			rt.farmStop = true
+		else
+			pcall(RunLoops.stopFarm, true)
+		end
 	end
+end)
+FarmBox:AddToggle('DLFarmStuckRestart', {
+	Text = 'Restart if stuck 10s',
+	Default = false,
+	Tooltip = 'If auto farm is mid-fight, stuck in place 10s with no kills/damage, soft-restarts the farm thread (keeps the toggle on). Manual Off never re-enables it. Off by default — the old Off/On cycle dropped you on the floor.',
+}):OnChanged(function(v)
+	rt.stuckAnchor = nil
+	Library:Notify(v and 'Stuck farm restart on' or 'Stuck farm restart off')
 end)
 FarmBox:AddToggle('DLRoomsInOrder', {
 	Text = 'Rooms in order',
 	Default = true,
-	Tooltip = 'Sweep Room_1, Room_2, ... in number order. Blessings still interrupt. Specials and nearby packs wait until that room is up — they no longer yank you across the floor.',
+	Tooltip = 'Each floor: blessings → special → then rooms in order. Each room: kill all → locked gates (if on) → chests (if on) → next room.',
 }):OnChanged(function(v)
 	Library:Notify(v and 'Rooms in order on' or 'Rooms in order off — HUD star order')
 end)
@@ -14354,17 +16128,22 @@ FarmBox:AddToggle('DLFarmAutoLow', {
 })
 FarmBox:AddToggle('DLFarmAutoHigh', {
 	Text = 'Auto max height',
-	Default = true,
-	Tooltip = 'Stand as high as your weapon HitboxSize still connects — the top of the M1 volume. Hover is a fine-tune on top. Uses the same HitboxSize as Show Hitbox in the game.',
+	Default = false,
+	Tooltip = 'Stand as high as your weapon HitboxSize still connects — the top of the M1 volume. Off by default (was floating you). Non-zero Hover ignores this and pins floor + hover only.',
 })
 FarmBox:AddSlider('DLFarmHover', {
 	Text = 'Hover',
 	Default = 0,
-	Min = -20,
+	Min = -40,
 	Max = 20,
 	Rounding = 0,
-	Tooltip = 'Added on top of auto height. With both autos off: height vs the floor next to the pack. Negative drops you into a pit / under an ice slab.',
-})
+	Tooltip = 'Offset from the floor. -13 stays 13 under the floor on every pin, including the boss.',
+}):OnChanged(function(v)
+	rt.hoverVal = tonumber(v) or 0
+end)
+if Options.DLFarmHover then
+	rt.hoverVal = tonumber(Options.DLFarmHover.Value) or 0
+end
 FarmBox:AddSlider('DLFarmDelay', {
 	Text = 'Swing delay',
 	Default = 0,
@@ -14906,6 +16685,8 @@ pcall(refreshHud)
 pcall(function()
 	local resume = getgenv().DLResumeFarm == true or on('DLAutoFarm')
 	if resume then
+		rt.farmIntentOn = true
+		rt.farmUserOff = false
 		if Toggles.DLAutoFarm and Toggles.DLAutoFarm.Value ~= true then
 			Toggles.DLAutoFarm:SetValue(true)
 		end
@@ -14924,9 +16705,6 @@ pcall(function()
 		Library:SetHideGameplayPaused(true)
 		if Toggles.DLNoPause and Toggles.DLNoPause.Value ~= true then
 			Toggles.DLNoPause:SetValue(true)
-		end
-		if Toggles.DLSweepMarks and Toggles.DLSweepMarks.Value ~= true then
-			Toggles.DLSweepMarks:SetValue(true)
 		end
 	elseif on('DLNoPause') then
 		rt.Pause.start()
@@ -14967,10 +16745,11 @@ hbCombatConn = track(RunService.Heartbeat:Connect(function(dt)
 	-- Skills / farm watchdog must not sit behind the combat throttle.
 	pcall(autoSkillTick)
 	pcall(RunLoops.autoFarmTick)
+	pcall(RunLoops.stuckFarmTick)
+	-- Sweep marks: once per ~2s while farming (combat+ESP both used to call it).
 	if (farmBusy or LocalPlayer:GetAttribute('InDungeon') == true)
-		and os.clock() - (rt.sweepMarkAt or 0) > 0.45
+		and os.clock() - (rt.sweepMarkAt or 0) > (farmBusy and 2.0 or 0.75)
 	then
-		rt.sweepMarkAt = os.clock()
 		pcall(tickRoomSweepMarks)
 	end
 	local now = os.clock()
@@ -15074,21 +16853,28 @@ hbEspConn = track(RunService.Heartbeat:Connect(function(dt)
 	-- Picked before the replay check runs, so the chests are banked first.
 	pcall(ChestPick.tick)
 	pcall(BlessPick.tick)
-	pcall(BlessPick.shrineTick)
-	pcall(tickRoomSweepMarks)
+	-- Farm loop already owns shrine priority. Dual shrineTick here double-scanned.
+	if not farmBusy then
+		pcall(BlessPick.shrineTick)
+	end
+	-- Sweep marks handled on the combat heartbeat (throttled).
 	pcall(RunLoops.trySummonSpecial)
 	pcall(RunLoops.confirmSpecialSummon)
 	pcall(Replay.tick)
 	pcall(DungeonStart.tick)
 	-- Gear/stat polls are not frame-critical — half rate while farming.
-	pcall(Stats.tick)
-	pcall(Gear.tick)
+	if not farmBusy or (rt.slowUi or 0) % 2 == 0 then
+		pcall(Stats.tick)
+		pcall(Gear.tick)
+	end
 	rt.slowUi = (rt.slowUi or 0) + 1
-	pcall(Config.tick)
+	if not farmBusy or (rt.slowUi % 4) == 0 then
+		pcall(Config.tick)
+	end
 	-- While the farm is running, chests are swept the moment a room is cleared, so the
 	-- timer would only add redundant round trips — which is most of what made the farm
 	-- look like it was teleporting constantly. The timer stays for manual play.
-	if on('DLChestAnywhere') and not routeBusy and not farmBusy then
+	if rt.chestsNow() and not routeBusy and not farmBusy then
 		local everyChest = Options.DLChestEvery and tonumber(Options.DLChestEvery.Value) or 20
 		if os.clock() - routeDoneAt > everyChest and #lootChests > 0 then
 			pcall(collectChestRoute, true)
@@ -15117,8 +16903,17 @@ getgenv().DLUnload = function()
 			Toggles.DLAutoFarm:SetValue(false)
 		end
 	end)
-	if not resumeFarm then
-		pcall(Pin.stop)
+	-- Always drop pin writers. resumeFarm used to skip Pin.stop and leave
+	-- Heartbeat/PreSim orphans stacking across reloads.
+	pcall(Pin.stop)
+	for _, key in ipairs({ 'DLPinConn', 'DLPinPreConn' }) do
+		local c = getgenv()[key]
+		if c then
+			pcall(function()
+				c:Disconnect()
+			end)
+			getgenv()[key] = nil
+		end
 	end
 	-- Leave Ataraxia's pause hide armed (same as Anti-AFK). Stopping it here
 	-- is why the banner came back on every helper reload.
