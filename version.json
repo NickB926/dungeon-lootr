@@ -1,6 +1,6 @@
 {
-    "version":  "1.0.80",
-    "message":  "fix loot-phase deadlock, sweep rooms in number order, forward-declare room helpers",
+    "version":  "1.0.81",
+    "message":  "stop warping to room centre mid-fight, target densest pack when aggroed",
     "files":  [
                   "dungeon-lootr/launch.lua",
                   "dungeon-lootr/DungeonLootr.lua",

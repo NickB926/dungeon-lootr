@@ -93,7 +93,7 @@ Library.ToggleKeybind = { Value = 'Home' }
 Library.Animations = Library.Animations or {}
 Library.Animations.TabSwitch = false
 
-local DL_BUILD = '1.0.80'
+local DL_BUILD = '1.0.81'
 getgenv().DLBuild = DL_BUILD
 
 local Window = Library:CreateWindow({
@@ -8141,6 +8141,8 @@ local function holdOnEnemy(npc)
 		end
 		-- Floor discs win over the boss stand pin for the whole telegraph lifetime.
 		if typeof(rt.aoeGoal) == 'Vector3' and os.clock() < (rt.aoeUntil or 0) then
+			rt.pinAoeN = (rt.pinAoeN or 0) + 1
+			rt.pinGoal = rt.aoeGoal
 			return rt.aoeGoal
 		end
 		local now = os.clock()
@@ -8218,7 +8220,7 @@ local function holdOnEnemy(npc)
 					if room and Rooms.indexOf(other) ~= room then
 						return
 					end
-					if (p.Position - live.Position).Magnitude <= 22 then
+					if (p.Position - live.Position).Magnitude <= 28 then
 						sx += p.Position.X
 						sz += p.Position.Z
 						n += 1
@@ -8238,12 +8240,14 @@ local function holdOnEnemy(npc)
 		if dungeon and Rooms.posInCorridor(dungeon, goal) then
 			local idx = tonumber(rt.farmRoomFilter) or Rooms.indexOf(npc)
 			if idx and not Rooms.isCorridor(dungeon, idx) then
-				local zone = Rooms.zone(dungeon, idx)
-				if zone then
-					goal = Vector3.new(zone.Position.X, y, zone.Position.Z)
-				end
+				-- The stand offset pushed us into the doorway. Step onto the pack
+				-- instead: warping to the room centre dragged the character away
+				-- from the mobs it was mid-fight with, across the whole room.
+				rt.pinCorridorN = (rt.pinCorridorN or 0) + 1
+				goal = Vector3.new(aimAt.X, y, aimAt.Z)
 			end
 		end
+		rt.pinGoal = goal
 		return goal, Vector3.new(aimAt.X, y, aimAt.Z)
 	end)
 end
@@ -9195,7 +9199,19 @@ local function farmLoop()
 				elseif aggroNpc then
 					rt.farmRoomFilter = nil
 					step('aggro')
-					farmKillNpc(aggroNpc)
+					-- Swing at the middle of the pack that is on us, not whichever
+					-- body happens to be closest. pickFarmTarget already scores by
+					-- crowd size; only take its answer if it is not dragging us off
+					-- somewhere else entirely.
+					local packNpc, packD = pickFarmTarget()
+					local aggroPart = enemyRoot(aggroNpc)
+					local here = routeRoot()
+					local aggroD = (aggroPart and here) and (aggroPart.Position - here.Position).Magnitude or 0
+					if packNpc and packD and packD <= aggroD + 30 then
+						farmKillNpc(packNpc)
+					else
+						farmKillNpc(aggroNpc)
+					end
 				else
 					step('tour')
 					tourFarmRooms(dungeon)
@@ -14940,6 +14956,10 @@ getgenv().DLFarmDebug = function()
 		routeBusy = routeBusy,
 		crash = rt.farmCrashErr,
 		cost = rt.stepCost,
+		pinGoal = rt.pinGoal,
+		pinCorridorN = rt.pinCorridorN,
+		pinAoeN = rt.pinAoeN,
+		fighting = rt.farmFightNpc and rt.farmFightNpc.Name or nil,
 	}
 end
 getgenv().DLFarmCost = function(reset)
