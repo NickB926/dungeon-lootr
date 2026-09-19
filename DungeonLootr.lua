@@ -141,7 +141,7 @@ Library.ToggleKeybind = { Value = 'Home' }
 Library.Animations = Library.Animations or {}
 Library.Animations.TabSwitch = false
 
-local DL_BUILD = '1.0.41'
+local DL_BUILD = '1.0.42'
 getgenv().DLBuild = DL_BUILD
 
 local Window = Library:CreateWindow({
@@ -1573,18 +1573,26 @@ end
 
 function rt.refreshFarmFloor(from)
 	local now = os.clock()
-	-- Floor Y barely moves mid-fight; 0.2s ray spam still cost frames.
-	local gap = farmBusy and 0.55 or 0.25
-	if type(rt.farmFloorY) == 'number' and now - (rt.farmFloorAt or 0) < gap then
-		return rt.farmFloorY
-	end
 	local origin = typeof(from) == 'Vector3' and from or nil
 	if not origin then
 		local root = routeRoot()
 		origin = root and root.Position
 	end
 	if not origin then
-		return rt.farmFloorY
+		return nil
+	end
+	-- Floor Y barely moves mid-fight; 0.2s ray spam still cost frames.
+	-- BUT: a cached Y from another XZ (corridor / aoe gap / last room) is what
+	-- dropped you into the void for a few seconds.
+	local gap = farmBusy and 0.55 or 0.25
+	if type(rt.farmFloorY) == 'number' and now - (rt.farmFloorAt or 0) < gap
+		and typeof(rt.farmFloorAtPos) == 'Vector3'
+	then
+		local dx = origin.X - rt.farmFloorAtPos.X
+		local dz = origin.Z - rt.farmFloorAtPos.Z
+		if dx * dx + dz * dz <= 100 then
+			return rt.farmFloorY
+		end
 	end
 	rt.farmFloorAt = now
 	local char = character()
@@ -1642,9 +1650,23 @@ function rt.refreshFarmFloor(from)
 	-- Prefer a cast from just above the stand down. Sky casts hit Barriers.
 	local hit = cast(origin.Y + 4, 120) or cast(origin.Y + 80, 220)
 	if hit then
-		rt.farmFloorY = hit.Position.Y
+		local y = hit.Position.Y
+		-- Reject absurd drops vs last good sample (void / under-map hits).
+		if type(rt.farmFloorY) == 'number' and (rt.farmFloorY - y) > 60
+			and typeof(rt.farmFloorAtPos) == 'Vector3'
+		then
+			local dx = origin.X - rt.farmFloorAtPos.X
+			local dz = origin.Z - rt.farmFloorAtPos.Z
+			if dx * dx + dz * dz < 400 then
+				return rt.farmFloorY
+			end
+		end
+		rt.farmFloorY = y
+		rt.farmFloorAtPos = Vector3.new(origin.X, 0, origin.Z)
+		return y
 	end
-	return rt.farmFloorY
+	-- Miss: never reuse a far-away room's floor Y.
+	return nil
 end
 
 function rt.setFarmPitchHum(on)
@@ -1781,11 +1803,21 @@ function rt.farmHoldCf(pos, aim, keep)
 		-- stack on top and read as +13 at hover 1. Hover 0 still uses the
 		-- hold goal (auto high/low / special bury).
 		local fy = rt.refreshFarmFloor(pos)
-		if type(fy) == 'number' and math.abs(hover) >= 0.5 then
-			pos = Vector3.new(pos.X, fy + hover, pos.Z)
-		elseif type(fy) == 'number' and math.abs(hover) < 0.5
-			and not on('DLFarmAutoHigh') and not on('DLFarmAutoLow')
-		then
+		local fight = rt.farmFightNpc or rt.farmReturnNpc
+		local live = fight and (rt.enemyRoot and rt.enemyRoot(fight) or nil)
+		if type(fy) ~= 'number' then
+			-- Ray missed (gap / void). Stay on the pin goal / under the fight
+			-- target — never a stale floor from another room.
+			if live then
+				fy = live.Position.Y - math.max(3, math.abs(hover))
+			else
+				fy = pos.Y - (hover < 0 and math.abs(hover) or 0)
+			end
+		end
+		local newY
+		if math.abs(hover) >= 0.5 then
+			newY = fy + hover
+		elseif not on('DLFarmAutoHigh') and not on('DLFarmAutoLow') then
 			-- No auto height: stay on the floor. Stale AutoHigh / enemy HRP
 			-- Y used to leave you floating ~30 studs up.
 			local hip = 3
@@ -1799,8 +1831,25 @@ function rt.farmHoldCf(pos, aim, keep)
 				end
 				hip = math.max(2.5, hh + rootPart.Size.Y * 0.5)
 			end
-			pos = Vector3.new(pos.X, fy + hip, pos.Z)
+			newY = fy + hip
+		else
+			newY = pos.Y
 		end
+		-- Hard clamp vs the fight target so a bad floor sample cannot yeet
+		-- you into the under-map void for several seconds.
+		if live then
+			local minY = live.Position.Y - 32
+			local maxY = live.Position.Y + 24
+			if newY < minY then
+				newY = live.Position.Y + math.clamp(hover, -18, 0)
+			elseif newY > maxY then
+				newY = live.Position.Y + math.min(hover, 8)
+			end
+		elseif type(rt._lastGoodStandY) == 'number' and (rt._lastGoodStandY - newY) > 40 then
+			newY = rt._lastGoodStandY
+		end
+		pos = Vector3.new(pos.X, newY, pos.Z)
+		rt._lastGoodStandY = newY
 	end
 	if farmBusy then
 		-- AutoRotate yanks yaw toward whatever the humanoid last stepped
@@ -4198,7 +4247,9 @@ rt.avoidFloorAoe = function()
 	-- scan — that made Pin thrash and ate M1 / skill input.
 	if not covered(me.X, me.Z, 2.5) then
 		if typeof(rt.aoeGoal) ~= 'Vector3' or covered(rt.aoeGoal.X, rt.aoeGoal.Z, 2.5) then
-			rt.aoeGoal = Vector3.new(me.X, me.Y, me.Z)
+			local fy = rt.refreshFarmFloor(me)
+			local y = type(fy) == 'number' and (fy + math.max(rt.combatHover(), 0)) or me.Y
+			rt.aoeGoal = Vector3.new(me.X, y, me.Z)
 		end
 		rt.aoeUntil = os.clock() + 0.9
 		return true
@@ -4213,7 +4264,9 @@ rt.avoidFloorAoe = function()
 		local d = dx * dx + dz * dz
 		if not bestD or d < bestD then
 			bestD = d
-			best = Vector3.new(x, me.Y, z)
+			local fy = rt.refreshFarmFloor(Vector3.new(x, me.Y, z))
+			local y = type(fy) == 'number' and fy + 3 or me.Y
+			best = Vector3.new(x, y, z)
 		end
 	end
 	for i = 1, #circles do
@@ -9121,10 +9174,13 @@ local function packAround(npc, live, radius)
 	return pack, n, Vector3.new(sx / n, live.Position.Y, sz / n)
 end
 
--- Same-room fodder around `npc` (plus the target itself). Used to aim the M1
--- box at the densest clump from wherever we already stand.
+-- Same-room fodder around `npc` (plus the target itself). Also pulls in
+-- nearby same-floor trash within 32 studs so a locked boss does not leave
+-- two fodder behind the slab "ignored".
 local function crowdPartsNear(npc)
 	local room = npc and Rooms.indexOf(npc)
+	local me = routeRoot()
+	local mePos = me and me.Position
 	local parts = {}
 	eachFarmNpc(function(other)
 		if not enemyAlive(other) or farmSkipped(other) then
@@ -9133,13 +9189,16 @@ local function crowdPartsNear(npc)
 		if other ~= npc and enemyRank(other) >= 3 then
 			return
 		end
-		if room and Rooms.indexOf(other) ~= room then
+		local p = enemyRoot(other)
+		if not p then
 			return
 		end
-		local p = enemyRoot(other)
-		if p then
-			parts[#parts + 1] = p.Position
+		local sameRoom = (not room) or other == npc or Rooms.indexOf(other) == room
+		local nearMe = mePos and (p.Position - mePos).Magnitude <= 32
+		if not sameRoom and not nearMe then
+			return
 		end
+		parts[#parts + 1] = p.Position
 	end)
 	return parts
 end
@@ -9549,14 +9608,11 @@ local function holdOnEnemy(npc)
 				aimAt = mid
 				rt.farmCrowdAim = mid
 				if not lookUp then
-					-- Frontal: keep a stand ring but retarget mid every frame.
+					-- Frontal: recompute approach every frame — a sticky crowdDir
+					-- left the slab facing right while two mobs sat on the left.
 					stand = math.max(stand, cachedStand or 4)
-					if typeof(rt.crowdDir) == 'Vector3' and rt.crowdDir.Magnitude > 0.05 then
-						dir = rt.crowdDir
-					else
-						dir = bestPackFacing(pack, mid, stand, dir)
-						rt.crowdDir = dir
-					end
+					dir = bestPackFacing(pack, mid, stand, dir)
+					rt.crowdDir = dir
 				else
 					stand = 0
 					cachedPlant = mid
@@ -9584,23 +9640,43 @@ local function holdOnEnemy(npc)
 				end
 			end
 		else
-			-- Pack path: if the locked npc slipped behind the slab, break the
-			-- 0.55s cache and face them (same bug as solo, just mid-pack).
+			-- Pack path: if ANY nearby fodder sits behind the slab, flip stand.
 			local me = routeRoot()
-			if me and live then
-				local to = Vector3.new(live.Position.X - me.Position.X, 0, live.Position.Z - me.Position.Z)
-				if to.Magnitude > 1.25 then
-					local look = Vector3.new(me.CFrame.LookVector.X, 0, me.CFrame.LookVector.Z)
-					if look.Magnitude < 0.05 then
-						look = Vector3.new(me.CFrame.UpVector.X, 0, me.CFrame.UpVector.Z)
+			if me then
+				local look = Vector3.new(me.CFrame.LookVector.X, 0, me.CFrame.LookVector.Z)
+				if look.Magnitude < 0.05 then
+					look = Vector3.new(me.CFrame.UpVector.X, 0, me.CFrame.UpVector.Z)
+				end
+				if look.Magnitude > 0.05 then
+					look = look.Unit
+					local pack = crowdPartsNear(npc)
+					local behindN, behindMid, bn = 0, nil, 0
+					local sx, sz = 0, 0
+					for _, p in ipairs(pack) do
+						local to = Vector3.new(p.X - me.Position.X, 0, p.Z - me.Position.Z)
+						if to.Magnitude > 1.0 then
+							if look:Dot(to.Unit) < 0.2 then
+								behindN += 1
+								sx += p.X
+								sz += p.Z
+								bn += 1
+							end
+						end
 					end
-					if look.Magnitude > 0.05 and look.Unit:Dot(to.Unit) < 0.25 then
-						rt.crowdSolo = true
+					if behindN >= 1 and bn > 0 then
+						behindMid = Vector3.new(sx / bn, plant.Y, sz / bn)
 						rt.crowdAimAt = 0
-						plant = live.Position
-						aimAt = live.Position
-						rt.farmCrowdAim = live.Position
-						dir = -to.Unit
+						plant = behindMid
+						aimAt = behindMid
+						rt.farmCrowdAim = behindMid
+						local away = Vector3.new(me.Position.X - behindMid.X, 0, me.Position.Z - behindMid.Z)
+						if away.Magnitude > 0.35 then
+							dir = away.Unit
+							rt.crowdDir = dir
+						end
+						if not lookUp then
+							stand = math.max(stand, 4)
+						end
 					end
 				end
 			end
@@ -9629,9 +9705,12 @@ local function holdOnEnemy(npc)
 			local here = meNow.Position
 			local flatDist = Vector3.new(goal.X - here.X, 0, goal.Z - here.Z).Magnitude
 			if flatDist > 0.35 then
-				-- Look-up: stick tight under the clump. Frontal: slightly looser.
-				local t = lookUp and math.clamp(0.28 + flatDist * 0.08, 0.28, 0.75)
-					or math.clamp(0.2 + flatDist * 0.05, 0.2, 0.55)
+				-- Snap hard when far / behind so we do not linger facing empty air.
+				local t = lookUp and math.clamp(0.45 + flatDist * 0.1, 0.45, 0.95)
+					or math.clamp(0.35 + flatDist * 0.08, 0.35, 0.9)
+				if flatDist > 10 then
+					t = 1
+				end
 				goal = Vector3.new(
 					here.X + (goal.X - here.X) * t,
 					goal.Y,
@@ -10534,6 +10613,11 @@ local function tourFarmRooms(dungeon)
 	local dname = dungeon.Name
 	if dname and rt.farmDungeonId ~= dname then
 		rt.farmDungeonId = dname
+		-- New Generated_ map (endless continue / replay) — shrines must run again.
+		rt.shrineUsed = {}
+		rt.blessDungeonId = nil
+		rt.blessPriAt = 0
+		rt.shrineDeepAt = 0
 		-- Tile re-parent can rename Generated_ without a new floor. Keep the
 		-- sweep so we do not walk already-cleared rooms from 1 again.
 		if not (rt.roomSweepDone and next(rt.roomSweepDone)) then
@@ -12796,7 +12880,10 @@ local BlessPick = (function()
 		if typeof(pos) ~= 'Vector3' then
 			return nil
 		end
-		return string.format('s:%.0f:%.0f:%.0f', pos.X, pos.Y, pos.Z)
+		-- Include floor id — endless continue reuses similar XZ and the old
+		-- global key skipped the new altar.
+		local id = tostring(rt.blessDungeonId or rt.farmDungeonId or '')
+		return string.format('s:%s:%.0f:%.0f:%.0f', id, pos.X, pos.Y, pos.Z)
 	end
 
 	local function shrineLooksSpent(model, prompt)
@@ -12816,9 +12903,8 @@ local BlessPick = (function()
 		if model and rt.shrineUsed[model] then
 			return true
 		end
-		if model and rt.shrineUsed['name:' .. model.Name] then
-			return true
-		end
+		-- Do NOT key by model.Name — every floor's Blessing_Altar shares the
+		-- same name, so one claim blacklisted every later floor's shrine.
 		local key = shrinePosKey(pos)
 		if key and rt.shrineUsed[key] == true then
 			return true
@@ -12830,7 +12916,6 @@ local BlessPick = (function()
 		rt.shrineUsed = rt.shrineUsed or {}
 		if model then
 			rt.shrineUsed[model] = true
-			rt.shrineUsed['name:' .. model.Name] = true
 		end
 		local key = shrinePosKey(pos)
 		if key then
@@ -12838,8 +12923,84 @@ local BlessPick = (function()
 		end
 	end
 
+	local function resetShrineFloor(dungeon)
+		local id = dungeon and dungeon.Name or nil
+		if not id then
+			id = tostring(LocalPlayer:GetAttribute('CurrentDungeon') or '')
+			if id == '' then
+				return
+			end
+		end
+		if rt.blessDungeonId == id then
+			return
+		end
+		rt.blessDungeonId = id
+		rt.shrineUsed = {}
+		shrineNext = 0
+		rt.blessPriAt = 0
+		rt.shrineDeepAt = 0
+		-- Drop a stuck shrine trip from the previous floor.
+		if not shrineBusy then
+			return
+		end
+		if os.clock() - (rt.shrineBusyAt or 0) > 1 then
+			shrineBusy = false
+			if routeLabel == 'blessing shrine' then
+				routeBusy = false
+			end
+		end
+	end
+
+	local function liveAltarIn(dungeon)
+		if not dungeon then
+			return nil
+		end
+		local function take(model)
+			if not model then
+				return nil
+			end
+			local prompt = model:FindFirstChildWhichIsA('ProximityPrompt', true)
+			if not (prompt and prompt.Enabled == true) then
+				return nil
+			end
+			local ok, pos = pcall(function()
+				return model:GetPivot().Position
+			end)
+			if not ok or typeof(pos) ~= 'Vector3' then
+				return nil
+			end
+			if shrineAlreadyUsed(model, pos) then
+				return nil
+			end
+			return model
+		end
+		local hit = take(dungeon:FindFirstChild('Blessing_Altar'))
+		if hit then
+			return hit
+		end
+		for _, child in ipairs(dungeon:GetChildren()) do
+			local low = string.lower(child.Name)
+			if low:find('bless', 1, true) or low:find('shrine', 1, true) or low:find('altar', 1, true) then
+				hit = take(child)
+				if hit then
+					return hit
+				end
+			end
+		end
+		return nil
+	end
+
 	function api.shrineTick()
-		if not on('DLAutoBless') or shrineBusy or routeBusy or rt.refillBusy or rt.refillUrgent or os.clock() < shrineNext then
+		if not on('DLAutoBless') or shrineBusy or routeBusy or rt.refillBusy or rt.refillUrgent then
+			return
+		end
+		resetShrineFloor(activeDungeonRoot())
+		-- Live unused altar on this floor always wins over shrineNext cooldown
+		-- left over from the previous floor's claim.
+		local dungeonNow = activeDungeonRoot()
+		if liveAltarIn(dungeonNow) then
+			shrineNext = 0
+		elseif os.clock() < shrineNext then
 			return
 		end
 		-- Farm loop calls farmPriority instead so shrines beat rooms.
@@ -12868,8 +13029,13 @@ local BlessPick = (function()
 				end)
 				pos = ok and p or nil
 			end
-			if not pos or shrineAlreadyUsed(model, pos) then
-				if pos then
+			if not pos then
+				return
+			end
+			if shrineAlreadyUsed(model, pos) then
+				-- Only persist spent when the prompt is actually dead — do not
+				-- mark a still-streaming altar just because a name key matched.
+				if shrineLooksSpent(model, prompt) then
 					markShrineUsed(model, pos)
 				end
 				return
@@ -12904,7 +13070,7 @@ local BlessPick = (function()
 		-- that missed a top-level name.
 		if not bestModel then
 			local dungeon = activeDungeonRoot()
-			local gap = 8
+			local gap = 2.5
 			if dungeon and os.clock() - (rt.shrineDeepAt or 0) > gap then
 				rt.shrineDeepAt = os.clock()
 				local altar = dungeon:FindFirstChild('Blessing_Altar', true)
@@ -13007,6 +13173,8 @@ local BlessPick = (function()
 		if not on('DLAutoBless') then
 			return false
 		end
+		local dungeon = activeDungeonRoot()
+		resetShrineFloor(dungeon)
 		if shrineBusy then
 			if os.clock() - (rt.shrineBusyAt or 0) > 10 then
 				shrineBusy = false
@@ -13017,8 +13185,32 @@ local BlessPick = (function()
 			end
 		end
 		local now = os.clock()
-		-- Throttle shrine hunts. Calling shrineTick every farm yield scanned
-		-- Generated_ children constantly and hitching the client.
+		local pending = liveAltarIn(dungeon)
+		-- New floor / live altar: do not let the 0.75s throttle hand the tour
+		-- to rooms before the shrine trip starts.
+		if pending then
+			shrineNext = 0
+			if now - (rt.blessPriAt or 0) >= 0.2 then
+				rt.blessPriAt = now
+				if api.open(true) then
+					farmLabel = 'blessing'
+					pcall(api.run, true)
+					return true
+				end
+				rt.blessFromFarm = true
+				pcall(api.shrineTick)
+				rt.blessFromFarm = nil
+			end
+			if shrineBusy or api.open(true) then
+				farmLabel = 'blessing shrine'
+				return true
+			end
+			-- Altar is up but tick has not claimed yet — still hold the farm.
+			farmLabel = 'blessing shrine'
+			return true
+		end
+		-- Throttle shrine hunts when nothing is pending. Calling shrineTick
+		-- every farm yield scanned Generated_ children constantly.
 		if now - (rt.blessPriAt or 0) < 0.75 then
 			return false
 		end
@@ -13546,6 +13738,12 @@ local Replay = (function()
 			lastReplayAt = now
 			task.spawn(function()
 				if continueEndless() then
+					-- Same dungeon id can keep the old map name briefly; drop
+					-- shrine blacklist so the new floor altar is first again.
+					rt.shrineUsed = {}
+					rt.blessDungeonId = nil
+					rt.blessPriAt = 0
+					rt.shrineDeepAt = 0
 					Library:Notify('Endless continue')
 				end
 			end)
