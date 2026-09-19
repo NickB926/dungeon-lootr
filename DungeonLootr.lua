@@ -141,7 +141,7 @@ Library.ToggleKeybind = { Value = 'Home' }
 Library.Animations = Library.Animations or {}
 Library.Animations.TabSwitch = false
 
-local DL_BUILD = '1.0.47'
+local DL_BUILD = '1.0.48'
 getgenv().DLBuild = DL_BUILD
 -- Do NOT wipe DLShrineSkipKeys on every reload — that re-warps spent altars.
 
@@ -669,6 +669,15 @@ local function statsText()
 	end
 	if on('DLAutoSpecial') then
 		lines[#lines + 1] = rt.specialHud or 'auto special summon on'
+	end
+	if on('DLRaidLoop') then
+		local id = Options.DLRaidName and tostring(Options.DLRaidName.Value or '') or ''
+		local diff = Options.DLRaidDifficulty and tostring(Options.DLRaidDifficulty.Value or '') or ''
+		if id ~= '' and id ~= 'nil' then
+			lines[#lines + 1] = ('raid loop  ·  %s · %s'):format(id, (diff ~= '' and diff ~= 'nil') and diff or '?')
+		else
+			lines[#lines + 1] = 'raid loop on'
+		end
 	end
 	if on('DLHuntSpecial') then
 		local needle = Options.DLHuntTarget and tostring(Options.DLHuntTarget.Value or '') or ''
@@ -14788,6 +14797,10 @@ local Replay = (function()
 	function api.tick()
 		local wantReplay = on('DLAutoReplay') or on('DLLoopSpecific')
 		local rushContinue = on('DLAutoFarm') and inRushNow()
+		if on('DLRaidLoop') then
+			-- RaidLoop.tick owns raid replay — do not RequestReplay dungeon here.
+			return
+		end
 		if not wantReplay and not rushContinue then
 			runCompleteAt = nil
 			replayArmedAt = nil
@@ -15410,6 +15423,11 @@ local DungeonStart = (function()
 			armedAt = 0
 			return
 		end
+		-- Event raid loop owns lobby starts — do not pick Bandits Den / first dungeon.
+		if on('DLRaidLoop') then
+			armedAt = 0
+			return
+		end
 		if on('DLLoopSpecific') or on('DLHuntSpecial') then
 			local id = select(1, api.target())
 			if not id then
@@ -15437,6 +15455,465 @@ local DungeonStart = (function()
 		end
 		nextCheck = os.clock() + 4
 		api.run(true)
+	end
+
+	return api
+end)()
+
+-- Event Raid loop (The First Test): Normal / Extreme / Impossible.
+-- Uses DungeonQueueService RequestSelectRaid* + RaidRunService RequestReplay,
+-- with Frames.Raid UI clicks as fallback (same ENTER / difficulty buttons).
+-- Stored on rt (not a chunk local) — main file is at Luau's 200-local limit.
+rt.RaidLoop = (function()
+	local ReplicatedStorage = game:GetService('ReplicatedStorage')
+	local api = {}
+	local nextCheck, lastStart, busy, armedAt = 0, 0, false, 0
+	local lastLabel = ''
+	local RAID_DIFFS = { 'Normal', 'Extreme', 'Impossible' }
+
+	local function inLobby()
+		return LocalPlayer:GetAttribute('InDungeon') ~= true
+			and LocalPlayer:GetAttribute('DungeonRun') ~= true
+	end
+
+	local function inRaidNow()
+		if workspace:FindFirstChild('Raid_NPCs') then
+			return true
+		end
+		local run = tostring(LocalPlayer:GetAttribute('DungeonRun') or '')
+		local cur = tostring(LocalPlayer:GetAttribute('CurrentDungeon') or '')
+		if run == 'Raids' or cur == 'Raids' or cur:find('Raid', 1, true) then
+			return true
+		end
+		local challenge = tostring(LocalPlayer:GetAttribute('ChallengeDungeon') or '')
+		if challenge == 'Raids' then
+			return true
+		end
+		return false
+	end
+
+	local function invoke(name, ...)
+		local rem = RunLoops.knitRF('DungeonQueueService', name)
+		if not rem then
+			return false, nil
+		end
+		local args = table.pack(...)
+		local ok, res = pcall(function()
+			return rem:InvokeServer(table.unpack(args, 1, args.n))
+		end)
+		return ok, res
+	end
+
+	local function clickGui(btn)
+		if not btn then
+			return false
+		end
+		-- RaidSelectController binds Enter / difficulties on Activated, not MouseButton1Click.
+		-- firesignal can "succeed" on an empty signal — only treat as clicked when listeners exist.
+		local function fire(sig)
+			if not sig then
+				return false
+			end
+			local ok, conns = pcall(getconnections, sig)
+			if not ok or type(conns) ~= 'table' or #conns == 0 then
+				return false
+			end
+			if type(firesignal) == 'function' then
+				pcall(firesignal, sig)
+				return true
+			end
+			local fired = false
+			for _, c in ipairs(conns) do
+				if c.Function then
+					task.spawn(c.Function)
+					fired = true
+				end
+			end
+			return fired
+		end
+		if fire(btn.Activated) then
+			return true
+		end
+		if fire(btn.MouseButton1Click) then
+			return true
+		end
+		return fire(btn.MouseButton1Down)
+	end
+
+	local function raidPanel()
+		local pg = LocalPlayer:FindFirstChild('PlayerGui')
+		local main = pg and pg:FindFirstChild('Main')
+		local frames = main and main:FindFirstChild('Frames')
+		return frames and frames:FindFirstChild('Raid') or nil
+	end
+
+	local function openRaidViaUIController()
+		local ps = LocalPlayer:FindFirstChild('PlayerScripts')
+		local client = ps and ps:FindFirstChild('Client')
+		local ctrls = client and client:FindFirstChild('Controllers')
+		local mod = ctrls and ctrls:FindFirstChild('UIController')
+		if not mod then
+			return false
+		end
+		local ok, UI = pcall(require, mod)
+		if not ok or type(UI) ~= 'table' or type(UI.names) ~= 'table' then
+			return false
+		end
+		local raid = UI.names.Raid
+		if type(raid) == 'table' and type(raid.open) == 'function' then
+			local opened = pcall(function()
+				raid:open()
+			end)
+			return opened
+		end
+		return false
+	end
+
+	local function ensureRaidOpen()
+		local p = raidPanel()
+		if p and p.Visible then
+			return p
+		end
+		-- Same path the Event NPC / game uses — MenuButtons has no Raid entry.
+		openRaidViaUIController()
+		task.wait(0.35)
+		p = raidPanel()
+		if p and p.Visible then
+			return p
+		end
+		-- Dialog option while talking to the event NPC: "Open the Event Raid."
+		pcall(function()
+			local pg = LocalPlayer:FindFirstChild('PlayerGui')
+			local dialog = pg and pg:FindFirstChild('dialog')
+			local responses = dialog and dialog:FindFirstChild('dialogResponses')
+			if not responses then
+				return
+			end
+			for _, d in ipairs(responses:GetChildren()) do
+				if d:IsA('GuiButton') then
+					local lab = d:FindFirstChildWhichIsA('TextLabel', true)
+					local t = string.lower(tostring(lab and lab.Text or ''))
+					if t:find('event raid', 1, true) or t:find('open the event', 1, true) then
+						clickGui(d)
+						break
+					end
+				end
+			end
+		end)
+		task.wait(0.45)
+		p = raidPanel()
+		if p and not p.Visible then
+			-- Last resort: force the frame on-screen (UIController parks closed panels off-screen).
+			pcall(function()
+				p.Visible = true
+				p.Position = UDim2.new(0.5, 0, 0.5, 0)
+				p.AnchorPoint = Vector2.new(0.5, 0.5)
+			end)
+		end
+		return raidPanel()
+	end
+
+	local function listRaids()
+		local names = {}
+		local ok, data = pcall(require, ReplicatedStorage.GameInfo.RaidData)
+		if ok and type(data) == 'table' then
+			if type(data.RAID_ORDER) == 'table' then
+				for _, id in ipairs(data.RAID_ORDER) do
+					names[#names + 1] = tostring(id)
+				end
+			end
+			if #names == 0 and type(data.Raids) == 'table' then
+				for id in pairs(data.Raids) do
+					names[#names + 1] = tostring(id)
+				end
+				table.sort(names)
+			end
+			if #names == 0 and type(data.DEFAULT_RAID) == 'string' then
+				names[1] = data.DEFAULT_RAID
+			end
+		end
+		if #names == 0 then
+			names[1] = 'The First Test'
+		end
+		return names
+	end
+
+	local function listDifficulties()
+		local ok, data = pcall(require, ReplicatedStorage.GameInfo.RaidData)
+		if ok and type(data) == 'table' and type(data.DIFFICULTY_ORDER) == 'table' then
+			local out = {}
+			for _, d in ipairs(data.DIFFICULTY_ORDER) do
+				out[#out + 1] = tostring(d)
+			end
+			if #out > 0 then
+				return out
+			end
+		end
+		return RAID_DIFFS
+	end
+
+	function api.target()
+		local wantName = Options.DLRaidName and tostring(Options.DLRaidName.Value or '') or ''
+		local wantDiff = Options.DLRaidDifficulty and tostring(Options.DLRaidDifficulty.Value or '') or ''
+		if wantName == '' or wantName == 'nil' then
+			wantName = 'The First Test'
+		end
+		local okDiff = false
+		for _, d in ipairs(RAID_DIFFS) do
+			if d == wantDiff then
+				okDiff = true
+				break
+			end
+		end
+		if not okDiff then
+			wantDiff = 'Normal'
+		end
+		return wantName, wantDiff
+	end
+
+	local function clickDifficulty(panel, diff)
+		local left = panel:FindFirstChild('Content') and panel.Content:FindFirstChild('LeftFrame')
+		if not left then
+			return false
+		end
+		local btn = left:FindFirstChild(diff)
+			or left:FindFirstChild(string.upper(diff))
+			or left:FindFirstChild(string.lower(diff))
+		if not btn then
+			for _, ch in ipairs(left:GetChildren()) do
+				if string.lower(ch.Name) == string.lower(diff) then
+					btn = ch
+					break
+				end
+			end
+		end
+		return clickGui(btn)
+	end
+
+	local function clickEnter(panel)
+		local buttons = panel:FindFirstChild('Content') and panel.Content:FindFirstChild('Buttons')
+		local enter = buttons and buttons:FindFirstChild('Enter')
+		if clickGui(enter) then
+			return true
+		end
+		for _, d in ipairs(panel:GetDescendants()) do
+			if d:IsA('GuiButton') then
+				local lab = d:FindFirstChildWhichIsA('TextLabel', true)
+				local t = string.upper(tostring(lab and lab.Text or d.Name or ''))
+				if t == 'ENTER' then
+					if clickGui(d) then
+						return true
+					end
+				end
+			end
+		end
+		return false
+	end
+
+	function api.enter(silent)
+		if busy then
+			return false
+		end
+		if not inLobby() and inRaidNow() then
+			if not silent then
+				Library:Notify('Already in a raid')
+			end
+			return false
+		end
+		if not inLobby() then
+			if not silent then
+				Library:Notify('Leave the dungeon before starting a raid')
+			end
+			return false
+		end
+		local id, diff = api.target()
+		busy = true
+		task.spawn(function()
+			-- RAID panel ENTER only. Never RequestStartSoloRun / RequestEnter /
+			-- RequestStartNow — those queue the first dungeon (Bandits Den), not the raid.
+			local ok = false
+			local panel = ensureRaidOpen()
+			if panel and panel.Visible then
+				-- Soft-select via queue remotes (safe; do not start).
+				invoke('RequestSelectRaid', id)
+				task.wait(0.1)
+				invoke('RequestSelectRaidDifficulty', diff)
+				task.wait(0.1)
+				-- Make sure the panel shows this raid (cycle if needed).
+				pcall(function()
+					local left = panel:FindFirstChild('Content') and panel.Content:FindFirstChild('LeftFrame')
+					local nameLabel = left and (
+						(left:FindFirstChild('Display') and left.Display:FindFirstChild('BossName'))
+						or left:FindFirstChild('BossName', true)
+					)
+					local shown = nameLabel and tostring(nameLabel.Text or '') or ''
+					if shown ~= '' and not string.lower(shown):find(string.lower(id), 1, true) then
+						local fwd = left:FindFirstChild('CycleForward')
+						for _ = 1, 6 do
+							clickGui(fwd)
+							task.wait(0.12)
+							shown = nameLabel and tostring(nameLabel.Text or '') or ''
+							if string.lower(shown):find(string.lower(id), 1, true) then
+								break
+							end
+						end
+					end
+				end)
+				clickDifficulty(panel, diff)
+				task.wait(0.25)
+				ok = clickEnter(panel)
+			end
+			lastStart = os.clock()
+			lastLabel = ('%s · %s'):format(id, diff)
+			busy = false
+			if not silent or not ok then
+				Library:Notify(('Raid start: %s%s'):format(
+					lastLabel, ok and '' or ' (could not open RAID / click ENTER)'))
+			elseif not silent then
+				Library:Notify(('Raid start: %s'):format(lastLabel))
+			end
+		end)
+		return true
+	end
+
+	function api.replay(silent)
+		local rf = RunLoops.knitRF('RaidRunService', 'RequestReplay')
+		if rf then
+			local ok, res = pcall(function()
+				return rf:InvokeServer()
+			end)
+			if ok and res ~= false then
+				if not silent then
+					Library:Notify('Raid replay')
+				end
+				return true
+			end
+		end
+		-- Completion UI REPLAY / ENTER again.
+		pcall(function()
+			local pg = LocalPlayer:FindFirstChild('PlayerGui')
+			local main = pg and pg:FindFirstChild('Main')
+			if not main then
+				return
+			end
+			for _, d in ipairs(main:GetDescendants()) do
+				if d:IsA('GuiButton') and d.Visible ~= false then
+					local lab = d:FindFirstChildWhichIsA('TextLabel', true)
+					local t = string.upper(tostring(lab and lab.Text or d.Name or ''))
+					if t:find('REPLAY', 1, true) or t == 'ENTER' then
+						clickGui(d)
+					end
+				end
+			end
+		end)
+		return false
+	end
+
+	function api.onLobby()
+		armedAt = os.clock()
+	end
+
+	function api.label()
+		return lastLabel
+	end
+
+	function api.inRaid()
+		return inRaidNow()
+	end
+
+	function api.listRaids()
+		return listRaids()
+	end
+
+	function api.listDifficulties()
+		return listDifficulties()
+	end
+
+	function api.tick()
+		if not on('DLRaidLoop') then
+			armedAt = 0
+			return
+		end
+		-- Mid-raid: on completion, RequestReplay (keeps difficulty).
+		if inRaidNow() then
+			armedAt = 0
+			local rf = RunLoops.knitRF('RaidRunService', 'GetSessionState')
+			local done = false
+			if rf then
+				local ok, st = pcall(function()
+					return rf:InvokeServer()
+				end)
+				if ok and type(st) == 'table' then
+					local phase = tostring(st.Phase or st.State or st.Status or '')
+					done = phase:lower():find('complete', 1, true)
+						or phase:lower():find('victory', 1, true)
+						or phase:lower():find('defeat', 1, true)
+						or st.Complete == true
+						or st.Finished == true
+				end
+			end
+			-- HUD / completion buttons also mean the run ended.
+			if not done then
+				pcall(function()
+					local pg = LocalPlayer:FindFirstChild('PlayerGui')
+					local main = pg and pg:FindFirstChild('Main')
+					if not main then
+						return
+					end
+					for _, d in ipairs(main:GetDescendants()) do
+						if d:IsA('TextLabel') or d:IsA('TextButton') then
+							local t = string.upper(tostring(d.Text or ''))
+							if (t:find('REPLAY', 1, true) or t == 'RETURN' or t:find('VICTORY', 1, true))
+								and d.Visible ~= false
+							then
+								done = true
+								break
+							end
+						end
+					end
+				end)
+			end
+			if done and os.clock() - (rt.raidReplayAt or 0) > 3 then
+				rt.raidReplayAt = os.clock()
+				task.spawn(function()
+					if not api.replay(true) then
+						-- Fall back: return lobby then re-enter with selected difficulty.
+						local ret = RunLoops.knitRF('RaidRunService', 'RequestReturn')
+						if ret then
+							pcall(function()
+								ret:InvokeServer()
+							end)
+						end
+						local deadline = os.clock() + 14
+						while os.clock() < deadline and not inLobby() do
+							task.wait(0.4)
+						end
+						api.onLobby()
+					end
+				end)
+			end
+			return
+		end
+		if not inLobby() then
+			armedAt = 0
+			return
+		end
+		if busy or os.clock() < nextCheck then
+			return
+		end
+		if os.clock() - lastStart < 8 then
+			return
+		end
+		if armedAt == 0 then
+			armedAt = os.clock()
+			return
+		end
+		local delay = Options.DLDungeonDelay and tonumber(Options.DLDungeonDelay.Value) or 2
+		if os.clock() - armedAt < delay then
+			return
+		end
+		nextCheck = os.clock() + 5
+		api.enter(true)
 	end
 
 	return api
@@ -17595,6 +18072,105 @@ ReplayBox:AddInput('DLHuntTarget', {
 })
 ReplayBox:AddLabel('Hunt sets Loop dungeon to Underworld Gate + Nightmare, farms/summons the special, then returns to lobby on kill.')
 
+ReplayBox:AddToggle('DLRaidLoop', {
+	Text = 'Event raid loop',
+	Default = false,
+	Tooltip = 'Loops the Event RAID panel only (The First Test): Normal/Extreme/Impossible + ENTER. Never starts a dungeon. Turns Auto farm on when you enter.',
+}):OnChanged(function(v)
+	if not v then
+		Library:Notify('Event raid loop off')
+		return
+	end
+	pcall(function()
+		if Options.DLRaidName and Options.DLRaidName.SetValue then
+			local cur = tostring(Options.DLRaidName.Value or '')
+			if cur == '' or cur == 'nil' then
+				Options.DLRaidName:SetValue('The First Test')
+			end
+		end
+		if Options.DLRaidDifficulty and Options.DLRaidDifficulty.SetValue then
+			local cur = tostring(Options.DLRaidDifficulty.Value or '')
+			if cur == '' or cur == 'nil' then
+				Options.DLRaidDifficulty:SetValue('Normal')
+			end
+		end
+		-- Keep dungeon auto-start / loop / hunt OFF so we do not join Bandits Den.
+		if Toggles.DLLoopSpecific then
+			Toggles.DLLoopSpecific:SetValue(false)
+		end
+		if Toggles.DLAutoDungeon then
+			Toggles.DLAutoDungeon:SetValue(false)
+		end
+		if Toggles.DLHuntSpecial then
+			Toggles.DLHuntSpecial:SetValue(false)
+		end
+		if Toggles.DLAutoReplay then
+			Toggles.DLAutoReplay:SetValue(false)
+		end
+		-- Farm after we are in the raid — enabling it in lobby used to pair with
+		-- other start logic. Arm farm when enter succeeds instead.
+	end)
+	if rt.RaidLoop then
+		rt.RaidLoop.onLobby()
+		local id, diff = rt.RaidLoop.target()
+		Library:Notify(('Raid loop · %s · %s — open RAID / ENTER'):format(id, diff))
+		task.spawn(function()
+			task.wait(0.35)
+			if rt.RaidLoop then
+				rt.RaidLoop.enter(false)
+			end
+			-- Enable farm once we are actually in the raid (not a dungeon).
+			local deadline = os.clock() + 20
+			while os.clock() < deadline do
+				local inRaid = workspace:FindFirstChild('Raid_NPCs') ~= nil
+				if not inRaid and rt.RaidLoop and rt.RaidLoop.inRaid then
+					inRaid = rt.RaidLoop.inRaid()
+				end
+				if inRaid then
+					if Toggles.DLAutoFarm then
+						Toggles.DLAutoFarm:SetValue(true)
+					end
+					break
+				end
+				task.wait(0.4)
+			end
+		end)
+	end
+end)
+ReplayBox:AddDropdown('DLRaidName', {
+	Text = 'Event raid',
+	Values = (rt.RaidLoop and rt.RaidLoop.listRaids()) or { 'The First Test' },
+	Default = 1,
+	Tooltip = 'Raid boss from RaidData (currently The First Test).',
+})
+ReplayBox:AddDropdown('DLRaidDifficulty', {
+	Text = 'Raid difficulty',
+	Values = (rt.RaidLoop and rt.RaidLoop.listDifficulties()) or { 'Normal', 'Extreme', 'Impossible' },
+	Default = 1,
+	Tooltip = 'Normal / Extreme / Impossible — same buttons on the RAID panel.',
+})
+ReplayBox:AddButton('Refresh raid list', function()
+	local names = rt.RaidLoop and rt.RaidLoop.listRaids() or {}
+	if Options.DLRaidName and Options.DLRaidName.SetValues then
+		Options.DLRaidName:SetValues(names)
+	end
+	Library:Notify((#names) .. ' raids')
+end)
+ReplayBox:AddButton('Enter event raid now', function()
+	task.spawn(function()
+		local R = rt.RaidLoop
+		if not R then
+			return
+		end
+		if R.inRaid() then
+			R.replay(false)
+			return
+		end
+		R.enter(false)
+	end)
+end)
+ReplayBox:AddLabel('Event raid loop uses the RAID menu (ENTER + Normal/Extreme/Impossible), not the dungeon select.')
+
 local LobbyBox = RunTab:AddLeftGroupbox('Lobby')
 LobbyBox:AddToggle('DLAutoDungeon', {
 	Text = 'Auto start best dungeon',
@@ -18159,6 +18735,11 @@ hbEspConn = track(RunService.Heartbeat:Connect(function(dt)
 	pcall(RunLoops.confirmSpecialSummon)
 	pcall(Replay.tick)
 	pcall(DungeonStart.tick)
+	pcall(function()
+		if rt.RaidLoop then
+			rt.RaidLoop.tick()
+		end
+	end)
 	-- Gear/stat polls are not frame-critical — half rate while farming.
 	if not farmBusy or (rt.slowUi or 0) % 2 == 0 then
 		pcall(Stats.tick)
@@ -18391,18 +18972,18 @@ track(LocalPlayer:GetAttributeChangedSignal('InDungeon'):Connect(function()
 		pcall(DungeonStart.onLobby)
 	end
 end))
-for _, attr in ipairs({ 'CurrentDungeon', 'CurrentDifficultyMode' }) do
-	track(LocalPlayer:GetAttributeChangedSignal(attr):Connect(function()
-		local id = tostring(LocalPlayer:GetAttribute('CurrentDungeon') or '')
-		local diff = tostring(LocalPlayer:GetAttribute('CurrentDifficultyMode') or '')
-		if id ~= '' then
-			rt.runDungeonId = id
-		end
-		if diff ~= '' then
-			rt.runDifficulty = diff
-		end
-	end))
-end
+track(LocalPlayer:GetAttributeChangedSignal('CurrentDungeon'):Connect(function()
+	local id = tostring(LocalPlayer:GetAttribute('CurrentDungeon') or '')
+	if id ~= '' then
+		rt.runDungeonId = id
+	end
+end))
+track(LocalPlayer:GetAttributeChangedSignal('CurrentDifficultyMode'):Connect(function()
+	local diff = tostring(LocalPlayer:GetAttribute('CurrentDifficultyMode') or '')
+	if diff ~= '' then
+		rt.runDifficulty = diff
+	end
+end))
 do
 	local id = tostring(LocalPlayer:GetAttribute('CurrentDungeon') or '')
 	local diff = tostring(LocalPlayer:GetAttribute('CurrentDifficultyMode') or '')
