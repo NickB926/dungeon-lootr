@@ -141,7 +141,7 @@ Library.ToggleKeybind = { Value = 'Home' }
 Library.Animations = Library.Animations or {}
 Library.Animations.TabSwitch = false
 
-local DL_BUILD = '1.0.48'
+local DL_BUILD = '1.0.49'
 getgenv().DLBuild = DL_BUILD
 -- Do NOT wipe DLShrineSkipKeys on every reload — that re-warps spent altars.
 
@@ -4354,6 +4354,11 @@ rt.avoidFloorAoe = function()
 		end
 	end
 	if #circles == 0 then
+		if rt.aoeGoal ~= nil or (rt.aoeUntil or 0) > 0 then
+			rt.aoeClearAt = os.clock()
+			rt.stickyPlant = nil
+			rt.packDir = nil
+		end
 		rt.aoeUntil = 0
 		rt.aoeGoal = nil
 		return false
@@ -4374,6 +4379,10 @@ rt.avoidFloorAoe = function()
 	-- Already clear of discs: do NOT steal the fight pin. Returning true with a
 	-- floor-Y aoeGoal is what yanked negative-hover back onto the pack.
 	if not covered(me.X, me.Z, 2.5) then
+		if rt.aoeGoal ~= nil or (rt.aoeUntil or 0) > 0 then
+			rt.aoeClearAt = os.clock()
+			rt.stickyPlant = nil
+		end
 		rt.aoeUntil = 0
 		rt.aoeGoal = nil
 		return false
@@ -4453,8 +4462,8 @@ rt.avoidFloorAoe = function()
 		end
 	end
 	rt.aoeGoal = best
-	-- Hold the gap for the full telegraph window; refresh while discs stay up.
-	rt.aoeUntil = os.clock() + 2.4
+	-- Short hold — long windows left us parked in a gap for ~10s after meteors.
+	rt.aoeUntil = os.clock() + 0.85
 	return true
 end
 
@@ -4599,15 +4608,24 @@ local function enemyAlive(npc)
 		if ov and ov > 0 then
 			return true
 		end
+		-- Raid adds (Mage Student) sometimes keep a 0-HP dummy Humanoid with no
+		-- HealthOverride while still attackable — treat parented Raid_NPCs as live.
+		if npc.Parent and npc.Parent.Name == 'Raid_NPCs' and enemyRoot(npc) then
+			return true
+		end
 		return false
 	end
 	-- No Humanoid: AnimationController packs (Demon Archer / Gatekeeper). Live as
 	-- long as HealthOverride is set and the model still has a world pivot.
 	local ov = tonumber(npc:GetAttribute('HealthOverride'))
-	if not (ov and ov > 0) then
-		return false
+	if ov and ov > 0 then
+		return enemyRoot(npc) ~= nil
 	end
-	return enemyRoot(npc) ~= nil
+	-- Raid fodder under Raid_NPCs with no HealthOverride / Humanoid.
+	if npc.Parent and npc.Parent.Name == 'Raid_NPCs' then
+		return enemyRoot(npc) ~= nil
+	end
+	return false
 end
 
 function rt.roomHasLiving(idx)
@@ -8713,8 +8731,21 @@ local function pickFarmTarget()
 		return nil
 	end
 	-- Already mid-swing on a live target — never hop to a sibling pack member.
+	-- Raid boss / special still yields to crystals + summoned adds (Mage Students).
 	local held = rt.farmFightNpc
 	if held and rt.farmFighting and enemyAlive(held) and enemyRoot(held) and not farmSkipped(held) then
+		if isRaidBossNpc(held) or enemyRank(held) >= 4 then
+			local crystal, crystalD = nearestCrystal()
+			if crystal then
+				farmLock = nil
+				return crystal, crystalD
+			end
+			local add, addD = addsNearSpecial(held)
+			if add then
+				farmLock = nil
+				return add, addD
+			end
+		end
 		local part = enemyRoot(held)
 		return held, (part.Position - root.Position).Magnitude
 	end
@@ -9796,6 +9827,11 @@ local function holdOnEnemy(npc)
 			rt.pinGoal = rt.aoeGoal
 			return rt.aoeGoal, cachedAim
 		end
+		-- Just left a meteor gap — drop sticky plant so we snap back to the boss.
+		if rt.aoeClearAt and os.clock() - rt.aoeClearAt < 0.35 then
+			rt.stickyPlant = nil
+			cachedPlant = nil
+		end
 		local now = os.clock()
 		if now - cachedAt > 0.2 then
 			cachedAt = now
@@ -10192,7 +10228,7 @@ local function farmKill(npc)
 					break
 				end
 				farmLabel = ('adds · %d'):format(#listAddsNearSpecial(addAnchor))
-			elseif (isRaidBossNpc(npc) or enemyRank(npc) >= 4) and now - (rt.addScanAt or 0) > 0.25 then
+			elseif (isRaidBossNpc(npc) or enemyRank(npc) >= 4) and now - (rt.addScanAt or 0) > 0.15 then
 				-- Crystals wipe the raid if they finish. Adds after that. Then the boss.
 				rt.addScanAt = now
 				local crystal = select(1, nearestCrystal())
@@ -10201,14 +10237,29 @@ local function farmKill(npc)
 					if farmLock == npc then
 						farmLock = nil
 					end
+					rt.farmFightNpc = nil
+					rt.farmFighting = false
 					break
 				end
 				local add = select(1, addsNearSpecial(npc))
+				if not add then
+					-- Arena edge spawns: any live Raid_NPCs fodder counts.
+					eachFarmNpc(function(other)
+						if add or other == npc or isRaidBossNpc(other) or isRaidCrystal(other) then
+							return
+						end
+						if isAwakeAdd(other) then
+							add = other
+						end
+					end)
+				end
 				if add then
 					farmLabel = ('adds · %s'):format(add.Name)
 					if farmLock == npc then
 						farmLock = nil
 					end
+					rt.farmFightNpc = nil
+					rt.farmFighting = false
 					break
 				end
 			end
@@ -10222,6 +10273,13 @@ local function farmKill(npc)
 			-- Stall detection needs a readable HP bar; a boss without one only gets
 			-- the timeout above. Specials / minis are never stall-abandoned — that
 			-- was warping onto nearby fodder mid-phase.
+			-- Dark Professor (no Humanoid) + meteor dodge: Damage_Dealt stalls for
+			-- ~8s and used to farmBan him for 30s → long gap before re-engage.
+			local aoeBusy = os.clock() < (rt.aoeUntil or 0)
+				or (rt.aoeClearAt and os.clock() - rt.aoeClearAt < 1.25)
+			if aoeBusy or isRaidBossNpc(npc) or enemyRank(npc) >= 4 then
+				lastDrop = now
+			end
 			if readable and not sticky and not crystalPack and not addPack then
 				local hp = enemyHealth(npc)
 				if hp and hp < lastHp - 0.5 then
@@ -10232,11 +10290,10 @@ local function farmKill(npc)
 					farmLabel = ('skip · %s'):format(npc.Name)
 					break
 				end
-			elseif not readable and not crystalPack and not addPack then
-				-- No HP bar: watch our damage. Sticky specials with no Humanoid
-				-- (dead Scarlet Knight shells) never dropped HP and sat the
-				-- full 240s boss timeout.
-				local stallFor = sticky and 8 or 6
+			elseif not readable and not sticky and not crystalPack and not addPack then
+				-- No HP bar: watch our damage. Sticky specials / raid bosses never
+				-- stall-abandon (meteor dodge / bury phases deal no Damage_Dealt).
+				local stallFor = 6
 				local dealt = tonumber(LocalPlayer:GetAttribute('Damage_Dealt')) or 0
 				local hits = tonumber(LocalPlayer:GetAttribute('Hit_Count')) or 0
 				if dealt > dealt0 + 0.5 or hits > hits0 then
@@ -10249,11 +10306,7 @@ local function farmKill(npc)
 					rt.packDir = nil
 					rt.packRoom = nil
 					rt.packStand = nil
-					if sticky then
-						farmBan[npc] = os.clock() + 30
-					else
-						farmBan[npc] = os.clock() + 1.5
-					end
+					farmBan[npc] = os.clock() + 1.5
 					farmLabel = ('replant · %s'):format(npc.Name)
 					break
 				end
@@ -15927,30 +15980,8 @@ rt.requestHuntReturn = function()
 	farmLabel = 'hunt · return lobby'
 	Library:Notify(('Hunt kill · %s — lobby'):format(huntTargetNeedle()))
 	task.spawn(function()
-		local rf = RunLoops.knitRF('DungeonRunService', 'RequestReturn')
-		if rf then
-			pcall(function()
-				rf:InvokeServer()
-			end)
-		end
-		pcall(function()
-			local pg = LocalPlayer:FindFirstChild('PlayerGui')
-			local main = pg and pg:FindFirstChild('Main')
-			if not main then
-				return
-			end
-			for _, d in ipairs(main:GetDescendants()) do
-				if d:IsA('TextButton') or d:IsA('ImageButton') then
-					local t = string.lower(tostring(d.Text or d.Name or ''))
-					if (t:find('return', 1, true) or t == 'lobby') and d.Visible ~= false then
-						if type(firesignal) == 'function' then
-							pcall(firesignal, d.MouseButton1Click)
-						end
-					end
-				end
-			end
-		end)
-		local deadline = os.clock() + 12
+		rt.forceReturnLobby(true)
+		local deadline = os.clock() + 14
 		while os.clock() < deadline and LocalPlayer:GetAttribute('InDungeon') == true do
 			task.wait(0.4)
 		end
@@ -15958,6 +15989,101 @@ rt.requestHuntReturn = function()
 		rt.huntKills = (rt.huntKills or 0) + 1
 		DungeonStart.onLobby()
 	end)
+end
+
+-- Force leave dungeon / raid back to lobby (RequestReturn + UI RETURN).
+rt.forceReturnLobby = function(silent)
+	if rt.returningLobby then
+		return false
+	end
+	rt.returningLobby = true
+	rt.farmStop = true
+	farmLabel = 'return lobby'
+	if not silent then
+		Library:Notify('Returning to lobby…')
+	end
+	task.spawn(function()
+		local function invokeReturn(service, method)
+			local rf = RunLoops.knitRF(service, method)
+			if not rf then
+				return false
+			end
+			local ok, res = pcall(function()
+				return rf:InvokeServer()
+			end)
+			return ok and res ~= false
+		end
+		invokeReturn('RaidRunService', 'RequestReturn')
+		task.wait(0.15)
+		invokeReturn('DungeonRunService', 'RequestReturn')
+		task.wait(0.15)
+		-- If stuck in a lobby queue / party ready check.
+		invokeReturn('DungeonQueueService', 'RequestLeaveQueue')
+		pcall(function()
+			local pg = LocalPlayer:FindFirstChild('PlayerGui')
+			local main = pg and pg:FindFirstChild('Main')
+			if not main then
+				return
+			end
+			local function fireBtn(btn)
+				if not btn then
+					return false
+				end
+				local function fire(sig)
+					if not sig then
+						return false
+					end
+					local ok, conns = pcall(getconnections, sig)
+					if not ok or type(conns) ~= 'table' or #conns == 0 then
+						return false
+					end
+					if type(firesignal) == 'function' then
+						pcall(firesignal, sig)
+						return true
+					end
+					for _, c in ipairs(conns) do
+						if c.Function then
+							task.spawn(c.Function)
+						end
+					end
+					return true
+				end
+				return fire(btn.Activated) or fire(btn.MouseButton1Click) or fire(btn.MouseButton1Down)
+			end
+			for _, d in ipairs(main:GetDescendants()) do
+				if (d:IsA('TextButton') or d:IsA('ImageButton')) and d.Visible ~= false then
+					local lab = d:FindFirstChildWhichIsA('TextLabel', true)
+					local t = string.upper(tostring(lab and lab.Text or d.Text or d.Name or ''))
+					if t:find('RETURN', 1, true)
+						or t:find('LOBBY', 1, true)
+						or t == 'LEAVE'
+						or t:find('LEAVE RAID', 1, true)
+					then
+						fireBtn(d)
+					end
+				end
+			end
+		end)
+		local deadline = os.clock() + 14
+		while os.clock() < deadline do
+			local inRun = LocalPlayer:GetAttribute('InDungeon') == true
+				or LocalPlayer:GetAttribute('DungeonRun') == true
+				or workspace:FindFirstChild('Raid_NPCs') ~= nil
+			if not inRun then
+				break
+			end
+			task.wait(0.35)
+		end
+		rt.returningLobby = false
+		rt.farmStop = nil
+		farmLabel = nil
+		if not silent then
+			local still = LocalPlayer:GetAttribute('InDungeon') == true
+				or workspace:FindFirstChild('Raid_NPCs') ~= nil
+			Library:Notify(still and 'Still in run — try again' or 'Back in lobby')
+		end
+	end)
+	return true
 end
 
 -- QuestService.ClaimQuest rejects every argument shape a quest id can take, so
@@ -18194,6 +18320,10 @@ LobbyBox:AddSlider('DLDungeonDelay', {
 LobbyBox:AddButton('Start best dungeon now', function()
 	task.spawn(DungeonStart.run, false)
 end)
+LobbyBox:AddButton('Force return to lobby', function()
+	rt.forceReturnLobby(false)
+end)
+LobbyBox:AddLabel('Force return uses Raid/Dungeon RequestReturn (+ RETURN UI). Does not turn off raid/dungeon loops.')
 LobbyBox:AddLabel('Loop specific dungeon overrides this pick and can use Endless. Auto start stays Nightmare max.')
 
 local WorldBox = WorldTab:AddLeftGroupbox('Look')
