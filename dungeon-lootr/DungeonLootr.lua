@@ -93,7 +93,7 @@ Library.ToggleKeybind = { Value = 'Home' }
 Library.Animations = Library.Animations or {}
 Library.Animations.TabSwitch = false
 
-local DL_BUILD = '1.0.85'
+local DL_BUILD = '1.0.86'
 getgenv().DLBuild = DL_BUILD
 
 local Window = Library:CreateWindow({
@@ -1539,6 +1539,36 @@ local Pin = (function()
 			if os.clock() < (rt.ultLockUntil or 0) then
 				return
 			end
+			local char = myRoot.Parent
+			local hum = char and char:FindFirstChildOfClass('Humanoid')
+			local st = hum and hum:GetState()
+			local rag = hum and (
+				hum.PlatformStand == true
+				or hum.Sit == true
+				or st == Enum.HumanoidStateType.Ragdoll
+				or st == Enum.HumanoidStateType.Physics
+				or st == Enum.HumanoidStateType.FallingDown
+				or st == Enum.HumanoidStateType.GettingUp
+			)
+			if rag then
+				pcall(function()
+					hum.PlatformStand = false
+					hum.Sit = false
+					hum:SetStateEnabled(Enum.HumanoidStateType.Ragdoll, false)
+					hum:SetStateEnabled(Enum.HumanoidStateType.FallingDown, false)
+					hum:SetStateEnabled(Enum.HumanoidStateType.GettingUp, true)
+					hum:SetStateEnabled(Enum.HumanoidStateType.Running, true)
+					hum:ChangeState(Enum.HumanoidStateType.Running)
+				end)
+				myRoot.AssemblyLinearVelocity = Vector3.zero
+				myRoot.AssemblyAngularVelocity = Vector3.zero
+				if typeof(aim) == 'Vector3' then
+					myRoot.CFrame = CFrame.lookAt(goal, Vector3.new(aim.X, goal.Y, aim.Z))
+				else
+					myRoot.CFrame = CFrame.new(goal) * (myRoot.CFrame - myRoot.CFrame.Position)
+				end
+				return
+			end
 			local drift = (here - goal).Magnitude
 			local dodging = os.clock() < (rt.aoeUntil or 0)
 			local tight = snapExact or dodging
@@ -1599,12 +1629,14 @@ local Pin = (function()
 						hum:SetStateEnabled(Enum.HumanoidStateType.Freefall, false)
 					end)
 				end
-				local st = hum:GetState()
-				if st == Enum.HumanoidStateType.Freefall
-					or st == Enum.HumanoidStateType.Physics
-					or st == Enum.HumanoidStateType.FallingDown
+				local st2 = hum:GetState()
+				if st2 == Enum.HumanoidStateType.Freefall
+					or st2 == Enum.HumanoidStateType.Physics
+					or st2 == Enum.HumanoidStateType.FallingDown
+					or st2 == Enum.HumanoidStateType.Ragdoll
 				then
 					pcall(function()
+						hum:SetStateEnabled(Enum.HumanoidStateType.Ragdoll, false)
 						hum:ChangeState(Enum.HumanoidStateType.Running)
 					end)
 				end
@@ -10649,7 +10681,7 @@ local ChestPick = (function()
 			end
 			return 0
 		end
-		if os.clock() - lastAt < 4 then
+		if os.clock() - lastAt < 0.12 then
 			return 0
 		end
 		lastAt = os.clock()
@@ -10662,13 +10694,11 @@ local ChestPick = (function()
 			local btn = p:FindFirstChild('Chest_' .. i)
 			if btn and btn.Visible and click(btn) then
 				took += 1
-				task.wait(0.3)
 			end
 		end
 		if took > 0 then
-			task.wait(0.4)
-			-- Only confirm if the panel is still up; the client may close itself once
-			-- the cap is reached.
+			-- Finish on the same pass. The old 0.3s-per-chest + 0.4s wait made
+			-- the reward panel sit there for over a second.
 			if api.open() then
 				click(p:FindFirstChild('Finish'))
 			end
@@ -10869,7 +10899,7 @@ local BlessPick = (function()
 	local openAt, openWas = 0, false
 	function api.open(force)
 		local now = os.clock()
-		if not force and now - openAt < 0.2 then
+		if not force and now - openAt < 0.08 then
 			return openWas
 		end
 		openAt = now
@@ -10885,7 +10915,7 @@ local BlessPick = (function()
 			end
 			return false
 		end
-		if os.clock() - lastAt < 3 then
+		if os.clock() - lastAt < 0.08 then
 			return false
 		end
 		lastAt = os.clock()
@@ -10906,7 +10936,7 @@ local BlessPick = (function()
 	end
 
 	function api.tick()
-		if on('DLAutoBless') and api.open() then
+		if on('DLAutoBless') and api.open(true) then
 			task.spawn(api.run, true)
 		end
 	end
@@ -11081,11 +11111,11 @@ local BlessPick = (function()
 				end
 			end
 			Pin.at(stand, true)
-			task.wait(0.55)
-			local deadline = os.clock() + 5.5
+			task.wait(0.08)
+			local deadline = os.clock() + 3.5
 			local opened = false
 			while os.clock() < deadline and currentInstance() do
-				if api.open() then
+				if api.open(true) then
 					opened = true
 					break
 				end
@@ -11100,12 +11130,11 @@ local BlessPick = (function()
 						fireChestPrompt(p)
 					end
 				end
-				task.wait(0.35)
+				task.wait(0.08)
 			end
 			local picked = false
-			if opened or api.open() then
+			if opened or api.open(true) then
 				picked = api.run(true) == true
-				task.wait(0.45)
 			end
 			if picked or opened or shrineLooksSpent(bestModel, bestPrompt)
 				or (bestPrompt and bestPrompt.Parent and bestPrompt.Enabled ~= true)
@@ -11120,7 +11149,7 @@ local BlessPick = (function()
 					live.AssemblyAngularVelocity = Vector3.zero
 				end)
 				Pin.at(home.Position, true)
-				task.wait(0.3)
+				task.wait(0.05)
 			end
 			if not wasNoclip and not farmBusy then
 				noclipOn = false
@@ -11186,7 +11215,7 @@ local BlessPick = (function()
 				end
 			end
 		end
-		if near and api.open() then
+		if near and api.open(true) then
 			farmLabel = 'blessing'
 			local picked = api.run(true) == true
 			if picked then

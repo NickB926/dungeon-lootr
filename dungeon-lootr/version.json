@@ -1,6 +1,6 @@
 {
-    "version":  "1.0.85",
-    "message":  "fix HUD star helper crash, follow listed rooms and loot before leaving",
+    "version":  "1.0.86",
+    "message":  "stand up from ragdoll instantly; pick boss chests and blessings immediately",
     "files":  [
                   "dungeon-lootr/launch.lua",
                   "dungeon-lootr/DungeonLootr.lua",
