@@ -141,7 +141,7 @@ Library.ToggleKeybind = { Value = 'Home' }
 Library.Animations = Library.Animations or {}
 Library.Animations.TabSwitch = false
 
-local DL_BUILD = '1.0.49'
+local DL_BUILD = '1.0.50'
 getgenv().DLBuild = DL_BUILD
 -- Do NOT wipe DLShrineSkipKeys on every reload — that re-warps spent altars.
 
@@ -4363,6 +4363,22 @@ rt.avoidFloorAoe = function()
 		rt.aoeGoal = nil
 		return false
 	end
+	-- Buried under the raid arena (special bury / void): never park on a floor
+	-- disc gap down here — snap logic elsewhere pulls us back to the boss.
+	do
+		local raid = workspace:FindFirstChild('Raid_NPCs')
+		if raid then
+			for _, ch in ipairs(raid:GetChildren()) do
+				local rp = ch:FindFirstChild('HumanoidRootPart') or ch.PrimaryPart
+				if rp and (rp.Position.Y - me.Y) > 35 then
+					rt.aoeUntil = 0
+					rt.aoeGoal = nil
+					rt.stickyPlant = nil
+					return false
+				end
+			end
+		end
+	end
 	local function covered(x, z, pad)
 		pad = pad or 3
 		for i = 1, #circles do
@@ -4776,6 +4792,13 @@ end
 local function enemyRank(npc)
 	if not npc then
 		return 0
+	end
+	-- Event raid boss (Dark Professor) is IsBoss only — treat as special so
+	-- findLiveSpecial / add-clear / ult-hold all pick him over leftover dungeon trash.
+	if npc.Parent and npc.Parent.Name == 'Raid_NPCs'
+		and (npc:GetAttribute('IsBoss') == true or npc:GetAttribute('IsSpecialBoss') == true)
+	then
+		return 4
 	end
 	if npc:GetAttribute('IsSpecialBoss') == true
 		or npc:GetAttribute('IsSpecial') == true
@@ -5691,6 +5714,14 @@ local function rebuildEnemyCache()
 			consider(npc)
 		end
 	end
+	-- Lobby admin abuse / world bosses (Demagios, Coyote, Mageless Student, …)
+	-- live under Workspace.NPCs — not Generated_ / Raid_NPCs.
+	local lobbyNpcs = workspace:FindFirstChild('NPCs')
+	if lobbyNpcs then
+		for _, npc in ipairs(lobbyNpcs:GetChildren()) do
+			consider(npc)
+		end
+	end
 	local rush = workspace:FindFirstChild('BossRush_NPCs')
 	if rush then
 		for _, npc in ipairs(rush:GetChildren()) do
@@ -6176,16 +6207,20 @@ local function autoSkillTick()
 	if not wantUlt then
 		return
 	end
-	if LocalPlayer:GetAttribute('InNoCombatZone') == true and not farmBusy then
-		return
-	end
-	-- Soft dungeon gate: attribute lag / alternate flags used to starve skills
-	-- for friends while the local client looked fine.
-	local inRun = LocalPlayer:GetAttribute('InDungeon') == true
-		or LocalPlayer:GetAttribute('DungeonRun') == true
-		or farmBusy == true
-		or tostring(LocalPlayer:GetAttribute('CurrentDungeon') or '') ~= ''
-	if not inRun then
+	-- Nearby hostiles first — lobby world bosses / admin waves sit in
+	-- Workspace.NPCs with InDungeon=false and often InNoCombatZone=true.
+	local nearby = skillMobNearby(58)
+	if not nearby then
+		if LocalPlayer:GetAttribute('InNoCombatZone') == true and not farmBusy then
+			return
+		end
+		local inRun = LocalPlayer:GetAttribute('InDungeon') == true
+			or LocalPlayer:GetAttribute('DungeonRun') == true
+			or farmBusy == true
+			or tostring(LocalPlayer:GetAttribute('CurrentDungeon') or '') ~= ''
+		if not inRun then
+			return
+		end
 		return
 	end
 	-- Do not gate on char Parry attr — it can stick true mid-farm and starve skills
@@ -6216,10 +6251,6 @@ local function autoSkillTick()
 	end
 	-- Shrine / chest routes can wait; do not hard-block while mid-fight.
 	if routeBusy and not rt.farmFighting and not rt.farmFightNpc then
-		return
-	end
-	-- Nearby mob / live fight target — wider than parry arm range.
-	if not skillMobNearby(58) then
 		return
 	end
 	-- One skill per tick. Dumping 1–4 on the same Heartbeat made the server
@@ -6300,6 +6331,32 @@ local function inDungeonFarm()
 	if LocalPlayer:GetAttribute('InDungeon') == true then
 		rt.farmDungeonMiss = nil
 		return true
+	end
+	-- Lobby admin abuse / world bosses under Workspace.NPCs.
+	local lobby = workspace:FindFirstChild('NPCs')
+	if lobby then
+		for _, npc in ipairs(lobby:GetChildren()) do
+			if npc:IsA('Model') then
+				local st = string.lower(tostring(npc:GetAttribute('State') or ''))
+				if st ~= 'dead' and st ~= 'died' and st ~= 'dying' then
+					local ov = tonumber(npc:GetAttribute('HealthOverride')) or 0
+					local hum = npc:FindFirstChildOfClass('Humanoid')
+					local aliveHum = hum and hum.Health > 0
+					if npc:GetAttribute('WorldBoss') == true
+						or npc:GetAttribute('IsBoss') == true
+						or ov > 0
+						or aliveHum
+						or (npc:FindFirstChild('HumanoidRootPart') ~= nil and (
+							npc:GetAttribute('ItemId') ~= nil
+							or npc:GetAttribute('IsFodder') ~= nil
+						))
+					then
+						rt.farmDungeonMiss = nil
+						return true
+					end
+				end
+			end
+		end
 	end
 	-- Room hops / key unlocks can drop InDungeon for a beat. Exiting the farm
 	-- loop there dumps noclip+pin and the skills start walking you on the floor.
@@ -8289,6 +8346,14 @@ local function isFinalBoss(npc)
 	if not npc then
 		return false
 	end
+	-- Lobby Workspace.NPCs (admin waves / world bosses) are never the dungeon
+	-- floor boss — IsBoss on Coyote/Demagios used to skipFinal them forever.
+	if npc.Parent and npc.Parent.Name == 'NPCs' and npc.Parent.Parent == workspace then
+		return false
+	end
+	if npc:GetAttribute('WorldBoss') == true then
+		return false
+	end
 	if npc:GetAttribute('IsMiniBoss') == true or isMiniBossEnemy(npc) then
 		return false
 	end
@@ -8369,6 +8434,13 @@ local function eachFarmNpc(fn)
 					end
 				end
 			end
+		end
+	end
+	-- Lobby admin abuse / world bosses (Coyote, Demagios, Mageless Student, …).
+	local lobbyNpcs = workspace:FindFirstChild('NPCs')
+	if lobbyNpcs then
+		for _, npc in ipairs(lobbyNpcs:GetChildren()) do
+			take(npc)
 		end
 	end
 	local chall = workspace:FindFirstChild('Challenge_Dungeons')
@@ -8696,6 +8768,14 @@ local corrSeen = setmetatable({}, { __mode = 'k' })
 
 rt.npcInCorridor = function(npc)
 	if not npc or isFinalBoss(npc) then
+		return false
+	end
+	-- Lobby admin / world-boss waves under Workspace.NPCs — never treat as
+	-- dungeon corridor trash (leftover Generated_ zones used to ban them).
+	if npc.Parent and npc.Parent.Name == 'NPCs' and npc.Parent.Parent == workspace then
+		return false
+	end
+	if npc:GetAttribute('WorldBoss') == true then
 		return false
 	end
 	local d = activeDungeonRoot()
@@ -10381,6 +10461,7 @@ local function findLiveSpecial()
 			return
 		end
 		local special = enemyRank(npc) >= 4
+			or isRaidBossNpc(npc)
 			or npc:GetAttribute('IsSpecial') == true
 			or npc:GetAttribute('IsSpecialBoss') == true
 		if not special then
@@ -10396,6 +10477,127 @@ local function findLiveSpecial()
 			best, bestD = npc, d
 		end
 	end)
+	return best
+end
+
+-- Event raid focus: crystals → Mage Students → Dark Professor.
+-- Dark Professor is IsBoss-only (rank was 3); leftover Generated_ rooms used to
+-- steal the farm while he sat in Raid_NPCs unfought.
+local function findRaidFocus()
+	local raid = workspace:FindFirstChild('Raid_NPCs')
+	if not raid then
+		return nil
+	end
+	local crystal = select(1, nearestCrystal())
+	if crystal then
+		return crystal
+	end
+	local boss
+	eachFarmNpc(function(npc)
+		if isRaidBossNpc(npc) and enemyAlive(npc) and not farmSkipped(npc) then
+			boss = npc
+		end
+	end)
+	if boss then
+		local add = select(1, addsNearSpecial(boss))
+		if add then
+			return add
+		end
+		-- Any awake Raid_NPCs fodder even if outside ADD_NEAR (player buried far).
+		local anyAdd
+		eachFarmNpc(function(npc)
+			if anyAdd or npc == boss or isRaidBossNpc(npc) or isRaidCrystal(npc) then
+				return
+			end
+			if isAwakeAdd(npc) then
+				anyAdd = npc
+			end
+		end)
+		if anyAdd then
+			return anyAdd
+		end
+		return boss
+	end
+	local add
+	eachFarmNpc(function(npc)
+		if add or not npc.Parent or npc.Parent.Name ~= 'Raid_NPCs' then
+			return
+		end
+		if isAwakeAdd(npc) then
+			add = npc
+		end
+	end)
+	return add
+end
+
+local function snapToRaidTarget(npc)
+	local me = routeRoot()
+	local part = enemyRoot(npc)
+	if not me or not part then
+		return false
+	end
+	local d = (me.Position - part.Position).Magnitude
+	local dy = math.abs(me.Position.Y - part.Position.Y)
+	if d < 55 and dy < 22 then
+		return false
+	end
+	rt.aoeUntil = 0
+	rt.aoeGoal = nil
+	rt.stickyPlant = nil
+	rt.farmFloorY = nil
+	local stand = Vector3.new(part.Position.X, part.Position.Y, part.Position.Z)
+	local flat = Vector3.new(me.Position.X - part.Position.X, 0, me.Position.Z - part.Position.Z)
+	if flat.Magnitude > 0.2 then
+		stand = part.Position + flat.Unit * 6
+	else
+		stand = part.Position + Vector3.new(0, 0, 6)
+	end
+	stand = Vector3.new(stand.X, part.Position.Y, stand.Z)
+	Pin.at(stand, true)
+	if type(rt.snapRoot) == 'function' then
+		pcall(rt.snapRoot, stand)
+	else
+		pcall(function()
+			me.CFrame = CFrame.new(stand)
+			me.AssemblyLinearVelocity = Vector3.zero
+		end)
+	end
+	return true
+end
+
+-- Lobby Workspace.NPCs: world bosses + admin abuse waves (Daemons, Students, …).
+local function findLobbyEventFocus()
+	local folder = workspace:FindFirstChild('NPCs')
+	if not folder then
+		return nil
+	end
+	local best, bestD, bestRank = nil, 9e9, -1
+	local me = routeRoot()
+	for _, npc in ipairs(folder:GetChildren()) do
+		-- Clear stale corridor bans — leftover Generated_ used to farmBan these.
+		if farmBan[npc] then
+			farmBan[npc] = nil
+		end
+		if enemyAlive(npc) and not farmSkipped(npc) and enemyRoot(npc) then
+			local part = enemyRoot(npc)
+			local d = me and (part.Position - me.Position).Magnitude or 0
+			local rank = 1
+			local name = string.lower(tostring(npc:GetAttribute('ItemId') or npc.Name or ''))
+			if npc:GetAttribute('WorldBoss') == true then
+				rank = 5
+			elseif npc:GetAttribute('IsBoss') == true then
+				rank = 4
+			elseif name:find('daemon', 1, true) or name:find('student', 1, true) then
+				rank = 3
+			elseif enemyRank(npc) >= 3 then
+				rank = enemyRank(npc)
+			end
+			-- Prefer nearest among same rank so we actually warp onto the pack.
+			if rank > bestRank or (rank == bestRank and d < bestD) then
+				best, bestD, bestRank = npc, d, rank
+			end
+		end
+	end
 	return best
 end
 
@@ -11867,6 +12069,24 @@ local function farmLoop()
 				rt.farmReturnNpc = nil
 				farmKillNpc(back)
 			else
+				-- Lobby world bosses / admin waves (Workspace.NPCs) before raid/dungeon.
+				local lobbyNpc = findLobbyEventFocus()
+				if lobbyNpc then
+					step('lobby')
+					farmLabel = ('event · %s'):format(lobbyNpc.Name)
+					pcall(snapToRaidTarget, lobbyNpc)
+					farmKillNpc(lobbyNpc)
+				else
+				-- Event raid owns the farm while Raid_NPCs has living targets.
+				-- Dark Professor is IsBoss (not IsSpecial) and used to lose to
+				-- leftover Generated_ room tours / under-map aoe gaps.
+				local raidNpc = findRaidFocus()
+				if raidNpc then
+					step('raid')
+					farmLabel = ('raid · %s'):format(raidNpc.Name)
+					pcall(snapToRaidTarget, raidNpc)
+					farmKillNpc(raidNpc)
+				else
 				step('aoe')
 				-- holdOnEnemy already steps off floor discs. Pin.at here mid-fight
 				-- yanked the character off the pack every time a telegraph spawned.
@@ -11986,6 +12206,8 @@ local function farmLoop()
 						step('tour')
 						tourFarmRooms(dungeon)
 					end
+				end
+				end
 				end
 				end
 			end
