@@ -141,7 +141,7 @@ Library.ToggleKeybind = { Value = 'Home' }
 Library.Animations = Library.Animations or {}
 Library.Animations.TabSwitch = false
 
-local DL_BUILD = '1.0.50'
+local DL_BUILD = '1.0.51'
 getgenv().DLBuild = DL_BUILD
 -- Do NOT wipe DLShrineSkipKeys on every reload — that re-warps spent altars.
 
@@ -310,28 +310,20 @@ local replayArmedAt = nil
 local replayTries = 0
 local lastReplayAt = 0
 local replayCount = 0
+-- Fallback only when GameInfo.CodesData is missing. Prefer live Active flags —
+-- listRedeemCodes refreshes from CodesData every run so new codes appear
+-- without bumping this table. Keep in sync when CodesData is unavailable.
 local EXTRA_CODES = {
+	'20MVISIT',
 	'45KLIKE',
 	'JACKAL',
+	'MOONWITCH',
+	'NECROMANCER',
+	'PAYLOAD',
 	'SILVERINE',
-	'20MVISIT',
-	'20mvisit',
+	'TORUS',
 	'TOURNAMENT',
-	'UPDATE1',
-	'15KCCU',
-	'WEEKENDBUFFS',
-	'RAIDTIME',
-	'COURAGE',
-	'LOVETHISGAME',
-	'LOOTR',
-	'FORGESKIP',
-	'8KLIKE',
-	'10KFAV',
-	'FULLRELEASE',
-	'LOOTRISBACK',
-	'JACKPOT',
-	'20KPLAYERS',
-	'GIVEMEGEMSPLEASE',
+	'UPDATE2',
 }
 pcall(function()
 	local cfg = game:GetService('ReplicatedStorage'):FindFirstChild('Configuration')
@@ -679,6 +671,16 @@ local function statsText()
 			lines[#lines + 1] = 'raid loop on'
 		end
 	end
+	if on('DLChallengeLoop') then
+		local boss = Options.DLChallengeBoss and tostring(Options.DLChallengeBoss.Value or '') or ''
+		local diff = Options.DLChallengeDifficulty and tostring(Options.DLChallengeDifficulty.Value or '') or ''
+		if boss ~= '' and boss ~= 'nil' then
+			lines[#lines + 1] = ('challenge loop  ·  %s · %s'):format(
+				boss, (diff ~= '' and diff ~= 'nil') and diff or '?')
+		else
+			lines[#lines + 1] = 'challenge loop on'
+		end
+	end
 	if on('DLHuntSpecial') then
 		local needle = Options.DLHuntTarget and tostring(Options.DLHuntTarget.Value or '') or ''
 		if needle == '' or needle == 'nil' then
@@ -826,6 +828,24 @@ end
 local function fireChestPrompt(prompt)
 	if not prompt or not prompt:IsA('ProximityPrompt') or prompt.Enabled ~= true then
 		return false
+	end
+	-- Auto collect off: never fire dungeon ChestPrompt. Collect-all sets chestForceClaim.
+	-- Potion / shrine / key prompts keep working (they are not ChestPrompt / DungeonChest).
+	if not on('DLChestAnywhere') and not rt.chestForceClaim then
+		local isChest = prompt.Name == 'ChestPrompt'
+		if not isChest then
+			local m = prompt.Parent
+			while m and not m:IsA('Model') do
+				m = m.Parent
+			end
+			if m then
+				isChest = m:GetAttribute('DungeonChest') == true
+					or (type(m.Name) == 'string' and m.Name:sub(1, 13) == 'DungeonChest')
+			end
+		end
+		if isChest then
+			return false
+		end
 	end
 	local now = os.clock()
 	if (chestFiredAt[prompt] or 0) + 0.35 > now then
@@ -1385,6 +1405,14 @@ local function setCharNoclip(enabled)
 		end
 	end
 	noclipSaved = {}
+	-- Lobby restart spam could leave HRP CanCollide=false without a save entry
+	-- (already false when noclip was "enabled"). Always put the root back.
+	pcall(function()
+		local hrp = char:FindFirstChild('HumanoidRootPart')
+		if hrp and hrp:IsA('BasePart') then
+			hrp.CanCollide = true
+		end
+	end)
 end
 
 -- Keep farm/route noclip without a full descendant walk every Stepped tick.
@@ -2854,7 +2882,13 @@ function rt.roomHasLiving(idx)
 	return false
 end
 
-local function collectChestRoute(silent, roomOnly)
+local function collectChestRoute(silent, roomOnly, force)
+	if not force and not on('DLChestAnywhere') then
+		if not silent then
+			Library:Notify('Auto collect chests is off')
+		end
+		return false
+	end
 	if rt.refillUrgent or rt.refillBusy then
 		return false
 	end
@@ -2867,6 +2901,9 @@ local function collectChestRoute(silent, roomOnly)
 			Library:Notify('No character to move')
 		end
 		return false
+	end
+	if force then
+		rt.chestForceClaim = true
 	end
 	-- Gate already spent (Use Key prompt off) = LockedRoom chests are free.
 	rt.chestRoomOpen = rt.chestRoomOpen or {}
@@ -2930,6 +2967,12 @@ local function collectChestRoute(silent, roomOnly)
 		for _, gen in ipairs(workspace:GetChildren()) do
 			if gen.Name:sub(1, 10) == 'Generated_' then
 				for _, child in ipairs(gen:GetChildren()) do
+					if child:GetAttribute('DungeonChest') == true or child.Name:sub(1, 13) == 'DungeonChest' then
+						consider(child)
+					end
+				end
+			elseif (gen.Name == 'Challenge_Dungeons' or gen.Name == 'Payload_Maps') then
+				for _, child in ipairs(gen:GetDescendants()) do
 					if child:GetAttribute('DungeonChest') == true or child.Name:sub(1, 13) == 'DungeonChest' then
 						consider(child)
 					end
@@ -3014,6 +3057,9 @@ local function collectChestRoute(silent, roomOnly)
 							routeBusy = false
 							rt.chestLooting = false
 							routeLabel = nil
+							if force then
+								rt.chestForceClaim = false
+							end
 							return got > 0
 						end
 						task.wait(0.08)
@@ -3025,6 +3071,9 @@ local function collectChestRoute(silent, roomOnly)
 							routeBusy = false
 							rt.chestLooting = false
 							routeLabel = nil
+							if force then
+								rt.chestForceClaim = false
+							end
 							return got > 0
 						end
 						pcall(function()
@@ -3090,6 +3139,9 @@ local function collectChestRoute(silent, roomOnly)
 		routeLabel = nil
 		routeBusy = false
 		rt.chestLooting = false
+		if force then
+			rt.chestForceClaim = false
+		end
 		routeDoneAt = os.clock()
 		lastChestGrab = os.clock()
 		if not silent or got > 0 then
@@ -3107,10 +3159,16 @@ local function collectChestRoute(silent, roomOnly)
 		routeBusy = false
 		rt.chestLooting = false
 		routeLabel = nil
+		if force then
+			rt.chestForceClaim = false
+		end
 		warn('[DL] chest route', errRun)
 		return false
 	end
 	if roomOnly or farmBusy then
+		if force then
+			rt.chestForceClaim = false
+		end
 		return got > 0
 	end
 	return true
@@ -4641,6 +4699,15 @@ local function enemyAlive(npc)
 	if npc.Parent and npc.Parent.Name == 'Raid_NPCs' then
 		return enemyRoot(npc) ~= nil
 	end
+	-- Payload waves: PayloadCombat_*/PayloadEnemies_* (AnimationController, no Humanoid).
+	local p = npc.Parent
+	if p and type(p.Name) == 'string' and p.Name:sub(1, 15) == 'PayloadEnemies_' then
+		local state = string.lower(tostring(npc:GetAttribute('State') or ''))
+		if state == 'dead' or state == 'died' or state == 'dying' then
+			return false
+		end
+		return enemyRoot(npc) ~= nil
+	end
 	return false
 end
 
@@ -5714,18 +5781,60 @@ local function rebuildEnemyCache()
 			consider(npc)
 		end
 	end
-	-- Lobby admin abuse / world bosses (Demagios, Coyote, Mageless Student, …)
-	-- live under Workspace.NPCs — not Generated_ / Raid_NPCs.
-	local lobbyNpcs = workspace:FindFirstChild('NPCs')
-	if lobbyNpcs then
-		for _, npc in ipairs(lobbyNpcs:GetChildren()) do
-			consider(npc)
-		end
-	end
 	local rush = workspace:FindFirstChild('BossRush_NPCs')
 	if rush then
 		for _, npc in ipairs(rush:GetChildren()) do
 			consider(npc)
+		end
+	end
+	-- Challenge / Payload helpers are declared later — gate on attrs/folders here.
+	if LocalPlayer:GetAttribute('InChallenge') == true then
+		local chall = workspace:FindFirstChild('Challenge_Dungeons')
+		if chall then
+			for _, room in ipairs(chall:GetChildren()) do
+				local folder = room:FindFirstChild('NPCs')
+				if folder then
+					for _, npc in ipairs(folder:GetChildren()) do
+						consider(npc)
+					end
+				end
+			end
+		end
+	end
+	local pay = workspace:FindFirstChild('Payload_Maps')
+	if pay then
+		for _, map in ipairs(pay:GetChildren()) do
+			local folder = map:FindFirstChild('NPCs')
+			if folder then
+				for _, npc in ipairs(folder:GetChildren()) do
+					consider(npc)
+				end
+			end
+			for _, d in ipairs(map:GetDescendants()) do
+				if d.Name == 'NPCs' and d:IsA('Folder') and d ~= folder then
+					for _, npc in ipairs(d:GetChildren()) do
+						consider(npc)
+					end
+				end
+			end
+		end
+	end
+	-- Live Payload waves: PayloadCombat_*/PayloadEnemies_* (AnimationController + HealthOverride).
+	if LocalPlayer:GetAttribute('InPayload') == true or pay then
+		if type(rt.eachPayloadCombatNpc) == 'function' then
+			rt.eachPayloadCombatNpc(consider)
+		else
+			for _, root in ipairs(workspace:GetChildren()) do
+				if type(root.Name) == 'string' and root.Name:sub(1, 14) == 'PayloadCombat_' then
+					for _, folder in ipairs(root:GetChildren()) do
+						if type(folder.Name) == 'string' and folder.Name:sub(1, 15) == 'PayloadEnemies_' then
+							for _, npc in ipairs(folder:GetChildren()) do
+								consider(npc)
+							end
+						end
+					end
+				end
+			end
 		end
 	end
 	enemyCacheAt = os.clock()
@@ -6207,20 +6316,14 @@ local function autoSkillTick()
 	if not wantUlt then
 		return
 	end
-	-- Nearby hostiles first — lobby world bosses / admin waves sit in
-	-- Workspace.NPCs with InDungeon=false and often InNoCombatZone=true.
-	local nearby = skillMobNearby(58)
-	if not nearby then
-		if LocalPlayer:GetAttribute('InNoCombatZone') == true and not farmBusy then
-			return
-		end
-		local inRun = LocalPlayer:GetAttribute('InDungeon') == true
-			or LocalPlayer:GetAttribute('DungeonRun') == true
-			or farmBusy == true
-			or tostring(LocalPlayer:GetAttribute('CurrentDungeon') or '') ~= ''
-		if not inRun then
-			return
-		end
+	if LocalPlayer:GetAttribute('InNoCombatZone') == true and not farmBusy then
+		return
+	end
+	local inRun = LocalPlayer:GetAttribute('InDungeon') == true
+		or LocalPlayer:GetAttribute('DungeonRun') == true
+		or farmBusy == true
+		or tostring(LocalPlayer:GetAttribute('CurrentDungeon') or '') ~= ''
+	if not inRun then
 		return
 	end
 	-- Do not gate on char Parry attr — it can stick true mid-farm and starve skills
@@ -6251,6 +6354,10 @@ local function autoSkillTick()
 	end
 	-- Shrine / chest routes can wait; do not hard-block while mid-fight.
 	if routeBusy and not rt.farmFighting and not rt.farmFightNpc then
+		return
+	end
+	-- Nearby mob / live fight target — wider than parry arm range.
+	if not skillMobNearby(58) then
 		return
 	end
 	-- One skill per tick. Dumping 1–4 on the same Heartbeat made the server
@@ -6323,40 +6430,114 @@ local function inBossRushFarm()
 		or d:find('boss rush', 1, true) ~= nil
 end
 
+-- Challenge / Payload farm gates live on rt (main chunk is at the 200-local cap).
+-- Challenge: InChallenge attr, arena under Challenge_Dungeons — HAS difficulty
+-- (Easy/Normal/Hard/Nightmare on the completion badge, same as normal runs).
+-- Payload: InPayload attr / PayloadCombat_* while Active — also has Easy/Normal/Hard/Nightmare.
+-- Wave chests ~60s; payload Chest_Selection ~3s — grab immediately.
+-- NEVER key off Payload_Maps / Challenge_Dungeons folder presence alone: those
+-- folders linger in workspace during normal Generated_ dungeon runs and used to
+-- trap the farm on "payload · waiting" (Frostpire / Snow Endless).
+do
+	function rt.inChallengeFarm()
+		return LocalPlayer:GetAttribute('InChallenge') == true
+	end
+	function rt.inPayloadFarm()
+		if LocalPlayer:GetAttribute('InPayload') == true then
+			return true
+		end
+		-- Generated_ / Challenge runs win even if Payload_Maps junk is in workspace.
+		if LocalPlayer:GetAttribute('InDungeon') == true
+			or LocalPlayer:GetAttribute('InChallenge') == true
+		then
+			return false
+		end
+		for _, root in ipairs(workspace:GetChildren()) do
+			local name = root.Name
+			if type(name) == 'string' and name:sub(1, 14) == 'PayloadCombat_' then
+				return true
+			end
+		end
+		return false
+	end
+	function rt.inModeArenaFarm()
+		return rt.inChallengeFarm() or rt.inPayloadFarm()
+	end
+	-- Payload combat NPCs live under PayloadCombat_<runId>/PayloadEnemies_<runId>,
+	-- not Payload_Maps (map geometry only).
+	function rt.eachPayloadCombatNpc(fn)
+		if type(fn) ~= 'function' then
+			return
+		end
+		for _, root in ipairs(workspace:GetChildren()) do
+			local name = root.Name
+			if type(name) == 'string' and name:sub(1, 14) == 'PayloadCombat_' then
+				for _, folder in ipairs(root:GetChildren()) do
+					local fnName = folder.Name
+					if type(fnName) == 'string' and fnName:sub(1, 15) == 'PayloadEnemies_' then
+						for _, npc in ipairs(folder:GetChildren()) do
+							fn(npc)
+						end
+					end
+				end
+			end
+		end
+	end
+	function rt.challengeArenaRoot()
+		local folder = workspace:FindFirstChild('Challenge_Dungeons')
+		if not folder then
+			return nil
+		end
+		local best, bestN = nil, -1
+		for _, child in ipairs(folder:GetChildren()) do
+			local npcs = child:FindFirstChild('NPCs')
+			local n = npcs and #npcs:GetChildren() or 0
+			if n > bestN then
+				best, bestN = child, n
+			end
+		end
+		if best then
+			return best
+		end
+		local kids = folder:GetChildren()
+		return kids[1]
+	end
+	function rt.payloadMapRoot()
+		local folder = workspace:FindFirstChild('Payload_Maps')
+		if not folder then
+			return nil
+		end
+		local best, bestN = nil, -1
+		for _, child in ipairs(folder:GetChildren()) do
+			local npcs = child:FindFirstChild('NPCs')
+			local n = npcs and #npcs:GetChildren() or 0
+			if n <= 0 then
+				for _, d in ipairs(child:GetDescendants()) do
+					if d.Name == 'NPCs' and d:IsA('Folder') then
+						n += #d:GetChildren()
+					end
+				end
+			end
+			if n > bestN then
+				best, bestN = child, n
+			end
+		end
+		if best then
+			return best
+		end
+		local kids = folder:GetChildren()
+		return kids[1]
+	end
+end
+
 local function inDungeonFarm()
-	if inBossRushFarm() then
+	if inBossRushFarm() or rt.inModeArenaFarm() then
 		rt.farmDungeonMiss = nil
 		return true
 	end
 	if LocalPlayer:GetAttribute('InDungeon') == true then
 		rt.farmDungeonMiss = nil
 		return true
-	end
-	-- Lobby admin abuse / world bosses under Workspace.NPCs.
-	local lobby = workspace:FindFirstChild('NPCs')
-	if lobby then
-		for _, npc in ipairs(lobby:GetChildren()) do
-			if npc:IsA('Model') then
-				local st = string.lower(tostring(npc:GetAttribute('State') or ''))
-				if st ~= 'dead' and st ~= 'died' and st ~= 'dying' then
-					local ov = tonumber(npc:GetAttribute('HealthOverride')) or 0
-					local hum = npc:FindFirstChildOfClass('Humanoid')
-					local aliveHum = hum and hum.Health > 0
-					if npc:GetAttribute('WorldBoss') == true
-						or npc:GetAttribute('IsBoss') == true
-						or ov > 0
-						or aliveHum
-						or (npc:FindFirstChild('HumanoidRootPart') ~= nil and (
-							npc:GetAttribute('ItemId') ~= nil
-							or npc:GetAttribute('IsFodder') ~= nil
-						))
-					then
-						rt.farmDungeonMiss = nil
-						return true
-					end
-				end
-			end
-		end
 	end
 	-- Room hops / key unlocks can drop InDungeon for a beat. Exiting the farm
 	-- loop there dumps noclip+pin and the skills start walking you on the floor.
@@ -6387,6 +6568,18 @@ end
 -- (Boss_Rush.RUSH_SPAWN holds meme models tagged Enemy with a Humanoid). Scope the
 -- farm to the NPCs folder of the dungeon we are actually running.
 function activeDungeonRoot()
+	if rt.inChallengeFarm() then
+		local arena = rt.challengeArenaRoot()
+		if arena then
+			return arena
+		end
+	end
+	if rt.inPayloadFarm() then
+		local map = rt.payloadMapRoot()
+		if map then
+			return map
+		end
+	end
 	local want = tostring(LocalPlayer:GetAttribute('CurrentDungeon') or '')
 	local fallback = nil
 	for _, root in ipairs(workspace:GetChildren()) do
@@ -6609,14 +6802,21 @@ local Rooms = (function()
 		local info = sessionInfo()
 		local soft = info and tonumber(info.CurrentRoom) == 0
 		local forward = awake == 0 or soft
-		local maxDist = (forward or farmBusy) and 2000 or 350
+		-- Frostpire pads are often 2k–4k studs apart; Vector3.zero also used when
+		-- root is missing so distance checks must not silently drop every pack.
+		local fromOk = typeof(fromPos) == 'Vector3' and fromPos.Magnitude > 1
+		local maxDist = (forward or farmBusy or not fromOk) and 6000 or 350
 		local bestIdx, bestD
 		eachNpc(dungeon, function(npc)
 			if npc:GetAttribute('IsDormant') == true and enemyAlive(npc) then
 				local idx = api.indexOf(npc)
 				local pos = idx and entryPoint(dungeon, idx)
-				if pos and (retryAt[idx] or 0) <= now then
-					local d = (pos - fromPos).Magnitude
+				if not pos then
+					local root = enemyRoot(npc)
+					pos = root and root.Position
+				end
+				if pos and idx and (retryAt[idx] or 0) <= now then
+					local d = fromOk and (pos - fromPos).Magnitude or 0
 					if d <= maxDist then
 						if forward then
 							if not bestIdx or idx < bestIdx then
@@ -8346,14 +8546,6 @@ local function isFinalBoss(npc)
 	if not npc then
 		return false
 	end
-	-- Lobby Workspace.NPCs (admin waves / world bosses) are never the dungeon
-	-- floor boss — IsBoss on Coyote/Demagios used to skipFinal them forever.
-	if npc.Parent and npc.Parent.Name == 'NPCs' and npc.Parent.Parent == workspace then
-		return false
-	end
-	if npc:GetAttribute('WorldBoss') == true then
-		return false
-	end
 	if npc:GetAttribute('IsMiniBoss') == true or isMiniBossEnemy(npc) then
 		return false
 	end
@@ -8436,20 +8628,76 @@ local function eachFarmNpc(fn)
 			end
 		end
 	end
-	-- Lobby admin abuse / world bosses (Coyote, Demagios, Mageless Student, …).
-	local lobbyNpcs = workspace:FindFirstChild('NPCs')
-	if lobbyNpcs then
-		for _, npc in ipairs(lobbyNpcs:GetChildren()) do
-			take(npc)
-		end
-	end
 	local chall = workspace:FindFirstChild('Challenge_Dungeons')
-	if chall then
+	if chall and rt.inChallengeFarm() then
+		for _, room in ipairs(chall:GetChildren()) do
+			local npcs = room:FindFirstChild('NPCs')
+			if npcs then
+				for _, npc in ipairs(npcs:GetChildren()) do
+					take(npc)
+				end
+			end
+			for _, ch in ipairs(room:GetChildren()) do
+				local n = string.lower(ch.Name)
+				if n:find('crystal', 1, true) or ch:GetAttribute('IsCrystal') == true then
+					take(ch)
+				end
+			end
+		end
+		-- Some challenge waves spawn as workspace models tagged with ChallengeDungeon.
+		for _, tag in ipairs({ 'Enemy', 'Boss', 'Elite', 'MiniBoss', 'Miniboss' }) do
+			local tagged = CollectionService:GetTagged(tag)
+			if type(tagged) == 'table' then
+				for _, inst in ipairs(tagged) do
+					if inst:GetAttribute('ChallengeDungeon') ~= nil then
+						take(inst)
+					end
+				end
+			end
+		end
+	elseif chall then
+		-- Lobby showcase crystals only — never chase lobby WorldBoss props.
 		for _, room in ipairs(chall:GetChildren()) do
 			for _, ch in ipairs(room:GetChildren()) do
 				local n = string.lower(ch.Name)
 				if n:find('crystal', 1, true) or ch:GetAttribute('IsCrystal') == true then
 					take(ch)
+				end
+			end
+		end
+	end
+	if rt.inPayloadFarm() then
+		local pay = workspace:FindFirstChild('Payload_Maps')
+		if pay then
+			for _, map in ipairs(pay:GetChildren()) do
+				local npcs = map:FindFirstChild('NPCs')
+				if npcs then
+					for _, npc in ipairs(npcs:GetChildren()) do
+						take(npc)
+					end
+				end
+				for _, d in ipairs(map:GetDescendants()) do
+					if d.Name == 'NPCs' and d:IsA('Folder') and d ~= npcs then
+						for _, npc in ipairs(d:GetChildren()) do
+							take(npc)
+						end
+					end
+				end
+			end
+		end
+		-- Actual combat NPCs are under PayloadCombat_*/PayloadEnemies_*.
+		if type(rt.eachPayloadCombatNpc) == 'function' then
+			rt.eachPayloadCombatNpc(take)
+		else
+			for _, root in ipairs(workspace:GetChildren()) do
+				if type(root.Name) == 'string' and root.Name:sub(1, 14) == 'PayloadCombat_' then
+					for _, folder in ipairs(root:GetChildren()) do
+						if type(folder.Name) == 'string' and folder.Name:sub(1, 15) == 'PayloadEnemies_' then
+							for _, npc in ipairs(folder:GetChildren()) do
+								take(npc)
+							end
+						end
+					end
 				end
 			end
 		end
@@ -8770,14 +9018,6 @@ rt.npcInCorridor = function(npc)
 	if not npc or isFinalBoss(npc) then
 		return false
 	end
-	-- Lobby admin / world-boss waves under Workspace.NPCs — never treat as
-	-- dungeon corridor trash (leftover Generated_ zones used to ban them).
-	if npc.Parent and npc.Parent.Name == 'NPCs' and npc.Parent.Parent == workspace then
-		return false
-	end
-	if npc:GetAttribute('WorldBoss') == true then
-		return false
-	end
 	local d = activeDungeonRoot()
 	if not d then
 		return false
@@ -9009,29 +9249,128 @@ end
 -- special-summon route used to mark the sweep done before any prompt was fired.
 local function openDungeonChests()
 	local list = {}
+	local function takeChest(child)
+		if not (child:GetAttribute('DungeonChest') == true or child.Name:sub(1, 13) == 'DungeonChest') then
+			return
+		end
+		local idx = tonumber(child:GetAttribute('RoomIndex'))
+		local d = activeDungeonRoot()
+		if idx and d and not rt.inModeArenaFarm() and Rooms.aliveCount(d, idx) > 0 then
+			-- Pack still in this room — never queue the chest.
+			return
+		end
+		if chestStillOpen(child) then
+			list[#list + 1] = child
+		elseif inEndlessFarm() and chestClaimCandidate(child) then
+			local here = routeRoot()
+			local anc = chestAnchor(child)
+			local near = here and anc and (here.Position - anc).Magnitude < 280
+			if near then
+				list[#list + 1] = child
+			end
+		elseif rt.inModeArenaFarm() and chestClaimCandidate(child) then
+			list[#list + 1] = child
+		end
+	end
 	for _, gen in ipairs(workspace:GetChildren()) do
 		if gen.Name:sub(1, 10) == 'Generated_' then
 			for _, child in ipairs(gen:GetChildren()) do
-				if child:GetAttribute('DungeonChest') == true or child.Name:sub(1, 13) == 'DungeonChest' then
-					local idx = tonumber(child:GetAttribute('RoomIndex'))
-					local d = activeDungeonRoot()
-					if idx and d and Rooms.aliveCount(d, idx) > 0 then
-						-- Pack still in this room — never queue the chest.
-					elseif chestStillOpen(child) then
-						list[#list + 1] = child
-					elseif inEndlessFarm() and chestClaimCandidate(child) then
-						local here = routeRoot()
-						local anc = chestAnchor(child)
-						local near = here and anc and (here.Position - anc).Magnitude < 280
-						if near then
-							list[#list + 1] = child
+				takeChest(child)
+			end
+		elseif gen.Name == 'Challenge_Dungeons' and rt.inChallengeFarm() then
+			for _, child in ipairs(gen:GetDescendants()) do
+				if child:IsA('Model') or child:IsA('BasePart') then
+					takeChest(child)
+				end
+			end
+		elseif gen.Name == 'Payload_Maps' and rt.inPayloadFarm() then
+			for _, child in ipairs(gen:GetDescendants()) do
+				if child:IsA('Model') or child:IsA('BasePart') then
+					takeChest(child)
+				end
+			end
+		end
+	end
+	return list
+end
+
+-- Challenge wave chests despawn in ~60s; Payload checkpoint UI dies in ~3s.
+-- Grab any open world chest under the mode map without waiting for a room clear.
+function rt.grabModeChests()
+	if not rt.inModeArenaFarm() then
+		return 0
+	end
+	if not on('DLChestAnywhere') then
+		return 0
+	end
+	if routeBusy or rt.chestLooting then
+		return 0
+	end
+	local got = 0
+	local list = openDungeonChests()
+	if #list == 0 then
+		-- Also fire any enabled ChestPrompt under the mode folder.
+		local roots = {}
+		if rt.inChallengeFarm() then
+			roots[#roots + 1] = workspace:FindFirstChild('Challenge_Dungeons')
+		end
+		if rt.inPayloadFarm() then
+			roots[#roots + 1] = workspace:FindFirstChild('Payload_Maps')
+		end
+		for _, root in ipairs(roots) do
+			if root then
+				for _, d in ipairs(root:GetDescendants()) do
+					if d:IsA('ProximityPrompt') and d.Enabled == true
+						and (d.Name == 'ChestPrompt' or tostring(d.ActionText):lower():find('open', 1, true))
+					then
+						local model = d.Parent
+						while model and not model:IsA('Model') do
+							model = model.Parent
+						end
+						if model then
+							list[#list + 1] = model
 						end
 					end
 				end
 			end
 		end
 	end
-	return list
+	for _, model in ipairs(list) do
+		if got >= 3 then
+			break
+		end
+		if not model or not model.Parent then
+			continue
+		end
+		if (rt.chestSkip and rt.chestSkip[model] or 0) > os.clock() then
+			continue
+		end
+		local prompt = chestPrompt(model)
+		if not prompt or prompt.Enabled ~= true then
+			continue
+		end
+		local pos = chestStandPos(model) or chestAnchor(model)
+		if pos then
+			local here = routeRoot()
+			if here and (here.Position - pos).Magnitude > 10 then
+				Pin.at(pos, true)
+				pcall(function()
+					if type(rt.snapRoot) == 'function' then
+						rt.snapRoot(pos)
+					end
+				end)
+			end
+		end
+		pcall(function()
+			prompt.MaxActivationDistance = math.max(tonumber(prompt.MaxActivationDistance) or 8, 18)
+		end)
+		chestFiredAt[prompt] = nil
+		fireChestPrompt(prompt)
+		got += 1
+		rt.chestSkip = rt.chestSkip or {}
+		rt.chestSkip[model] = os.clock() + 0.6
+	end
+	return got
 end
 
 local function tryChestSweep(why)
@@ -10565,42 +10904,6 @@ local function snapToRaidTarget(npc)
 	return true
 end
 
--- Lobby Workspace.NPCs: world bosses + admin abuse waves (Daemons, Students, …).
-local function findLobbyEventFocus()
-	local folder = workspace:FindFirstChild('NPCs')
-	if not folder then
-		return nil
-	end
-	local best, bestD, bestRank = nil, 9e9, -1
-	local me = routeRoot()
-	for _, npc in ipairs(folder:GetChildren()) do
-		-- Clear stale corridor bans — leftover Generated_ used to farmBan these.
-		if farmBan[npc] then
-			farmBan[npc] = nil
-		end
-		if enemyAlive(npc) and not farmSkipped(npc) and enemyRoot(npc) then
-			local part = enemyRoot(npc)
-			local d = me and (part.Position - me.Position).Magnitude or 0
-			local rank = 1
-			local name = string.lower(tostring(npc:GetAttribute('ItemId') or npc.Name or ''))
-			if npc:GetAttribute('WorldBoss') == true then
-				rank = 5
-			elseif npc:GetAttribute('IsBoss') == true then
-				rank = 4
-			elseif name:find('daemon', 1, true) or name:find('student', 1, true) then
-				rank = 3
-			elseif enemyRank(npc) >= 3 then
-				rank = enemyRank(npc)
-			end
-			-- Prefer nearest among same rank so we actually warp onto the pack.
-			if rank > bestRank or (rank == bestRank and d < bestD) then
-				best, bestD, bestRank = npc, d, rank
-			end
-		end
-	end
-	return best
-end
-
 local function nearestAggro(maxD)
 	local root = routeRoot()
 	if not root then
@@ -10988,7 +11291,10 @@ local function goToOpenStar(dungeon, maxRoom)
 		end
 		local room = dungeon:FindFirstChild('Room_' .. tostring(i))
 		if room and room:GetAttribute('IsLootRoom') == true and not roomIsSwept(dungeon, i) then
-			return true
+			-- Chest-only pads: ignore when Auto collect chests is off.
+			if on('DLChestAnywhere') then
+				return true
+			end
 		end
 		if room and room:GetAttribute('IsCheckpoint') == true and not roomIsSwept(dungeon, i)
 			and on('DLChestAnywhere')
@@ -11003,12 +11309,26 @@ local function goToOpenStar(dungeon, maxRoom)
 	end
 
 	local star
+	-- 0) Lowest dormant combat room wins over chest-only stars (Frostpire).
+	pcall(function()
+		local here = routeRoot()
+		local dorm = Rooms.nextDormant(dungeon, here and here.Position or Vector3.zero)
+		if dorm and roomNeedsVisit(dorm) then
+			star = dorm
+		end
+	end)
 	-- 1) HUD combat stars in order.
-	if on('DLRoomsInOrder') then
+	if not star and on('DLRoomsInOrder') then
 		for _, i in ipairs(Rooms.layoutCombatRooms()) do
 			if roomNeedsVisit(i) then
-				star = i
-				break
+				-- Prefer dormant/alive over chest-only when scanning stars.
+				local combat = Rooms.dormantCount(dungeon, i) > 0 or Rooms.aliveCount(dungeon, i) > 0
+				if combat then
+					star = i
+					break
+				elseif not star then
+					star = i
+				end
 			end
 		end
 	end
@@ -11017,8 +11337,13 @@ local function goToOpenStar(dungeon, maxRoom)
 	if not star then
 		for i = 1, maxRoom or Rooms.maxRoom(dungeon) do
 			if roomNeedsVisit(i) then
-				star = i
-				break
+				local combat = Rooms.dormantCount(dungeon, i) > 0 or Rooms.aliveCount(dungeon, i) > 0
+				if combat then
+					star = i
+					break
+				elseif not star then
+					star = i
+				end
 			end
 		end
 	end
@@ -11466,6 +11791,19 @@ end
 
 -- HUD star order when Rooms in order: Room_2 → 6 → 8, not every hallway Room_N.
 local function tourFarmRooms(dungeon)
+	-- Challenge / Payload are arena waves — no Room_N layout. Fight whatever is alive.
+	if rt.inModeArenaFarm() then
+		local target = pickFarmTarget()
+		if target then
+			local tag = rt.inChallengeFarm() and 'challenge' or 'payload'
+			farmLabel = ('%s · %s'):format(tag, target.Name)
+			farmKillNpc(target)
+		else
+			farmLabel = rt.inChallengeFarm() and 'challenge · waiting' or 'payload · waiting'
+			task.wait(0.2)
+		end
+		return
+	end
 	if inBossRushFarm() and not dungeon then
 		farmLabel = 'boss rush · waiting'
 		task.wait(0.25)
@@ -11522,8 +11860,8 @@ local function tourFarmRooms(dungeon)
 	local maxRoom = Rooms.maxRoom(dungeon)
 	local idx = tonumber(rt.farmRoomIdx) or 1
 	if on('DLRoomsInOrder') then
-		-- Combat stars PLUS unstarred loot/checkpoint pads with chests, in
-		-- Room_N order. Star-only walking skipped the yellow IsLootRoom boxes.
+		-- Floor order: combat HUD stars only until those are clear, then chest
+		-- pads (pre-boss). IsLootRoom used to steal the tour before Room_2 woke.
 		local candidates = {}
 		local seen = {}
 		local function add(i)
@@ -11542,6 +11880,11 @@ local function tourFarmRooms(dungeon)
 				add(i)
 			end
 		end)
+		local starsDone = false
+		pcall(function()
+			starsDone = Rooms.preBossStarsDone() == true
+		end)
+		local allowChests = on('DLChestAnywhere') and starsDone
 		for i = 1, maxRoom do
 			if seen[i] then
 				continue
@@ -11550,33 +11893,63 @@ local function tourFarmRooms(dungeon)
 			if not room or Rooms.isCorridor(dungeon, i) or Rooms.isStartRoom(dungeon, i) then
 				continue
 			end
-			-- Re-open only once when a chest appears after a false sweep — not every
-			-- tour pass (that kept empty HUD stars in a wait/holdRoom loop).
-			if room:GetAttribute('IsLootRoom') == true
+			local hasCombat = Rooms.dormantCount(dungeon, i) > 0 or Rooms.aliveCount(dungeon, i) > 0
+			-- Combat off the star bar (rare) still needs a visit; chest-only pads
+			-- wait until every pre-boss star is filled.
+			if hasCombat then
+				add(i)
+			elseif allowChests and (
+				room:GetAttribute('IsLootRoom') == true
 				or room:GetAttribute('IsCheckpoint') == true
-			then
-				-- Only tour loot/checkpoint pads that still need work.
-				if roomHasPendingChest(dungeon, i)
-					or Rooms.dormantCount(dungeon, i) > 0
-					or Rooms.aliveCount(dungeon, i) > 0
-					or not roomIsSwept(dungeon, i)
-				then
+				or roomHasPendingChest(dungeon, i)
+			) then
+				if roomHasPendingChest(dungeon, i) or not roomIsSwept(dungeon, i) then
 					add(i)
 				end
-			elseif roomHasPendingChest(dungeon, i)
-				or Rooms.dormantCount(dungeon, i) > 0
-				or Rooms.aliveCount(dungeon, i) > 0
-			then
-				add(i)
 			end
 		end
 		table.sort(candidates)
+		-- Prefer waking dormant packs over chest-only rooms (Frostpire Endless
+		-- often leaves an Enabled chest in a later Room_N while Room_2 packs sleep).
+		local dormFirst = nil
+		pcall(function()
+			local here = routeRoot()
+			dormFirst = Rooms.nextDormant(dungeon, here and here.Position or Vector3.zero)
+		end)
 		local pick
-		for _, i in ipairs(candidates) do
-			local okSkip, why = pcall(skipTourRoom, dungeon, i)
-			if not (okSkip and why) then
-				pick = i
-				break
+		if dormFirst then
+			for _, i in ipairs(candidates) do
+				if i == dormFirst then
+					pick = i
+					break
+				end
+			end
+			if not pick then
+				pick = dormFirst
+			end
+		end
+		if not pick then
+			for _, i in ipairs(candidates) do
+				local okSkip, why = pcall(skipTourRoom, dungeon, i)
+				if not (okSkip and why) then
+					-- Skip chest-only rooms while any dormant pack remains elsewhere.
+					local hasDorm = Rooms.dormantCount(dungeon, i) > 0
+					local hasAlive = Rooms.aliveCount(dungeon, i) > 0
+					if not hasDorm and not hasAlive and dormFirst then
+						continue
+					end
+					pick = i
+					break
+				end
+			end
+		end
+		if not pick then
+			for _, i in ipairs(candidates) do
+				local okSkip, why = pcall(skipTourRoom, dungeon, i)
+				if not (okSkip and why) then
+					pick = i
+					break
+				end
 			end
 		end
 		if pick then
@@ -11768,6 +12141,7 @@ local function tourFarmRooms(dungeon)
 	end
 	local roomModel = dungeon:FindFirstChild('Room_' .. tostring(idx))
 	if roomModel and roomModel:GetAttribute('IsLootRoom') == true
+		and on('DLChestAnywhere')
 		and Rooms.aliveCount(dungeon, idx) <= 0
 		and Rooms.dormantCount(dungeon, idx) <= 0
 	then
@@ -11821,7 +12195,12 @@ local function tourFarmRooms(dungeon)
 			end
 			if os.clock() - rt.loadStallIdx[idx] > 2.5 then
 				if Rooms.aliveCount(dungeon, idx) <= 0 and Rooms.dormantCount(dungeon, idx) <= 0 then
-					rt.farmRoomPhase = 'loot'
+					if on('DLChestAnywhere') then
+						rt.farmRoomPhase = 'loot'
+					else
+						markRoomSwept(dungeon, idx)
+						advanceFromRoom(dungeon, idx)
+					end
 					rt.loadStallIdx[idx] = nil
 				elseif Rooms.zone(dungeon, idx) then
 					rt.loadStallIdx[idx] = nil
@@ -11849,9 +12228,15 @@ local function tourFarmRooms(dungeon)
 			return
 		end
 		-- Fall through into loot this same pass — do not return as wait and
-		-- re-hold forever on empty IsLootRoom pads.
-		phase = 'loot'
-		rt.farmRoomPhase = 'loot'
+		-- re-hold forever on empty IsLootRoom pads. Chests off → leave.
+		if on('DLChestAnywhere') then
+			phase = 'loot'
+			rt.farmRoomPhase = 'loot'
+		else
+			markRoomSwept(dungeon, idx)
+			advanceFromRoom(dungeon, idx)
+			return
+		end
 	end
 	if phase == 'fight' then
 		if Rooms.aliveCount(dungeon, idx) <= 0 then
@@ -11877,6 +12262,59 @@ local function tourFarmRooms(dungeon)
 	end
 	if Rooms.aliveCount(dungeon, idx) > 0 then
 		rt.farmRoomPhase = 'fight'
+		return
+	end
+	-- Frostpire / Endless: an open chest in a later empty Room_N must not
+	-- steal the tour while earlier packs are still IsDormant. Wake those first.
+	do
+		local here = routeRoot()
+		local from = here and here.Position
+		local dormIdx = nil
+		pcall(function()
+			dormIdx = Rooms.nextDormant(dungeon, from or Vector3.zero)
+		end)
+		if not dormIdx and Rooms.dormantCount(dungeon, idx) > 0 then
+			dormIdx = idx
+		end
+		if dormIdx then
+			if dormIdx ~= idx then
+				rt.farmRoomIdx = dormIdx
+				rt.farmRoomFilter = dormIdx
+				rt.farmRoomPhase = 'fight'
+				rt.lootStallIdx = nil
+				farmLabel = ('wake Room_%d'):format(dormIdx)
+				local wake = pickFarmTarget()
+				if wake then
+					farmKillNpc(wake)
+				else
+					pcall(function()
+						Rooms.enter(dungeon, dormIdx)
+					end)
+					pcall(function()
+						Rooms.holdRoom(dungeon, dormIdx, 1)
+					end)
+				end
+				return
+			end
+			rt.farmRoomPhase = 'fight'
+			farmLabel = ('wake Room_%d'):format(idx)
+			local wake = pickFarmTarget()
+			if wake then
+				farmKillNpc(wake)
+			else
+				pcall(function()
+					Rooms.holdRoom(dungeon, idx, 1)
+				end)
+			end
+			return
+		end
+	end
+	-- Auto collect off: never warp to chests / hang on loot pads.
+	if not on('DLChestAnywhere') then
+		rt.lootStallIdx = nil
+		markRoomSwept(dungeon, idx)
+		advanceFromRoom(dungeon, idx)
+		farmLabel = ('skip chests Room_%d'):format(idx)
 		return
 	end
 	farmLabel = ('Room_%d · loot'):format(idx)
@@ -11982,6 +12420,34 @@ local function farmLoop()
 	local root = routeRoot()
 	farmHome = root and root.CFrame or nil
 	local wasNoclip = noclipOn
+	-- Lobby / between runs: wait WITHOUT noclip or pin. Enabling collision-off
+	-- here then exiting (wasNoclip already true) left HRP.CanCollide=false forever
+	-- and the character looked frozen next to lobby zones.
+	farmBusy = false
+	farmLabel = 'waiting · lobby'
+	while currentInstance() and on('DLAutoFarm') and rt.farmUserOff ~= true
+		and not inDungeonFarm() and not rt.farmSoftRestart and not rt.farmStop
+	do
+		farmBusy = false
+		farmLabel = 'waiting · lobby'
+		if noclipOn then
+			noclipOn = false
+			pcall(setCharNoclip, false)
+		end
+		task.wait(0.4)
+	end
+	if not currentInstance() or not on('DLAutoFarm') or rt.farmUserOff == true
+		or rt.farmSoftRestart or rt.farmStop or not inDungeonFarm()
+	then
+		farmBusy = false
+		farmLabel = nil
+		if noclipOn or not wasNoclip then
+			noclipOn = false
+			pcall(setCharNoclip, false)
+			pcall(fixMovement)
+		end
+		return
+	end
 	farmBusy = true
 	noclipOn = true
 	pcall(setCharNoclip, true)
@@ -12068,15 +12534,25 @@ local function farmLoop()
 				step('return')
 				rt.farmReturnNpc = nil
 				farmKillNpc(back)
-			else
-				-- Lobby world bosses / admin waves (Workspace.NPCs) before raid/dungeon.
-				local lobbyNpc = findLobbyEventFocus()
-				if lobbyNpc then
-					step('lobby')
-					farmLabel = ('event · %s'):format(lobbyNpc.Name)
-					pcall(snapToRaidTarget, lobbyNpc)
-					farmKillNpc(lobbyNpc)
+			elseif rt.inModeArenaFarm() and LocalPlayer:GetAttribute('InDungeon') ~= true then
+				-- Challenge / Payload: no Room_N tour. Kill waves + grab timed chests now.
+				-- Guard InDungeon: Payload_Maps junk in workspace must not steal Frostpire.
+				step('mode')
+				pcall(function()
+					if type(rt.grabModeChests) == 'function' then
+						rt.grabModeChests()
+					end
+				end)
+				local target = pickFarmTarget()
+				if target then
+					local tag = rt.inChallengeFarm() and 'challenge' or 'payload'
+					farmLabel = ('%s · %s'):format(tag, target.Name)
+					farmKillNpc(target)
 				else
+					farmLabel = rt.inChallengeFarm() and 'challenge · waiting' or 'payload · waiting'
+					task.wait(0.15)
+				end
+			else
 				-- Event raid owns the farm while Raid_NPCs has living targets.
 				-- Dark Professor is IsBoss (not IsSpecial) and used to lose to
 				-- leftover Generated_ room tours / under-map aoe gaps.
@@ -12134,12 +12610,18 @@ local function farmLoop()
 							step('boss')
 						else
 							local chestRoom = dungeon and rt.firstChestRoom(dungeon)
-							if chestRoom then
+							-- Do not jump to chests while dormant packs remain (Frostpire).
+							local dormLeft = false
+							pcall(function()
+								local here = routeRoot()
+								dormLeft = Rooms.nextDormant(dungeon, here and here.Position or Vector3.zero) ~= nil
+							end)
+							if chestRoom and not dormLeft then
 								step('chests')
 								rt.farmRoomIdx = chestRoom
 								rt.farmRoomPhase = 'loot'
 								tourFarmRooms(dungeon)
-							elseif rt.chestsNow() and dungeon then
+							elseif rt.chestsNow() and dungeon and not dormLeft then
 								step('chests')
 								pcall(rt.grabPreBossChests, dungeon)
 								if rt.firstChestRoom(dungeon) then
@@ -12209,7 +12691,6 @@ local function farmLoop()
 				end
 				end
 				end
-				end
 			end
 			end
 			end
@@ -12256,9 +12737,9 @@ local function farmLoop()
 		end)
 		task.wait(0.2)
 	end
-	-- User Off always restores collision. wasNoclip stayed true across restarts
-	-- and left you floating after toggle off.
-	if rt.farmUserOff == true or rt.farmStop == true or not wasNoclip then
+	-- Always restore collision when leaving a run (lobby / mode ended) or on Off.
+	-- wasNoclip-only used to keep CanCollide=false after lobby restart spam.
+	if rt.farmUserOff == true or rt.farmStop == true or not inDungeonFarm() or not wasNoclip then
 		noclipOn = false
 		pcall(setCharNoclip, false)
 		pcall(fixMovement)
@@ -12820,11 +13301,15 @@ local function listRedeemCodes()
 		seen[code] = true
 		names[#names + 1] = code
 	end
+	local fromGame = false
 	local folder = game:GetService('ReplicatedStorage'):FindFirstChild('GameInfo')
 	local mod = folder and folder:FindFirstChild('CodesData')
 	if mod and mod:IsA('ModuleScript') then
 		local ok, data = pcall(require, mod)
 		if ok and type(data) == 'table' and type(data.Codes) == 'table' then
+			fromGame = true
+			-- Source of truth: only Active, non–role-gated codes. Updates when
+			-- the game flips flags — no manual list edits needed for new drops.
 			for name, info in pairs(data.Codes) do
 				if type(info) == 'table' and info.Active == true and type(info.RequiresRole) ~= 'string' then
 					add(tostring(name))
@@ -12832,8 +13317,12 @@ local function listRedeemCodes()
 			end
 		end
 	end
-	for _, code in ipairs(EXTRA_CODES) do
-		add(code)
+	-- Fallback / forward-compat only. Never re-add expired guide codes when
+	-- CodesData already told us what is live.
+	if not fromGame then
+		for _, code in ipairs(EXTRA_CODES) do
+			add(code)
+		end
 	end
 	table.sort(names)
 	return names
@@ -13660,8 +14149,10 @@ end)
 -- Main.HUD.Chest_Selection: a CanvasGroup holding Chest_1..3 image buttons, a Finish
 -- button, and a header stating how many to take. Clicking the real buttons is
 -- deliberate rather than calling SelectChests: the client decides between
--- SelectChests and SelectMidRunChests and enforces the selection cap itself, so
--- driving its own buttons keeps mid-run picks working for free.
+-- SelectChests, SelectMidRunChests, and PayloadRunService.SelectCheckpointChests
+-- and enforces the selection cap itself, so driving its own buttons keeps
+-- mid-run / payload picks working for free.
+-- Payload checkpoint offers only last ~3s (PayloadData.RewardChoiceSeconds).
 local ChestPick = (function()
 	local api = {}
 	local lastAt = 0
@@ -13752,7 +14243,9 @@ local ChestPick = (function()
 			end
 			return 0
 		end
-		if busy or os.clock() - lastAt < 0.04 then
+		-- Payload checkpoint timer is ~3s — no debounce gap once open.
+		local gap = (workspace:FindFirstChild('Payload_Maps') ~= nil) and 0 or 0.04
+		if busy or os.clock() - lastAt < gap then
 			return 0
 		end
 		busy = true
@@ -14708,7 +15201,10 @@ local Replay = (function()
 			if title and title:IsA('TextLabel') then
 				local tx = string.upper(tostring(title.Text or ''))
 				if tx:find('FAIL', 1, true) or tx:find('DEFEAT', 1, true) or tx:find('COMPLETE', 1, true) then
-					if frame.Visible ~= false then
+					-- Challenge sometimes keeps Completion_Info.Visible=false while the
+					-- panel still has full AbsoluteSize on screen (Time Left countdown).
+					local sz = frame.AbsoluteSize
+					if frame.Visible ~= false or (sz.X > 200 and sz.Y > 200) then
 						return true
 					end
 				end
@@ -14739,6 +15235,22 @@ local Replay = (function()
 		return inst ~= nil
 	end
 
+	-- Challenge completion can leave ancestors Visible=false while AbsoluteSize stays
+	-- layout-sized; still allow the red REPLAY ImageButton through.
+	local function guiClickable(inst)
+		if not inst or not inst:IsA('GuiButton') then
+			return false
+		end
+		if guiChainVisible(inst) then
+			return true
+		end
+		if inst.Visible ~= true then
+			return false
+		end
+		local sz = inst.AbsoluteSize
+		return sz.X >= 20 and sz.Y >= 12
+	end
+
 	local function findReplayButton()
 		local pg = LocalPlayer:FindFirstChild('PlayerGui')
 		local main = pg and pg:FindFirstChild('Main')
@@ -14748,7 +15260,7 @@ local Replay = (function()
 		end
 		local best
 		local function consider(btn)
-			if not btn or not btn:IsA('GuiButton') or not guiChainVisible(btn) then
+			if not guiClickable(btn) then
 				return
 			end
 			best = best or btn
@@ -14773,10 +15285,33 @@ local Replay = (function()
 		return findReplayButton() ~= nil
 	end
 
+	local function inChallengeReplay()
+		if LocalPlayer:GetAttribute('InChallenge') == true then
+			return true
+		end
+		if workspace:FindFirstChild('Challenge_Dungeons') then
+			return true
+		end
+		-- Session can linger a beat after COMPLETED while InChallenge is already nil.
+		local rf = RunLoops.knitRF('ChallengeRunService', 'GetSessionState')
+		if not rf then
+			return false
+		end
+		local ok, st = pcall(function()
+			return rf:InvokeServer()
+		end)
+		return ok and st ~= nil
+	end
+
 	local function clickBtn(btn)
 		if not btn or not btn:IsA('GuiButton') then
 			return false
 		end
+		pcall(function()
+			if btn:IsA('GuiButton') then
+				btn:Activate()
+			end
+		end)
 		if type(firesignal) == 'function' then
 			for _, ev in ipairs({ btn.MouseButton1Click, btn.Activated, btn.MouseButton1Down }) do
 				if ev and pcall(firesignal, ev) then
@@ -14807,6 +15342,20 @@ local Replay = (function()
 
 	local function clickReplayButton()
 		return clickBtn(findReplayButton())
+	end
+
+	local function requestChallengeReplay()
+		if clickReplayButton() then
+			return true
+		end
+		local rf = RunLoops.knitRF('ChallengeRunService', 'RequestReplay')
+		if not rf then
+			return false
+		end
+		local ok, res = pcall(function()
+			return rf:InvokeServer()
+		end)
+		return ok and res ~= false
 	end
 
 	local function hudWarning()
@@ -15019,9 +15568,17 @@ local Replay = (function()
 		if loopingEndless() and continueEndless() then
 			return true
 		end
+		-- Challenge COMPLETED: red REPLAY → ChallengeRunService.RequestReplay.
+		-- Loop specific + difficulty uses the same button (challenge has Easy/etc).
+		-- Skip DungeonQueue CHANGE DUNGEON — that remote is for normal runs only.
+		if inChallengeReplay() or (on('DLLoopSpecific') and findReplayButton()) then
+			if requestChallengeReplay() then
+				return true
+			end
+		end
 		-- Prefer a better dungeon/diff when one is unlocked; otherwise same-run replay.
 		local upgrade = rt.dungeonUpgradeOrReplay
-		if type(upgrade) == 'function' then
+		if type(upgrade) == 'function' and not inChallengeReplay() then
 			local okUpgrade, did = pcall(upgrade, silent)
 			if okUpgrade and did then
 				return true
@@ -15044,8 +15601,18 @@ local Replay = (function()
 				end
 			end
 		end
+		-- Loop same map: click REPLAY before the dungeon remote (challenge + normal).
+		if on('DLLoopSpecific') and clickReplayButton() then
+			return true
+		end
 		local rf = RunLoops.knitRF('DungeonRunService', 'RequestReplay')
 		if not rf then
+			if clickReplayButton() then
+				return true
+			end
+			if requestChallengeReplay() then
+				return true
+			end
 			if not silent then
 				Library:Notify('Replay remote not found')
 			end
@@ -15055,13 +15622,16 @@ local Replay = (function()
 			return rf:InvokeServer()
 		end)
 		if not ok then
+			if clickReplayButton() or requestChallengeReplay() then
+				return true
+			end
 			if not silent then
 				Library:Notify('Replay failed: ' .. tostring(res))
 			end
 			return false
 		end
 		if res == false then
-			if clickReplayButton() then
+			if clickReplayButton() or requestChallengeReplay() then
 				return true
 			end
 			return false
@@ -15076,6 +15646,10 @@ local Replay = (function()
 			-- RaidLoop.tick owns raid replay — do not RequestReplay dungeon here.
 			return
 		end
+		if on('DLChallengeLoop') then
+			-- ChallengeLoop.tick owns challenge enter + RequestReplay.
+			return
+		end
 		if not wantReplay and not rushContinue then
 			runCompleteAt = nil
 			replayArmedAt = nil
@@ -15086,6 +15660,20 @@ local Replay = (function()
 		-- must not block Endless Continue.
 		if ChestPick.open() and not (loopingEndless() and continueUiShowing()) then
 			replayArmedAt = nil
+			return
+		end
+		-- Challenge COMPLETED: same red REPLAY as Boss Rush — click immediately.
+		if wantReplay and (inChallengeReplay() or findReplayButton()) and completionShowing() then
+			local now = os.clock()
+			if now - lastReplayAt < 1.0 then
+				return
+			end
+			lastReplayAt = now
+			task.spawn(function()
+				if requestChallengeReplay() or clickReplayButton() then
+					Library:Notify(on('DLLoopSpecific') and 'Challenge loop replay' or 'Challenge replay')
+				end
+			end)
 			return
 		end
 		-- Boss Rush: red REPLAY on Completion_Info (Mythic), not green Warning Confirm.
@@ -15183,7 +15771,7 @@ local Replay = (function()
 		task.spawn(function()
 			local ok = api.request(true)
 			if not ok then
-				ok = clickReplayButton()
+				ok = clickReplayButton() or requestChallengeReplay()
 			end
 			if ok then
 				Library:Notify(on('DLLoopSpecific') and 'Loop dungeon requested' or 'Auto replay requested')
@@ -15698,8 +16286,8 @@ local DungeonStart = (function()
 			armedAt = 0
 			return
 		end
-		-- Event raid loop owns lobby starts — do not pick Bandits Den / first dungeon.
-		if on('DLRaidLoop') then
+		-- Event raid / Challenge loops own lobby starts — do not pick Bandits Den.
+		if on('DLRaidLoop') or on('DLChallengeLoop') then
 			armedAt = 0
 			return
 		end
@@ -16194,6 +16782,443 @@ rt.RaidLoop = (function()
 	return api
 end)()
 
+rt.ChallengeLoop = (function()
+	local ReplicatedStorage = game:GetService('ReplicatedStorage')
+	local api = {}
+	local nextCheck, lastStart, busy, armedAt = 0, 0, false, 0
+	local lastLabel = ''
+	local DIFFS = { 'Easy', 'Normal', 'Hard', 'Nightmare' }
+
+	local function challengeData()
+		local ok, cd = pcall(require, ReplicatedStorage.GameInfo.ChallengeData)
+		if ok and type(cd) == 'table' then
+			return cd
+		end
+		return nil
+	end
+
+	local function featuredDungeon()
+		local cd = challengeData()
+		return (cd and tostring(cd.FEATURED_DUNGEON or '')) ~= '' and tostring(cd.FEATURED_DUNGEON)
+			or 'Double Dungeon'
+	end
+
+	local function listBosses()
+		local names = {}
+		local cd = challengeData()
+		if cd and type(cd.BOSS_PREVIEW_ORDER) == 'table' then
+			for _, b in ipairs(cd.BOSS_PREVIEW_ORDER) do
+				if type(b) == 'table' then
+					local id = tostring(b.HeroId or b.Name or '')
+					if id ~= '' then
+						names[#names + 1] = id
+					end
+				elseif type(b) == 'string' and b ~= '' then
+					names[#names + 1] = b
+				end
+			end
+		end
+		if #names == 0 then
+			names = {
+				'Scarlet Knight',
+				'Imperator',
+				'Shadow Knight',
+				'Unrestricted EX',
+				'Awakened Devil',
+				'Frigid Monarch',
+			}
+		end
+		return names
+	end
+
+	local function listDifficulties()
+		local ok, pd = pcall(require, ReplicatedStorage.GameInfo.PayloadData)
+		if ok and type(pd) == 'table' and type(pd.DifficultyOrder) == 'table' then
+			local out = {}
+			for _, d in ipairs(pd.DifficultyOrder) do
+				out[#out + 1] = tostring(d)
+			end
+			if #out > 0 then
+				return out
+			end
+		end
+		return DIFFS
+	end
+
+	local function inLobby()
+		return LocalPlayer:GetAttribute('InDungeon') ~= true
+			and LocalPlayer:GetAttribute('InChallenge') ~= true
+			and LocalPlayer:GetAttribute('DungeonRun') ~= true
+			and workspace:FindFirstChild('Challenge_Dungeons') == nil
+	end
+
+	local function inChallengeNow()
+		if LocalPlayer:GetAttribute('InChallenge') == true then
+			return true
+		end
+		if workspace:FindFirstChild('Challenge_Dungeons') then
+			return true
+		end
+		local rf = RunLoops.knitRF('ChallengeRunService', 'GetSessionState')
+		if not rf then
+			return false
+		end
+		local ok, st = pcall(function()
+			return rf:InvokeServer()
+		end)
+		return ok and st ~= nil
+	end
+
+	local function invoke(name, ...)
+		local rem = RunLoops.knitRF('DungeonQueueService', name)
+		if not rem then
+			return false, nil
+		end
+		local args = table.pack(...)
+		local ok, res = pcall(function()
+			return rem:InvokeServer(table.unpack(args, 1, args.n))
+		end)
+		return ok, res
+	end
+
+	local function clickGui(btn)
+		if not btn then
+			return false
+		end
+		local function fire(sig)
+			if not sig then
+				return false
+			end
+			local ok, conns = pcall(getconnections, sig)
+			if not ok or type(conns) ~= 'table' or #conns == 0 then
+				return false
+			end
+			if type(firesignal) == 'function' then
+				pcall(firesignal, sig)
+				return true
+			end
+			local fired = false
+			for _, c in ipairs(conns) do
+				if c.Function then
+					task.spawn(c.Function)
+					fired = true
+				end
+			end
+			return fired
+		end
+		return fire(btn.Activated) or fire(btn.MouseButton1Click) or fire(btn.MouseButton1Down)
+	end
+
+	local function challengePanel()
+		local pg = LocalPlayer:FindFirstChild('PlayerGui')
+		local main = pg and pg:FindFirstChild('Main')
+		local frames = main and main:FindFirstChild('Frames')
+		return frames and frames:FindFirstChild('ChallengeDungeon') or nil
+	end
+
+	local function openChallengeViaUIController()
+		local ps = LocalPlayer:FindFirstChild('PlayerScripts')
+		local client = ps and ps:FindFirstChild('Client')
+		local ctrls = client and client:FindFirstChild('Controllers')
+		local mod = ctrls and ctrls:FindFirstChild('UIController')
+		if not mod then
+			return false
+		end
+		local ok, UI = pcall(require, mod)
+		if not ok or type(UI) ~= 'table' or type(UI.names) ~= 'table' then
+			return false
+		end
+		local ch = UI.names.ChallengeDungeon
+		if type(ch) == 'table' and type(ch.open) == 'function' then
+			return pcall(function()
+				ch:open()
+			end)
+		end
+		return false
+	end
+
+	local function ensureChallengeOpen()
+		local p = challengePanel()
+		if p and p.Visible then
+			return p
+		end
+		openChallengeViaUIController()
+		task.wait(0.35)
+		p = challengePanel()
+		if p and not p.Visible then
+			pcall(function()
+				p.Visible = true
+				p.Position = UDim2.new(0.5, 0, 0.5, 0)
+				p.AnchorPoint = Vector2.new(0.5, 0.5)
+			end)
+		end
+		return challengePanel()
+	end
+
+	function api.target()
+		local wantBoss = Options.DLChallengeBoss and tostring(Options.DLChallengeBoss.Value or '') or ''
+		local wantDiff = Options.DLChallengeDifficulty and tostring(Options.DLChallengeDifficulty.Value or '') or ''
+		if wantBoss == '' or wantBoss == 'nil' then
+			local bosses = listBosses()
+			wantBoss = bosses[1] or 'Scarlet Knight'
+		end
+		local okDiff = false
+		for _, d in ipairs(DIFFS) do
+			if d == wantDiff then
+				okDiff = true
+				break
+			end
+		end
+		if not okDiff then
+			wantDiff = 'Nightmare'
+		end
+		return wantBoss, wantDiff
+	end
+
+	local function cycleToBoss(panel, bossId)
+		if not panel or not bossId or bossId == '' then
+			return false
+		end
+		local left = panel:FindFirstChild('Content') and panel.Content:FindFirstChild('LeftFrame')
+		if not left then
+			return false
+		end
+		local display = left:FindFirstChild('Display')
+		local nameLabel = display and display:FindFirstChild('BossName')
+			or left:FindFirstChild('BossName', true)
+		local fwd = left:FindFirstChild('CycleForward')
+		if not fwd or not nameLabel then
+			return false
+		end
+		local needle = string.lower(bossId)
+		for _ = 1, 8 do
+			local shown = string.lower(tostring(nameLabel.Text or ''))
+			if shown:find(needle, 1, true) then
+				return true
+			end
+			clickGui(fwd)
+			task.wait(0.12)
+		end
+		local shown = string.lower(tostring(nameLabel.Text or ''))
+		return shown:find(needle, 1, true) ~= nil
+	end
+
+	local function clickEnter(panel)
+		local buttons = panel:FindFirstChild('Content') and panel.Content:FindFirstChild('Buttons')
+		local enter = buttons and buttons:FindFirstChild('Enter')
+		if clickGui(enter) then
+			return true
+		end
+		for _, d in ipairs(panel:GetDescendants()) do
+			if d:IsA('GuiButton') then
+				local lab = d:FindFirstChildWhichIsA('TextLabel', true)
+				local t = string.upper(tostring(lab and lab.Text or d.Name or ''))
+				if t == 'ENTER' then
+					if clickGui(d) then
+						return true
+					end
+				end
+			end
+		end
+		return false
+	end
+
+	function api.enter(silent)
+		if busy then
+			return false
+		end
+		if inChallengeNow() then
+			if not silent then
+				Library:Notify('Already in Challenge')
+			end
+			return false
+		end
+		if not inLobby() then
+			if not silent then
+				Library:Notify('Leave the dungeon before starting Challenge')
+			end
+			return false
+		end
+		local boss, diff = api.target()
+		busy = true
+		task.spawn(function()
+			local ok = false
+			local featured = featuredDungeon()
+			-- Soft-select via queue remotes (Mode + featured map + difficulty).
+			invoke('RequestSelectMode', 'Challenge')
+			task.wait(0.15)
+			invoke('RequestSelectDungeon', featured)
+			task.wait(0.15)
+			invoke('RequestSelectDifficulty', diff)
+			task.wait(0.15)
+			local panel = ensureChallengeOpen()
+			if panel then
+				cycleToBoss(panel, boss)
+				task.wait(0.2)
+			end
+			-- Pod queue is what Challenge ENTER uses (not RequestStartSoloRun).
+			local okRf, res = invoke('RequestStartPodQueue')
+			ok = okRf and res ~= false
+			if not ok and panel then
+				ok = clickEnter(panel)
+			end
+			lastStart = os.clock()
+			lastLabel = ('%s · %s'):format(boss, diff)
+			busy = false
+			if not silent or not ok then
+				Library:Notify(('Challenge start: %s%s'):format(
+					lastLabel, ok and '' or ' (queue / ENTER failed)'))
+			elseif not silent then
+				Library:Notify(('Challenge start: %s'):format(lastLabel))
+			end
+		end)
+		return true
+	end
+
+	function api.replay(silent)
+		local rf = RunLoops.knitRF('ChallengeRunService', 'RequestReplay')
+		if rf then
+			local ok, res = pcall(function()
+				return rf:InvokeServer()
+			end)
+			if ok and res ~= false then
+				if not silent then
+					Library:Notify('Challenge replay')
+				end
+				return true
+			end
+		end
+		pcall(function()
+			local pg = LocalPlayer:FindFirstChild('PlayerGui')
+			local main = pg and pg:FindFirstChild('Main')
+			if not main then
+				return
+			end
+			for _, d in ipairs(main:GetDescendants()) do
+				if d:IsA('GuiButton') and d.Visible ~= false then
+					local lab = d:FindFirstChildWhichIsA('TextLabel', true)
+					local t = string.upper(tostring(lab and lab.Text or d.Name or ''))
+					if t:find('REPLAY', 1, true) then
+						clickGui(d)
+						return
+					end
+				end
+			end
+		end)
+		return false
+	end
+
+	function api.onLobby()
+		armedAt = os.clock()
+	end
+
+	function api.label()
+		return lastLabel
+	end
+
+	function api.inChallenge()
+		return inChallengeNow()
+	end
+
+	function api.listBosses()
+		return listBosses()
+	end
+
+	function api.listDifficulties()
+		return listDifficulties()
+	end
+
+	function api.tick()
+		if not on('DLChallengeLoop') then
+			armedAt = 0
+			return
+		end
+		if inChallengeNow() then
+			armedAt = 0
+			local rf = RunLoops.knitRF('ChallengeRunService', 'GetSessionState')
+			local done = false
+			if rf then
+				local ok, st = pcall(function()
+					return rf:InvokeServer()
+				end)
+				if ok and type(st) == 'table' then
+					local phase = tostring(st.Phase or st.State or st.Status or '')
+					done = phase:lower():find('complete', 1, true)
+						or phase:lower():find('victory', 1, true)
+						or phase:lower():find('defeat', 1, true)
+						or st.Complete == true
+						or st.Finished == true
+				end
+			end
+			if not done then
+				pcall(function()
+					local pg = LocalPlayer:FindFirstChild('PlayerGui')
+					local main = pg and pg:FindFirstChild('Main')
+					local hud = main and main:FindFirstChild('HUD')
+					local container = hud and hud:FindFirstChild('Dungeon_Container')
+					local info = container and container:FindFirstChild('Completion_Info')
+					if info then
+						local as = info.AbsoluteSize
+						if (info.Visible == true or (as and as.X > 80 and as.Y > 40)) then
+							for _, d in ipairs(info:GetDescendants()) do
+								if d:IsA('GuiButton') then
+									local lab = d:FindFirstChildWhichIsA('TextLabel', true)
+									local t = string.upper(tostring(lab and lab.Text or d.Name or ''))
+									if t:find('REPLAY', 1, true) then
+										done = true
+										break
+									end
+								end
+							end
+						end
+					end
+				end)
+			end
+			if done and os.clock() - (rt.challengeReplayAt or 0) > 2.5 then
+				rt.challengeReplayAt = os.clock()
+				task.spawn(function()
+					if not api.replay(true) then
+						local ret = RunLoops.knitRF('ChallengeRunService', 'RequestReturn')
+						if ret then
+							pcall(function()
+								ret:InvokeServer()
+							end)
+						end
+						local deadline = os.clock() + 14
+						while os.clock() < deadline and not inLobby() do
+							task.wait(0.4)
+						end
+						api.onLobby()
+					end
+				end)
+			end
+			return
+		end
+		if not inLobby() then
+			armedAt = 0
+			return
+		end
+		if busy or os.clock() < nextCheck then
+			return
+		end
+		if os.clock() - lastStart < 8 then
+			return
+		end
+		if armedAt == 0 then
+			armedAt = os.clock()
+			return
+		end
+		local delay = Options.DLDungeonDelay and tonumber(Options.DLDungeonDelay.Value) or 2
+		if os.clock() - armedAt < delay then
+			return
+		end
+		nextCheck = os.clock() + 5
+		api.enter(true)
+	end
+
+	return api
+end)()
+
 rt.requestHuntReturn = function()
 	if rt.huntReturning then
 		return
@@ -16213,12 +17238,17 @@ rt.requestHuntReturn = function()
 	end)
 end
 
--- Force leave dungeon / raid back to lobby (RequestReturn + UI RETURN).
+-- Force leave dungeon / raid / payload / challenge back to lobby.
 rt.forceReturnLobby = function(silent)
-	if rt.returningLobby then
+	-- Allow a fresh attempt if a prior return hung (Payload never called RequestReturn).
+	if rt.returningLobby and (os.clock() - (rt.returningLobbyAt or 0)) < 12 then
+		if not silent then
+			Library:Notify('Already returning…')
+		end
 		return false
 	end
 	rt.returningLobby = true
+	rt.returningLobbyAt = os.clock()
 	rt.farmStop = true
 	farmLabel = 'return lobby'
 	if not silent then
@@ -16235,10 +17265,17 @@ rt.forceReturnLobby = function(silent)
 			end)
 			return ok and res ~= false
 		end
+		-- Payload has its own run service — DungeonRunService.RequestReturn alone is ignored.
+		invokeReturn('PayloadRunService', 'RequestReturn')
+		task.wait(0.12)
+		invokeReturn('ChallengeRunService', 'RequestReturn')
+		task.wait(0.12)
 		invokeReturn('RaidRunService', 'RequestReturn')
-		task.wait(0.15)
+		task.wait(0.12)
+		invokeReturn('BossRushService', 'RequestReturn')
+		task.wait(0.12)
 		invokeReturn('DungeonRunService', 'RequestReturn')
-		task.wait(0.15)
+		task.wait(0.12)
 		-- If stuck in a lobby queue / party ready check.
 		invokeReturn('DungeonQueueService', 'RequestLeaveQueue')
 		pcall(function()
@@ -16251,57 +17288,110 @@ rt.forceReturnLobby = function(silent)
 				if not btn then
 					return false
 				end
+				local fired = false
+				pcall(function()
+					if btn:IsA('GuiButton') then
+						btn:Activate()
+						fired = true
+					end
+				end)
 				local function fire(sig)
 					if not sig then
 						return false
 					end
-					local ok, conns = pcall(getconnections, sig)
-					if not ok or type(conns) ~= 'table' or #conns == 0 then
-						return false
-					end
 					if type(firesignal) == 'function' then
 						pcall(firesignal, sig)
-						return true
+						fired = true
 					end
-					for _, c in ipairs(conns) do
-						if c.Function then
-							task.spawn(c.Function)
+					local ok, conns = pcall(getconnections, sig)
+					if ok and type(conns) == 'table' then
+						for _, c in ipairs(conns) do
+							if c.Function then
+								task.spawn(c.Function)
+								fired = true
+							end
 						end
 					end
-					return true
+					return fired
 				end
-				return fire(btn.Activated) or fire(btn.MouseButton1Click) or fire(btn.MouseButton1Down)
+				fire(btn.Activated)
+				fire(btn.MouseButton1Click)
+				fire(btn.MouseButton1Down)
+				return fired
+			end
+			-- Prefer known leave controls (Payload / dungeon HUD).
+			local prefer = {
+				main:FindFirstChild('HUD')
+					and main.HUD:FindFirstChild('Actions')
+					and main.HUD.Actions:FindFirstChild('Left')
+					and main.HUD.Actions.Left:FindFirstChild('Buttons')
+					and main.HUD.Actions.Left.Buttons:FindFirstChild('LeaveDungeon'),
+				main:FindFirstChild('HUD')
+					and main.HUD:FindFirstChild('Dungeon_Container')
+					and main.HUD.Dungeon_Container:FindFirstChild('Completion_Info')
+					and main.HUD.Dungeon_Container.Completion_Info:FindFirstChild('Content')
+					and main.HUD.Dungeon_Container.Completion_Info.Content:FindFirstChild('ActionButtons')
+					and main.HUD.Dungeon_Container.Completion_Info.Content.ActionButtons:FindFirstChild('ReturnButton'),
+				main:FindFirstChild('HUD')
+					and main.HUD:FindFirstChild('Dungeon_Container')
+					and main.HUD.Dungeon_Container:FindFirstChild('Spectate_Info')
+					and main.HUD.Dungeon_Container.Spectate_Info:FindFirstChild('Return'),
+			}
+			for _, btn in ipairs(prefer) do
+				if btn then
+					fireBtn(btn)
+				end
 			end
 			for _, d in ipairs(main:GetDescendants()) do
 				if (d:IsA('TextButton') or d:IsA('ImageButton')) and d.Visible ~= false then
 					local lab = d:FindFirstChildWhichIsA('TextLabel', true)
 					local t = string.upper(tostring(lab and lab.Text or d.Text or d.Name or ''))
-					if t:find('RETURN', 1, true)
-						or t:find('LOBBY', 1, true)
+					local n = string.upper(tostring(d.Name or ''))
+					if n == 'LEAVEDUNGEON'
+						or n == 'RETURNBUTTON'
+						or t:find('RETURN TO LOBBY', 1, true)
+						or t:find('RETURN', 1, true)
+						or t:find('LEAVE DUNGEON', 1, true)
 						or t == 'LEAVE'
 						or t:find('LEAVE RAID', 1, true)
 					then
+						-- Skip frame Exit buttons (Inventory / Shop / etc.).
+						if n == 'EXIT' or t == 'EXIT' then
+							continue
+						end
 						fireBtn(d)
 					end
 				end
 			end
 		end)
-		local deadline = os.clock() + 14
+		-- Payload mid-run sometimes needs a second RequestReturn after LeaveDungeon UI.
+		task.wait(0.4)
+		invokeReturn('PayloadRunService', 'RequestReturn')
+		invokeReturn('DungeonRunService', 'RequestReturn')
+		local deadline = os.clock() + 16
 		while os.clock() < deadline do
 			local inRun = LocalPlayer:GetAttribute('InDungeon') == true
 				or LocalPlayer:GetAttribute('DungeonRun') == true
+				or LocalPlayer:GetAttribute('InPayload') == true
+				or LocalPlayer:GetAttribute('InChallenge') == true
 				or workspace:FindFirstChild('Raid_NPCs') ~= nil
+				or workspace:FindFirstChild('Payload_Maps') ~= nil
+				or workspace:FindFirstChild('Challenge_Dungeons') ~= nil
 			if not inRun then
 				break
 			end
 			task.wait(0.35)
 		end
 		rt.returningLobby = false
+		rt.returningLobbyAt = nil
 		rt.farmStop = nil
 		farmLabel = nil
 		if not silent then
 			local still = LocalPlayer:GetAttribute('InDungeon') == true
+				or LocalPlayer:GetAttribute('InPayload') == true
+				or LocalPlayer:GetAttribute('InChallenge') == true
 				or workspace:FindFirstChild('Raid_NPCs') ~= nil
+				or workspace:FindFirstChild('Payload_Maps') ~= nil
 			Library:Notify(still and 'Still in run — try again' or 'Back in lobby')
 		end
 	end)
@@ -17220,6 +18310,12 @@ local Gear = (function()
 	-- Locked items and equipped pieces stay. Only Head / Body / Ring.
 	local SELL_SLOTS = { Head = true, Body = true, Ring = true }
 	local JUNK_QUALITY = 0.95 -- sell strictly below 95%
+	-- Never sell these ItemIds (Exotic / quest showcase gear).
+	local JUNK_KEEP_IDS = {
+		KingsCrown = true,
+		LivingArmor = true,
+		SupernovaRing = true,
+	}
 
 	local equipDataMod
 	local function equipmentData()
@@ -17250,6 +18346,18 @@ local Gear = (function()
 			return true
 		end
 		if item.Locked == true then
+			return true
+		end
+		local id = tostring(item.ItemId or '')
+		if JUNK_KEEP_IDS[id] then
+			return true
+		end
+		-- DisplayName fallback (UI shows "King's Crown", id is KingsCrown).
+		local dn = string.lower(tostring(item.DisplayName or item.Name or ''))
+		if dn:find("king's crown", 1, true)
+			or dn:find('living armor', 1, true)
+			or dn:find('supernova ring', 1, true)
+		then
 			return true
 		end
 		if not SELL_SLOTS[tostring(item.Slot or '')] then
@@ -17783,6 +18891,197 @@ local Gear = (function()
 			end
 			api.sellJunk(true)
 		end
+		if on('DLAutoForge') and os.clock() >= (rt.forgeAt or 0) then
+			rt.forgeAt = os.clock() + 2.5
+			api.forgeRun(true)
+		end
+	end
+
+	local function forgeRF(name)
+		local mod = knitRoot()
+		local svcs = mod and mod:FindFirstChild('Services')
+		local fs = svcs and svcs:FindFirstChild('ForgeService')
+		local rf = fs and fs:FindFirstChild('RF')
+		return (rf and rf:FindFirstChild(name)) or nil
+	end
+
+	local forgeDataMod
+	local function forgeData()
+		if forgeDataMod ~= nil then
+			return forgeDataMod
+		end
+		local ok, mod = pcall(function()
+			return require(ReplicatedStorage.GameInfo.ForgeData)
+		end)
+		forgeDataMod = (ok and type(mod) == 'table') and mod or false
+		return forgeDataMod
+	end
+
+	local function itemForgeLevel(item)
+		if type(item) ~= 'table' then
+			return 0
+		end
+		return tonumber(item.ForgeLevel) or 0
+	end
+
+	local function canForgeItem(item)
+		if type(item) ~= 'table' or type(item.GUID) ~= 'string' then
+			return false
+		end
+		local fd = forgeData()
+		if fd and type(fd.IsForgeable) == 'function' then
+			local ok, yes = pcall(fd.IsForgeable, item)
+			if ok and yes == false then
+				return false
+			end
+		end
+		return true
+	end
+
+	function api.forgeCandidates()
+		local d = api.data()
+		if not d then
+			return {}
+		end
+		local scope = Options.DLForgeScope and tostring(Options.DLForgeScope.Value or '') or 'Equipped'
+		local target = Options.DLForgeTarget and tonumber(Options.DLForgeTarget.Value) or 15
+		local fd = forgeData()
+		local maxLv = (fd and tonumber(fd.MAX_FORGE_LEVEL)) or 20
+		target = math.clamp(math.floor(target), 1, maxLv)
+		local list = {}
+		local seen = {}
+		local function take(item, where)
+			if not canForgeItem(item) or seen[item.GUID] then
+				return
+			end
+			local lv = itemForgeLevel(item)
+			if lv >= target then
+				return
+			end
+			seen[item.GUID] = true
+			list[#list + 1] = {
+				item = item,
+				where = where,
+				level = lv,
+				guid = item.GUID,
+				slot = tostring(item.Slot or '?'),
+				name = tostring(item.ItemId or item.GUID),
+			}
+		end
+		if scope == 'Equipped' or scope == 'Both' then
+			for slot, item in pairs(d.Equipment or {}) do
+				if type(item) == 'table' then
+					take(item, 'equipped:' .. tostring(slot))
+				end
+			end
+		end
+		if scope == 'Inventory' or scope == 'Both' then
+			for _, item in pairs(d.EquipmentInventory or {}) do
+				if type(item) == 'table' then
+					take(item, 'bag')
+				end
+			end
+		end
+		table.sort(list, function(a, b)
+			if a.level ~= b.level then
+				return a.level > b.level
+			end
+			return a.name < b.name
+		end)
+		return list, target
+	end
+
+	local function getForgeInfo(guid)
+		local rem = forgeRF('GetForgeInfo')
+		if not rem then
+			return nil
+		end
+		local ok, info = pcall(function()
+			return rem:InvokeServer(guid)
+		end)
+		if ok and type(info) == 'table' then
+			return info
+		end
+		return nil
+	end
+
+	local function invokeForge(guid, protect, enhance)
+		local rem = forgeRF('ForgeItem')
+		if not rem then
+			return false, nil
+		end
+		local opts = {
+			Protect = protect == true,
+			Enhance = enhance == true,
+		}
+		local ok, res = pcall(function()
+			return rem:InvokeServer(guid, opts)
+		end)
+		return ok and res ~= false, res
+	end
+
+	function api.forgeRun(silent)
+		if rt.forgeBusy then
+			return 0
+		end
+		local cands, target = api.forgeCandidates()
+		if #cands == 0 then
+			if not silent then
+				Library:Notify(('No forge targets under +%d'):format(target))
+			end
+			return 0
+		end
+		rt.forgeBusy = true
+		local wantProtect = on('DLForgeProtect')
+		local wantEnhance = on('DLForgeEnhance')
+		local attempts, successes, stopped = 0, 0, nil
+		-- Cap work per tick so the farm stays responsive.
+		local budget = silent and 8 or 40
+		for _, c in ipairs(cands) do
+			if attempts >= budget then
+				break
+			end
+			while attempts < budget do
+				local info = getForgeInfo(c.guid)
+				if not info then
+					stopped = stopped or 'GetForgeInfo failed'
+					break
+				end
+				local lv = tonumber(info.ForgeLevel) or c.level or 0
+				if info.IsMaxed == true or lv >= target then
+					break
+				end
+				if info.CanForge ~= true then
+					stopped = stopped or ('Need mats/coins for ' .. c.name)
+					break
+				end
+				local protect = wantProtect and info.ProtectApplies == true
+					and (tonumber(info.ProtectionScrollsOwned) or 0) > 0
+				local enhance = wantEnhance and info.EnhanceApplies == true
+				attempts += 1
+				local ok, res = invokeForge(c.guid, protect, enhance)
+				if not ok then
+					stopped = stopped or ('Forge refused ' .. c.name)
+					break
+				end
+				if type(res) == 'table' and res.Success == false then
+					-- Failed roll still consumes — keep going unless CanForge drops.
+					task.wait(0.08)
+				else
+					successes += 1
+					task.wait(0.08)
+				end
+			end
+		end
+		rt.forgeBusy = false
+		if not silent or successes > 0 or stopped then
+			local msg = ('Forge: %d tries · %d ok'):format(attempts, successes)
+			if stopped then
+				msg = msg .. ' · ' .. stopped
+			end
+			Library:Notify(msg)
+		end
+		return successes
 	end
 
 	return api
@@ -17941,7 +19240,7 @@ ChestBox:AddToggle('DLOpenGates', {
 	Library:Notify(v and 'Open locked gates on' or 'Open locked gates off')
 end)
 ChestBox:AddButton('Collect all chests', function()
-	collectChestRoute(false)
+	collectChestRoute(false, nil, true)
 end)
 ChestBox:AddSlider('DLChestEvery', {
 	Text = 'Route every (s)',
@@ -18452,6 +19751,9 @@ ReplayBox:AddToggle('DLRaidLoop', {
 		if Toggles.DLHuntSpecial then
 			Toggles.DLHuntSpecial:SetValue(false)
 		end
+		if Toggles.DLChallengeLoop then
+			Toggles.DLChallengeLoop:SetValue(false)
+		end
 		if Toggles.DLAutoReplay then
 			Toggles.DLAutoReplay:SetValue(false)
 		end
@@ -18519,6 +19821,107 @@ ReplayBox:AddButton('Enter event raid now', function()
 end)
 ReplayBox:AddLabel('Event raid loop uses the RAID menu (ENTER + Normal/Extreme/Impossible), not the dungeon select.')
 
+ReplayBox:AddToggle('DLChallengeLoop', {
+	Text = 'Challenge loop',
+	Default = false,
+	Tooltip = 'Loops Challenge: picks boss + difficulty, ENTER via pod queue, then RequestReplay on COMPLETED. Turns Auto farm on when you enter. Disables dungeon/raid/hunt loops.',
+}):OnChanged(function(v)
+	if not v then
+		Library:Notify('Challenge loop off')
+		return
+	end
+	pcall(function()
+		if Options.DLChallengeBoss and Options.DLChallengeBoss.SetValue then
+			local cur = tostring(Options.DLChallengeBoss.Value or '')
+			if cur == '' or cur == 'nil' then
+				local bosses = (rt.ChallengeLoop and rt.ChallengeLoop.listBosses()) or {}
+				Options.DLChallengeBoss:SetValue(bosses[1] or 'Scarlet Knight')
+			end
+		end
+		if Options.DLChallengeDifficulty and Options.DLChallengeDifficulty.SetValue then
+			local cur = tostring(Options.DLChallengeDifficulty.Value or '')
+			if cur == '' or cur == 'nil' then
+				Options.DLChallengeDifficulty:SetValue('Nightmare')
+			end
+		end
+		if Toggles.DLLoopSpecific then
+			Toggles.DLLoopSpecific:SetValue(false)
+		end
+		if Toggles.DLAutoDungeon then
+			Toggles.DLAutoDungeon:SetValue(false)
+		end
+		if Toggles.DLHuntSpecial then
+			Toggles.DLHuntSpecial:SetValue(false)
+		end
+		if Toggles.DLRaidLoop then
+			Toggles.DLRaidLoop:SetValue(false)
+		end
+		if Toggles.DLAutoReplay then
+			Toggles.DLAutoReplay:SetValue(false)
+		end
+	end)
+	if rt.ChallengeLoop then
+		rt.ChallengeLoop.onLobby()
+		local boss, diff = rt.ChallengeLoop.target()
+		Library:Notify(('Challenge loop · %s · %s'):format(boss, diff))
+		task.spawn(function()
+			task.wait(0.35)
+			if rt.ChallengeLoop then
+				rt.ChallengeLoop.enter(false)
+			end
+			local deadline = os.clock() + 25
+			while os.clock() < deadline do
+				local inCh = LocalPlayer:GetAttribute('InChallenge') == true
+					or workspace:FindFirstChild('Challenge_Dungeons') ~= nil
+				if not inCh and rt.ChallengeLoop and rt.ChallengeLoop.inChallenge then
+					inCh = rt.ChallengeLoop.inChallenge()
+				end
+				if inCh then
+					if Toggles.DLAutoFarm then
+						Toggles.DLAutoFarm:SetValue(true)
+					end
+					break
+				end
+				task.wait(0.4)
+			end
+		end)
+	end
+end)
+ReplayBox:AddDropdown('DLChallengeBoss', {
+	Text = 'Challenge boss',
+	Values = (rt.ChallengeLoop and rt.ChallengeLoop.listBosses()) or { 'Scarlet Knight' },
+	Default = 1,
+	Tooltip = 'Boss carousel on the Challenge panel (Scarlet Knight, Imperator, …). Cycles preview before ENTER.',
+})
+ReplayBox:AddDropdown('DLChallengeDifficulty', {
+	Text = 'Challenge difficulty',
+	Values = (rt.ChallengeLoop and rt.ChallengeLoop.listDifficulties())
+		or { 'Easy', 'Normal', 'Hard', 'Nightmare' },
+	Default = 4,
+	Tooltip = 'Easy / Normal / Hard / Nightmare — RequestSelectDifficulty before pod queue.',
+})
+ReplayBox:AddButton('Refresh challenge bosses', function()
+	local names = rt.ChallengeLoop and rt.ChallengeLoop.listBosses() or {}
+	if Options.DLChallengeBoss and Options.DLChallengeBoss.SetValues then
+		Options.DLChallengeBoss:SetValues(names)
+	end
+	Library:Notify((#names) .. ' challenge bosses')
+end)
+ReplayBox:AddButton('Enter Challenge now', function()
+	task.spawn(function()
+		local C = rt.ChallengeLoop
+		if not C then
+			return
+		end
+		if C.inChallenge() then
+			C.replay(false)
+			return
+		end
+		C.enter(false)
+	end)
+end)
+ReplayBox:AddLabel('Challenge loop: Mode Challenge → featured dungeon → difficulty → boss preview → RequestStartPodQueue / ENTER.')
+
 local LobbyBox = RunTab:AddLeftGroupbox('Lobby')
 LobbyBox:AddToggle('DLAutoDungeon', {
 	Text = 'Auto start best dungeon',
@@ -18545,7 +19948,7 @@ end)
 LobbyBox:AddButton('Force return to lobby', function()
 	rt.forceReturnLobby(false)
 end)
-LobbyBox:AddLabel('Force return uses Raid/Dungeon RequestReturn (+ RETURN UI). Does not turn off raid/dungeon loops.')
+LobbyBox:AddLabel('Force return uses Payload/Challenge/Raid/BossRush/Dungeon RequestReturn + LeaveDungeon.')
 LobbyBox:AddLabel('Loop specific dungeon overrides this pick and can use Endless. Auto start stays Nightmare max.')
 
 local WorldBox = WorldTab:AddLeftGroupbox('Look')
@@ -18737,7 +20140,7 @@ end)
 DataBox:AddLabel('Class / dungeon dumps only.')
 
 local CodesBox = DataTab:AddRightGroupbox('Codes')
-CodesBox:AddLabel('Live CodesData + Sept 2026 guide extras. Skip creator-only.')
+CodesBox:AddLabel('Uses live CodesData Active list (auto). Skips creator-only.')
 CodesBox:AddButton('Use all codes', function()
 	RunLoops.redeemAllCodes()
 end)
@@ -18840,7 +20243,47 @@ end)
 GearBox:AddButton('Clear junk now', function()
 	task.spawn(Gear.sellJunk, false)
 end)
-GearBox:AddLabel('Junk sell: Head / Body / Ring under 95% Quality. Keeps Locked + equipped. Never weapons.')
+GearBox:AddLabel('Junk sell: Head / Body / Ring under 95% Quality. Keeps Locked, equipped, King\'s Crown / Living Armor / Supernova Ring. Never weapons.')
+
+GearBox:AddToggle('DLAutoForge', {
+	Text = 'Auto forge upgrade',
+	Default = false,
+	Tooltip = 'Calls ForgeService.ForgeItem on equipped/bag gear under the target level (same remote as the Forge Upgrade button). Stops when maxed or out of mats/coins.',
+}):OnChanged(function(v)
+	Library:Notify(v and 'Auto forge on' or 'Auto forge off')
+	if v then
+		rt.forgeAt = 0
+		task.spawn(Gear.forgeRun, true)
+	end
+end)
+GearBox:AddDropdown('DLForgeScope', {
+	Text = 'Forge which gear',
+	Values = { 'Equipped', 'Inventory', 'Both' },
+	Default = 1,
+	Tooltip = 'Equipped = worn slots only. Inventory = bag only. Both = worn + bag.',
+})
+GearBox:AddSlider('DLForgeTarget', {
+	Text = 'Forge until +',
+	Default = 15,
+	Min = 1,
+	Max = 20,
+	Rounding = 0,
+	Tooltip = 'Stop when ForgeLevel reaches this (max 20).',
+})
+GearBox:AddToggle('DLForgeProtect', {
+	Text = 'Use protection scrolls',
+	Default = false,
+	Tooltip = 'Passes Protect=true when the item accepts protection and you own scrolls (blocks downgrade on fail).',
+})
+GearBox:AddToggle('DLForgeEnhance', {
+	Text = 'Use enhance',
+	Default = false,
+	Tooltip = 'Passes Enhance=true when EnhanceApplies on GetForgeInfo.',
+})
+GearBox:AddButton('Forge upgrade now', function()
+	task.spawn(Gear.forgeRun, false)
+end)
+GearBox:AddLabel('Forge uses ForgeItem(guid, {Protect, Enhance}). Does not need the Auto Forge gamepass.')
 
 local StatBox = DataTab:AddLeftGroupbox('Skill points')
 Stats.setLabel(StatBox:AddLabel('Level ? · reading…'))
@@ -19092,6 +20535,11 @@ hbEspConn = track(RunService.Heartbeat:Connect(function(dt)
 			rt.RaidLoop.tick()
 		end
 	end)
+	pcall(function()
+		if rt.ChallengeLoop then
+			rt.ChallengeLoop.tick()
+		end
+	end)
 	-- Gear/stat polls are not frame-critical — half rate while farming.
 	if not farmBusy or (rt.slowUi or 0) % 2 == 0 then
 		pcall(Stats.tick)
@@ -19201,7 +20649,7 @@ getgenv().DLUnload = function()
 end
 getgenv().DLLootHudUnload = getgenv().DLUnload
 getgenv().DLCollectChests = function()
-	collectChestRoute(false)
+	collectChestRoute(false, nil, true)
 end
 getgenv().DLFixMovement = fixMovement
 getgenv().DLSetFarm = function(v)
@@ -19212,6 +20660,7 @@ end
 getgenv().DLFarmStatus = function()
 	return farmLabel, farmKills, farmBusy, rt.farmCrashErr, rt.farmCrashN
 end
+getgenv().DLRT = rt
 getgenv().DLFarmDebug = function()
 	return {
 		step = rt.farmStep,
@@ -19229,6 +20678,9 @@ getgenv().DLFarmDebug = function()
 		pinCorridorN = rt.pinCorridorN,
 		pinAoeN = rt.pinAoeN,
 		fighting = rt.farmFightNpc and rt.farmFightNpc.Name or nil,
+		inPayload = rt.inPayloadFarm and rt.inPayloadFarm() or false,
+		inChallenge = rt.inChallengeFarm and rt.inChallengeFarm() or false,
+		dungeon = activeDungeonRoot() and activeDungeonRoot().Name or nil,
 	}
 end
 getgenv().DLFarmCost = function(reset)
@@ -19263,6 +20715,8 @@ pcall(function()
 		{ 'DungeonRunService', 'DungeonComplete' },
 		{ 'DungeonService', 'DungeonComplete' },
 		{ 'BossRushService', 'DungeonComplete' },
+		{ 'ChallengeRunService', 'DungeonComplete' },
+		{ 'PayloadRunService', 'DungeonComplete' },
 	}) do
 		local ev = knitRE(pair[1], pair[2])
 		if ev then
@@ -19272,6 +20726,7 @@ pcall(function()
 	for _, pair in ipairs({
 		{ 'DungeonRunService', 'ReplayStarting' },
 		{ 'BossRushService', 'ReplayStarting' },
+		{ 'ChallengeRunService', 'ReplayStarting' },
 	}) do
 		local rs = knitRE(pair[1], pair[2])
 		if rs then
@@ -19281,7 +20736,7 @@ pcall(function()
 			end))
 		end
 	end
-	for _, svc in ipairs({ 'DungeonRunService', 'BossRushService' }) do
+	for _, svc in ipairs({ 'DungeonRunService', 'BossRushService', 'ChallengeRunService' }) do
 		local lives = knitRE(svc, 'LivesUpdate')
 		if lives then
 			track(lives.OnClientEvent:Connect(function(a)
@@ -19322,6 +20777,19 @@ track(LocalPlayer:GetAttributeChangedSignal('InDungeon'):Connect(function()
 		end
 	else
 		pcall(DungeonStart.onLobby)
+	end
+end))
+-- Challenge uses PayloadData-style difficulties on the completion badge; Payload
+-- uses PayloadData.Difficulties / CurrentDifficultyMode.
+track(LocalPlayer:GetAttributeChangedSignal('InChallenge'):Connect(function()
+	if LocalPlayer:GetAttribute('InChallenge') == true then
+		rt.farmChestSwept = false
+		rt.farmStarted = false
+	end
+end))
+track(workspace.ChildAdded:Connect(function(child)
+	if child.Name == 'Payload_Maps' or child.Name == 'Challenge_Dungeons' then
+		rt.farmChestSwept = false
 	end
 end))
 track(LocalPlayer:GetAttributeChangedSignal('CurrentDungeon'):Connect(function()
