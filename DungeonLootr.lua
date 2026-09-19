@@ -93,7 +93,7 @@ Library.ToggleKeybind = { Value = 'Home' }
 Library.Animations = Library.Animations or {}
 Library.Animations.TabSwitch = false
 
-local DL_BUILD = '1.0.84'
+local DL_BUILD = '1.0.85'
 getgenv().DLBuild = DL_BUILD
 
 local Window = Library:CreateWindow({
@@ -6276,51 +6276,6 @@ local Rooms = (function()
 		return hudHasOpenStar()
 	end
 
-	-- Combat stars in HUD order (Room_2, Room_6, …). Halls are not on this list.
-	function api.layoutCombatRooms()
-		seedLayoutFromController()
-		local out = {}
-		if type(rt.zoneLayout) ~= 'table' then
-			return out
-		end
-		for _, z in ipairs(rt.zoneLayout) do
-			local i = z and tonumber(z.Index)
-			if i and z.IsBoss ~= true then
-				out[#out + 1] = i
-			end
-		end
-		return out
-	end
-
-	function api.layoutRoomOpen(idx)
-		if not idx then
-			return false
-		end
-		seedLayoutFromController()
-		if type(rt.zoneLayout) ~= 'table' then
-			return false
-		end
-		for _, z in ipairs(rt.zoneLayout) do
-			if z and tonumber(z.Index) == idx and z.IsBoss ~= true then
-				return z.Done ~= true and z.Completed ~= true
-			end
-		end
-		return false
-	end
-
-	function api.layoutBossRoom()
-		seedLayoutFromController()
-		if type(rt.zoneLayout) ~= 'table' then
-			return nil
-		end
-		for _, z in ipairs(rt.zoneLayout) do
-			if z and z.IsBoss == true then
-				return tonumber(z.Index)
-			end
-		end
-		return nil
-	end
-
 	function api.starsHold()
 		return hudHasOpenStar() or api.specialStarOpen()
 	end
@@ -6514,6 +6469,51 @@ local Rooms = (function()
 			end
 		end)
 		return type(rt.zoneLayout) == 'table' and #rt.zoneLayout > 0
+	end
+
+	-- Combat stars in HUD order (Room_2, Room_6, …). Halls are not on this list.
+	function api.layoutCombatRooms()
+		seedLayoutFromController()
+		local out = {}
+		if type(rt.zoneLayout) ~= 'table' then
+			return out
+		end
+		for _, z in ipairs(rt.zoneLayout) do
+			local i = z and tonumber(z.Index)
+			if i and z.IsBoss ~= true then
+				out[#out + 1] = i
+			end
+		end
+		return out
+	end
+
+	function api.layoutRoomOpen(idx)
+		if not idx then
+			return false
+		end
+		seedLayoutFromController()
+		if type(rt.zoneLayout) ~= 'table' then
+			return false
+		end
+		for _, z in ipairs(rt.zoneLayout) do
+			if z and tonumber(z.Index) == idx and z.IsBoss ~= true then
+				return z.Done ~= true and z.Completed ~= true
+			end
+		end
+		return false
+	end
+
+	function api.layoutBossRoom()
+		seedLayoutFromController()
+		if type(rt.zoneLayout) ~= 'table' then
+			return nil
+		end
+		for _, z in ipairs(rt.zoneLayout) do
+			if z and z.IsBoss == true then
+				return tonumber(z.Index)
+			end
+		end
+		return nil
 	end
 
 	-- First incomplete star, then sequential empty rooms. A leftover special
