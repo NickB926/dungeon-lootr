@@ -93,7 +93,7 @@ Library.ToggleKeybind = { Value = 'Home' }
 Library.Animations = Library.Animations or {}
 Library.Animations.TabSwitch = false
 
-local DL_BUILD = '1.0.41'
+local DL_BUILD = '1.0.80'
 getgenv().DLBuild = DL_BUILD
 
 local Window = Library:CreateWindow({
