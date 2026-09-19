@@ -141,8 +141,9 @@ Library.ToggleKeybind = { Value = 'Home' }
 Library.Animations = Library.Animations or {}
 Library.Animations.TabSwitch = false
 
-local DL_BUILD = '1.0.45'
+local DL_BUILD = '1.0.46'
 getgenv().DLBuild = DL_BUILD
+-- Do NOT wipe DLShrineSkipKeys on every reload — that re-warps spent altars.
 
 local Window = Library:CreateWindow({
 	Title = 'Dungeon Lootr',
@@ -279,11 +280,20 @@ local farmFinished = {}
 local farmBan = {}
 -- Forward decl: farmHoldCf / refreshFarmFloor run before the real body below.
 local activeDungeonRoot
+local isPlayerSkillSummon
 local function farmSkipped(npc)
-	-- Chest-room mannequins have no Humanoid. Fighting them parks farm on the
-	-- dummy (skipFinal then also hides the floor boss).
-	if npc and npc:GetAttribute('IsLootRoomGuard') == true then
+	-- Old chest mannequins used IsLootRoomGuard with tiny/no HP. Demon packs
+	-- (Archer/Rogue Daemon) carry the same flag + multi-million HealthOverride.
+	-- Skipping those left the farm warped onto live enemies without swinging.
+	-- Root parts also stream in/out — do not require a root to treat them as live.
+	if isPlayerSkillSummon and isPlayerSkillSummon(npc) then
 		return true
+	end
+	if npc and npc:GetAttribute('IsLootRoomGuard') == true then
+		local ov = tonumber(npc:GetAttribute('HealthOverride')) or 0
+		if ov < 500 then
+			return true
+		end
 	end
 	local ban = farmBan[npc]
 	if ban and os.clock() < ban then
@@ -1563,9 +1573,10 @@ end
 -- Slider hover only while farming. Chest / gate / potion pins need prompt height.
 -- Negative bury must NOT drop to 0 on healWait or the farmFighting=false gap
 -- between kills — that is what yanked you onto the floor with live mobs.
+-- Room-arm wait is the only farm phase that forces floor height (Zone touch).
 function rt.combatHover()
 	local h = rt.hoverN()
-	if routeBusy or rt.chestLooting then
+	if routeBusy or rt.chestLooting or (rt.bossPadUntil and os.clock() < rt.bossPadUntil) then
 		return 0
 	end
 	-- Potion station stand needs the prompt; bury would miss it.
@@ -1574,6 +1585,11 @@ function rt.combatHover()
 	end
 	if not farmBusy then
 		return h
+	end
+	-- Arming an empty star: stand on the slab so ZoneEntered fires. Once a
+	-- fight target exists (or hover is negative mid-pack), bury again.
+	if rt.farmRoomPhase == 'wait' and not rt.farmFighting and not rt.farmFightNpc then
+		return 0
 	end
 	if h < 0 then
 		return h
@@ -1822,6 +1838,7 @@ function rt.farmHoldCf(pos, aim, keep)
 	-- farmFighting is true. The false gap between kills left goal Y on the
 	-- floor and farmHoldCf skipped the rewrite, so you popped up mid-pack.
 	if farmBusy and not routeBusy and not rt.chestLooting
+		and not (rt.bossPadUntil and os.clock() < rt.bossPadUntil)
 		and (math.abs(hover) >= 0.5 or rt.farmFighting or rt.farmFightNpc)
 	then
 		-- Explicit hover (non-zero) is floor + slider only. AutoHigh used to
@@ -1830,6 +1847,31 @@ function rt.farmHoldCf(pos, aim, keep)
 		local fy = rt.refreshFarmFloor(pos)
 		local fight = rt.farmFightNpc or rt.farmReturnNpc
 		local live = fight and (rt.enemyRoot and rt.enemyRoot(fight) or nil)
+		-- Specials / bosses often sit on a raised pad behind a gate. Floor ray
+		-- under their HRP is that pad — bury then floats ABOVE the approach
+		-- floor. Prefer the lower of enemy-floor vs our recent stand floor.
+		if live and hover < 0 then
+			local me = routeRoot()
+			local myFy = me and rt.refreshFarmFloor(me.Position) or nil
+			local lastFy = type(rt._lastGoodStandY) == 'number' and (rt._lastGoodStandY - hover) or nil
+			local lowFy = nil
+			for _, cand in ipairs({ fy, myFy, lastFy, rt.farmFloorY }) do
+				if type(cand) == 'number' then
+					if not lowFy or cand < lowFy then
+						lowFy = cand
+					end
+				end
+			end
+			if type(lowFy) == 'number' and type(fy) == 'number' and (fy - lowFy) > 5 then
+				fy = lowFy
+			elseif type(lowFy) == 'number' and type(fy) ~= 'number' then
+				fy = lowFy
+			end
+			-- Boss HRP far above our floor → never adopt the elevated pad.
+			if type(myFy) == 'number' and (live.Position.Y - myFy) > 8 then
+				fy = myFy
+			end
+		end
 		if type(fy) ~= 'number' then
 			-- Ray missed (gap / void). Stay on the pin goal / under the fight
 			-- target — never a stale floor from another room.
@@ -1865,8 +1907,18 @@ function rt.farmHoldCf(pos, aim, keep)
 		if live then
 			local minY = live.Position.Y - 32
 			local maxY = live.Position.Y + 24
+			-- Raised-pad specials: allow bury well below HRP (under the gate floor).
+			local me = routeRoot()
+			local myFy = me and type(rt.farmFloorY) == 'number' and rt.farmFloorY or nil
+			if hover < 0 and type(myFy) == 'number' and (live.Position.Y - myFy) > 8 then
+				minY = myFy + hover - 4
+				maxY = myFy + 6
+			end
 			if newY < minY then
 				newY = live.Position.Y + math.clamp(hover, -18, 0)
+				if hover < 0 and type(myFy) == 'number' and (live.Position.Y - myFy) > 8 then
+					newY = myFy + hover
+				end
 			elseif newY > maxY then
 				-- Never pull a negative bury UP to the enemy.
 				if hover < 0 then
@@ -2137,14 +2189,12 @@ local Pin = (function()
 				if os.clock() < (rt.ultLockUntil or 0) then
 					return
 				end
-				-- Only correct CFrame when knocked off the stand. While a fight
-				-- target is live, rebuild look every PreSim — pasting pinHoldCf
-				-- re-applied the engage yaw and left the slab facing empty air.
-				local drift = (myRoot.Position - lastGoal).Magnitude
-				if farmBusy and (rt.farmFightNpc or rt.crowdSolo) then
-					myRoot.CFrame = rt.farmHoldCf(lastGoal, lastAim, myRoot.CFrame)
+				-- Mid-fight: Heartbeat owns CFrame. Rebuilding look here every
+				-- PreSim doubled writes and flickered the stand across the pack.
+				if rt.farmFighting or rt.farmFightNpc then
 					return
 				end
+				local drift = (myRoot.Position - lastGoal).Magnitude
 				if drift < 0.85 and typeof(rt.pinHoldCf) == 'CFrame' then
 					local look = myRoot.CFrame.LookVector
 					local want = rt.pinHoldCf.LookVector
@@ -3176,6 +3226,9 @@ function rt.listRoomChests(dungeon, idx)
 		if type(rt.chestInBossRoom) == 'function' and rt.chestInBossRoom(child) then
 			return
 		end
+		if (rt.chestSkip and rt.chestSkip[child] or 0) > os.clock() then
+			return
+		end
 		if rt.chestInRoom(dungeon, idx, child) and not chestIsClaimed(child) then
 			if child:GetAttribute('LockedRoom') == true and not wantOpenGates() then
 				local p = chestPrompt(child)
@@ -3359,7 +3412,9 @@ function rt.grabPreBossChests(dungeon)
 end
 
 function rt.firstChestRoom(dungeon)
-	if not dungeon or not rt.chestsNow() then
+	-- Prefer any clear room with a pending chest (including unstarred loot pads).
+	-- Bulk grabPreBossChests still waits on chestsNow(); this only picks a room.
+	if not dungeon or not on('DLChestAnywhere') then
 		return nil
 	end
 	local best
@@ -3408,7 +3463,10 @@ end
 -- Snap onto every chest in this room and fire Loot. The old poll often queued
 -- nothing and left the character standing in the zone.
 function rt.lootRoomChests(dungeon, idx)
-	if not rt.chestsNow() then
+	-- Per-room loot must run whenever the tour visits that room. chestsNow()
+	-- only gates the bulk pre-boss sweep — gating here marked unstarred loot
+	-- pads swept without ever opening them.
+	if not on('DLChestAnywhere') then
 		return true
 	end
 	if not dungeon or not idx or rt.roomHasLiving(idx) then
@@ -3530,9 +3588,6 @@ local function lootClearedRoom(roomIdx, dungeon)
 	end
 	if not dungeon then
 		return false
-	end
-	if not rt.chestsNow() then
-		return true
 	end
 	return rt.lootRoomChests(dungeon, roomIdx)
 end
@@ -4576,11 +4631,55 @@ function rt.roomHasLiving(idx)
 	return false
 end
 
+isPlayerSkillSummon = function(npc)
+	if not npc then
+		return false
+	end
+	-- Anti Magic / Shadow Vagrant skill clone (Assets.Effects.Shadow_Clone).
+	local name = string.lower(tostring(npc.Name or ''))
+	if name == 'shadow_clone'
+		or name:find('shadow_clone', 1, true)
+		or name:find('shadowclone', 1, true)
+	then
+		return true
+	end
+	if npc:GetAttribute('IsSummon') == true
+		or npc:GetAttribute('IsAlly') == true
+		or npc:GetAttribute('IsFriendly') == true
+		or npc:GetAttribute('Friendly') == true
+		or npc:GetAttribute('IsPlayerSummon') == true
+	then
+		return true
+	end
+	local uid = LocalPlayer.UserId
+	for _, key in ipairs({
+		'OwnerUserId',
+		'OwnerId',
+		'CreatorUserId',
+		'SummonerUserId',
+		'UserId',
+		'PlayerId',
+	}) do
+		local v = npc:GetAttribute(key)
+		if v == uid or tonumber(v) == uid then
+			return true
+		end
+	end
+	local parent = npc.Parent
+	if parent and (parent.Name == 'Effects' or parent.Name == 'SkillEffects' or parent.Name == 'Summons') then
+		return true
+	end
+	return false
+end
+
 local function isWorldEnemy(npc)
 	if not npc or not npc.Parent then
 		return false
 	end
 	if not npc:IsDescendantOf(workspace) then
+		return false
+	end
+	if isPlayerSkillSummon(npc) then
 		return false
 	end
 	if npc.Parent.Name == 'Dialogue_NPCS' or npc.Parent.Name == 'PlayerModels' then
@@ -4731,8 +4830,27 @@ end
 local function refreshEnemyEspList()
 	local list = {}
 	local seen = {}
+	local dungeon = activeDungeonRoot and activeDungeonRoot() or nil
+	local raidNpcs = workspace:FindFirstChild('Raid_NPCs')
+	local function inFarmScope(npc)
+		if not npc then
+			return false
+		end
+		if dungeon and npc:IsDescendantOf(dungeon) then
+			return true
+		end
+		if raidNpcs and npc:IsDescendantOf(raidNpcs) then
+			return true
+		end
+		return false
+	end
 	local function consider(npc)
 		if not npc or seen[npc] or not npc.Parent then
+			return
+		end
+		-- Lobby showcase models (Awakened Devil, etc.) wear the Enemy tag but
+		-- are not in the run — tracers made it look like leftovers blocked the boss.
+		if not inFarmScope(npc) then
 			return
 		end
 		local pn = npc.Parent.Name
@@ -4745,14 +4863,17 @@ local function refreshEnemyEspList()
 		seen[npc] = true
 		list[#list + 1] = npc
 	end
-	for _, root in ipairs(workspace:GetChildren()) do
-		if type(root.Name) == 'string' and root.Name:sub(1, 10) == 'Generated_' then
-			local folder = root:FindFirstChild('NPCs')
-			if folder then
-				for _, npc in ipairs(folder:GetChildren()) do
-					consider(npc)
-				end
+	if dungeon then
+		local folder = dungeon:FindFirstChild('NPCs')
+		if folder then
+			for _, npc in ipairs(folder:GetChildren()) do
+				consider(npc)
 			end
+		end
+	end
+	if raidNpcs then
+		for _, npc in ipairs(raidNpcs:GetChildren()) do
+			consider(npc)
 		end
 	end
 	for _, tag in ipairs({ 'Enemy', 'Boss', 'Elite', 'MiniBoss', 'Miniboss' }) do
@@ -6620,6 +6741,17 @@ local Rooms = (function()
 			and math.abs(lp.Z) <= zone.Size.Z * 0.5 + 1.5
 	end
 
+	-- Loose bubble — Daemon packs often sit just outside Zone with RoomIndex=nil.
+	local function nearZoneXZ(zone, pos, pad)
+		if not zone or typeof(pos) ~= 'Vector3' then
+			return false
+		end
+		pad = tonumber(pad) or 56
+		local lp = zone.CFrame:PointToObjectSpace(pos)
+		return math.abs(lp.X) <= zone.Size.X * 0.5 + pad
+			and math.abs(lp.Z) <= zone.Size.Z * 0.5 + pad
+	end
+
 	function api.posInCorridor(dungeon, pos)
 		if not dungeon or typeof(pos) ~= 'Vector3' then
 			return false
@@ -6659,6 +6791,19 @@ local Rooms = (function()
 			and api.isBossRoom(dungeon, idx)
 		then
 			return true
+		end
+		-- Some packs never get RoomIndex. Fall back to standing position so the
+		-- tour still fights them instead of idling in an "empty" room.
+		local root = enemyRoot(npc)
+		if root and type(api.posInRoom) == 'function' then
+			local ok, hit = pcall(api.posInRoom, dungeon, idx, root.Position)
+			if ok and hit == true then
+				return true
+			end
+			local zone = api.zone(dungeon, idx)
+			if zone and nearZoneXZ(zone, root.Position, 56) then
+				return true
+			end
 		end
 		return false
 	end
@@ -7449,11 +7594,26 @@ local Rooms = (function()
 	seedLayoutFromController = function(force)
 		-- Stale Done flags left Endless idle↔next-gate while Room_6 was still open.
 		local fresh = os.clock() - (rt.zoneAt or 0) < 3.5
+		-- HUD still has empty treasure/combat stars but our cached layout says
+		-- everything non-boss is Done — markRoomSwept used to flip those flags.
+		if not force and type(rt.zoneLayout) == 'table' and #rt.zoneLayout > 0 and hudHasOpenStar() then
+			local anyOpen = false
+			for _, z in ipairs(rt.zoneLayout) do
+				if z and z.IsBoss ~= true and z.Done ~= true and z.Completed ~= true then
+					anyOpen = true
+					break
+				end
+			end
+			if not anyOpen then
+				force = true
+			end
+		end
 		if not force and rt.zoneFromGc and type(rt.zoneLayout) == 'table' and #rt.zoneLayout > 0 and fresh then
 			return true
 		end
-		-- getgc(true) is expensive. 2.5s still re-scanned too often during loot tours.
-		if not force and os.clock() - (rt.zoneSeedAt or 0) < 8 then
+		-- getgc(true) is expensive — never more than once per 2.5s even on force.
+		local minGap = force and 2.5 or 8
+		if os.clock() - (rt.zoneSeedAt or 0) < minGap then
 			return type(rt.zoneLayout) == 'table' and #rt.zoneLayout > 0
 		end
 		rt.zoneSeedAt = os.clock()
@@ -7508,7 +7668,13 @@ local Rooms = (function()
 		end
 		for _, z in ipairs(rt.zoneLayout) do
 			if z and tonumber(z.Index) == idx and z.IsBoss ~= true then
-				return z.Done ~= true and z.Completed ~= true
+				-- Controller Done/Completed is source of truth. A dry loot pass used
+				-- to stamp roomSweepDone and skip Room_12/19 while the HUD treasure
+				-- stars were still open — farm then sat on the boss room forever.
+				if z.Done == true or z.Completed == true then
+					return false
+				end
+				return true
 			end
 		end
 		return false
@@ -8031,7 +8197,12 @@ local function isFinalBoss(npc)
 		return true
 	end
 	local ov = tonumber(npc:GetAttribute('HealthOverride')) or 0
-	if ov >= 200000 then
+	-- Endless Demon packs (Archer/Rogue Daemon) also sit at multi-million
+	-- HealthOverride. Treating them as the floor boss made the farm skip
+	-- straight to chests while standing on top of them without swinging.
+	if ov >= 200000 and npc:GetAttribute('IsBoss') == true
+		and npc:GetAttribute('IsLootRoomGuard') ~= true
+	then
 		return true
 	end
 	-- Attribute checks first: the phase read goes through a remote, and asking for
@@ -8225,7 +8396,7 @@ end
 
 local function holdOnCrystalPack()
 	Pin.follow(function()
-		if os.clock() - (rt.aoeScanAt or 0) > 0.12 then
+		if os.clock() - (rt.aoeScanAt or 0) > 0.35 then
 			rt.aoeScanAt = os.clock()
 			pcall(rt.avoidFloorAoe)
 		end
@@ -8390,7 +8561,7 @@ end
 
 local function holdOnAddPack(anchor)
 	Pin.follow(function()
-		if os.clock() - (rt.aoeScanAt or 0) > 0.12 then
+		if os.clock() - (rt.aoeScanAt or 0) > 0.35 then
 			rt.aoeScanAt = os.clock()
 			pcall(rt.avoidFloorAoe)
 		end
@@ -8505,16 +8676,15 @@ local function pickFarmTarget()
 	local nearest, nearestD = nil, nil
 	local top, topD, topRank = nil, nil, 0
 	local ranged, rangedD = nil, nil
-		eachFarmNpc(function(npc)
-			if not enemyAlive(npc) or farmSkipped(npc) then
-				return
-			end
-			local roomOnly = tonumber(rt.farmRoomFilter)
-			local doneIdx = Rooms.indexOf(npc)
-			if not roomOnly and doneIdx and roomIsSwept(activeDungeonRoot(), doneIdx) and not isFinalBoss(npc) then
-				return
-			end
-			if roomOnly and not Rooms.npcInRoom(activeDungeonRoot(), npc, roomOnly) then
+	local function considerNpc(npc, roomOnly)
+		if not enemyAlive(npc) or farmSkipped(npc) then
+			return
+		end
+		local doneIdx = Rooms.indexOf(npc)
+		if not roomOnly and doneIdx and roomIsSwept(activeDungeonRoot(), doneIdx) and not isFinalBoss(npc) then
+			return
+		end
+		if roomOnly and not Rooms.npcInRoom(activeDungeonRoot(), npc, roomOnly) then
 			return
 		end
 		if skipFinal and isFinalBoss(npc) then
@@ -8536,7 +8706,19 @@ local function pickFarmTarget()
 		if preferRanged and not asleep and isRangedEnemy(npc) and (not rangedD or d < rangedD) then
 			ranged, rangedD = npc, d
 		end
+	end
+	local roomOnly = tonumber(rt.farmRoomFilter)
+	eachFarmNpc(function(npc)
+		considerNpc(npc, roomOnly)
 	end)
+	-- Room filter hid every Daemon (nil RoomIndex / outside Zone). Drop it and
+	-- retarget so we actually teleport onto the pack.
+	if not nearest and roomOnly then
+		rt.farmRoomFilter = nil
+		eachFarmNpc(function(npc)
+			considerNpc(npc, nil)
+		end)
+	end
 	local picked, pickedD = nearest, nearestD
 	-- Raid Dark Professor / room specials over map fodder so we actually warp in.
 	if top and isRaidBossNpc(top) then
@@ -9247,6 +9429,10 @@ end
 -- nearby same-floor trash within 32 studs so a locked boss does not leave
 -- two fodder behind the slab "ignored".
 local function crowdPartsNear(npc)
+	local now = os.clock()
+	if rt._crowdNpc == npc and type(rt._crowdParts) == 'table' and now - (rt._crowdAt or 0) < 0.15 then
+		return rt._crowdParts
+	end
 	local room = npc and Rooms.indexOf(npc)
 	local me = routeRoot()
 	local mePos = me and me.Position
@@ -9269,6 +9455,9 @@ local function crowdPartsNear(npc)
 		end
 		parts[#parts + 1] = p.Position
 	end)
+	rt._crowdNpc = npc
+	rt._crowdParts = parts
+	rt._crowdAt = now
 	return parts
 end
 
@@ -9503,7 +9692,7 @@ local function holdOnEnemy(npc)
 		if not live then
 			return nil
 		end
-		if os.clock() - (rt.aoeScanAt or 0) > 0.12 then
+		if os.clock() - (rt.aoeScanAt or 0) > 0.35 then
 			rt.aoeScanAt = os.clock()
 			pcall(rt.avoidFloorAoe)
 		end
@@ -9530,6 +9719,31 @@ local function holdOnEnemy(npc)
 		if enemyRank(npc) >= 4 and not autoLow and not autoHigh then
 			local off = Options.DLFarmSpecialOff and tonumber(Options.DLFarmSpecialOff.Value) or -11.5
 			y = live.Position.Y + off
+			-- Raised pad / behind-gate specials: SpecialOff from HRP still floats
+			-- above the approach floor. Anchor bury to the lower approach floor.
+			local approach = baseY
+			local me = routeRoot()
+			if me then
+				local myHit = workspace:Raycast(
+					Vector3.new(me.Position.X, me.Position.Y + 4, me.Position.Z),
+					Vector3.new(0, -80, 0),
+					params
+				)
+				if myHit then
+					local myFloor = myHit.Position.Y + hip
+					if not approach or myFloor < approach - 2 then
+						approach = myFloor
+					end
+				end
+			end
+			if type(approach) == 'number' and (live.Position.Y - (approach - hip)) > 8 then
+				-- Sit below the room floor we approached from, not mid-air under HRP.
+				if rt.hoverN() < 0 then
+					y = (approach - hip) + rt.hoverN()
+				else
+					y = math.min(y, approach + off)
+				end
+			end
 		elseif autoLow or autoHigh then
 			local hb = equippedHitboxSize()
 			local halfH = math.clamp(hb.Y * 0.5, 3, 14)
@@ -9665,20 +9879,32 @@ local function holdOnEnemy(npc)
 		local stand = cachedStand
 		local aimAt = cachedAim or live.Position
 		local plant = cachedPlant or live.Position
-		-- Per-frame pack chase: 0.55s cache left the yellow box on empty floor
-		-- while mobs walked out. Look-up needs XZ under the clump every tick.
+		-- Throttle pack math. Recomputing densestCentroid + facing every pin
+		-- frame hopped the stand between clump centres (44 jumps / 45 frames).
 		local lookUp = rt.hoverN() < 0
-		do
+		local packNow = os.clock()
+		local refreshPack = packNow - (rt.packRefreshAt or 0) > (lookUp and 0.28 or 0.18)
+		if refreshPack then
+			rt.packRefreshAt = packNow
 			local pack = crowdPartsNear(npc)
 			local mid, tn = densestCentroid(pack, 16)
 			if mid and tn and tn >= 2 then
 				rt.crowdSolo = false
+				-- Sticky plant: ignore mid jitter under ~5 studs.
+				if typeof(rt.stickyPlant) == 'Vector3' then
+					local jump = Vector3.new(mid.X - rt.stickyPlant.X, 0, mid.Z - rt.stickyPlant.Z).Magnitude
+					if jump < 5 then
+						mid = rt.stickyPlant
+					else
+						rt.stickyPlant = mid
+					end
+				else
+					rt.stickyPlant = mid
+				end
 				plant = mid
 				aimAt = mid
 				rt.farmCrowdAim = mid
 				if not lookUp then
-					-- Frontal: recompute approach every frame — a sticky crowdDir
-					-- left the slab facing right while two mobs sat on the left.
 					stand = math.max(stand, cachedStand or 4)
 					dir = bestPackFacing(pack, mid, stand, dir)
 					rt.crowdDir = dir
@@ -9688,12 +9914,26 @@ local function holdOnEnemy(npc)
 				end
 			else
 				rt.crowdSolo = true
+				rt.stickyPlant = live.Position
 				plant = live.Position
 				aimAt = live.Position
 				rt.farmCrowdAim = live.Position
 				if lookUp then
 					stand = 0
 				end
+			end
+		else
+			if typeof(rt.stickyPlant) == 'Vector3' then
+				plant = rt.stickyPlant
+				aimAt = rt.farmCrowdAim or rt.stickyPlant
+			elseif typeof(rt.farmCrowdAim) == 'Vector3' then
+				plant = rt.farmCrowdAim
+				aimAt = rt.farmCrowdAim
+			end
+			if lookUp then
+				stand = 0
+			elseif typeof(rt.crowdDir) == 'Vector3' then
+				dir = rt.crowdDir
 			end
 		end
 		-- Solo / behind-target every pin frame.
@@ -9710,6 +9950,8 @@ local function holdOnEnemy(npc)
 			end
 		else
 			-- Pack path: if ANY nearby fodder sits behind the slab, flip stand.
+			-- Throttle behind-checks — flipping every frame caused XZ flicker.
+			if refreshPack then
 			local me = routeRoot()
 			if me then
 				local look = Vector3.new(me.CFrame.LookVector.X, 0, me.CFrame.LookVector.Z)
@@ -9737,6 +9979,7 @@ local function holdOnEnemy(npc)
 						rt.crowdAimAt = 0
 						plant = behindMid
 						aimAt = behindMid
+						rt.stickyPlant = behindMid
 						rt.farmCrowdAim = behindMid
 						local away = Vector3.new(me.Position.X - behindMid.X, 0, me.Position.Z - behindMid.Z)
 						if away.Magnitude > 0.35 then
@@ -9748,6 +9991,7 @@ local function holdOnEnemy(npc)
 						end
 					end
 				end
+			end
 			end
 		end
 		local goal = Vector3.new(plant.X, y, plant.Z) + Vector3.new(dir.X, 0, dir.Z) * stand
@@ -9774,11 +10018,16 @@ local function holdOnEnemy(npc)
 			local here = meNow.Position
 			local flatDist = Vector3.new(goal.X - here.X, 0, goal.Z - here.Z).Magnitude
 			if flatDist > 0.35 then
-				-- Snap hard when far / behind so we do not linger facing empty air.
-				local t = lookUp and math.clamp(0.45 + flatDist * 0.1, 0.45, 0.95)
-					or math.clamp(0.35 + flatDist * 0.08, 0.35, 0.9)
-				if flatDist > 10 then
-					t = 1
+				-- Look-up: snap when close enough — micro-lerping a sticky plant
+				-- still jittered. Far hops still hard-snap.
+				local t
+				if lookUp then
+					t = flatDist > 6 and 1 or 1
+				else
+					t = math.clamp(0.35 + flatDist * 0.08, 0.35, 0.9)
+					if flatDist > 10 then
+						t = 1
+					end
 				end
 				goal = Vector3.new(
 					here.X + (goal.X - here.X) * t,
@@ -9868,6 +10117,9 @@ local function farmKill(npc)
 	pcall(watchEnemy, npc)
 	rt.farmFightNpc = npc
 	rt.farmPitchYaw = nil
+	rt.stickyPlant = nil
+	rt.packRefreshAt = 0
+	rt._crowdNpc = nil
 	rt.farmFighting = true
 	local function packAlive()
 		if crystalPack then
@@ -10146,6 +10398,243 @@ local function findFloorBoss()
 	return best
 end
 
+-- Special-room packs / spawners still alive → floor boss will not spawn.
+-- Prefer routing back into that room over sitting on Boss_Spawn.
+local function unclearedSpecialRoom(dungeon)
+	if not dungeon then
+		return nil
+	end
+	local maxR = Rooms.maxRoom(dungeon)
+	for i = 1, maxR do
+		local room = dungeon:FindFirstChild('Room_' .. tostring(i))
+		if not room then
+			continue
+		end
+		local special = room:GetAttribute('IsSpecialBoss') == true
+			or room:GetAttribute('IsSpecial') == true
+			or room:GetAttribute('HasSpecial') == true
+			or Rooms.roomIsSpecial(dungeon, i) == true
+		if not special then
+			continue
+		end
+		local living = false
+		pcall(function()
+			living = Rooms.aliveCount(dungeon, i) > 0 or Rooms.dormantCount(dungeon, i) > 0
+		end)
+		if not living then
+			eachFarmNpc(function(npc)
+				if living or not enemyAlive(npc) or farmSkipped(npc) or isFinalBoss(npc) then
+					return
+				end
+				if Rooms.npcInRoom(dungeon, npc, i) then
+					living = true
+				end
+			end)
+		end
+		if living then
+			return i
+		end
+	end
+	return nil
+end
+
+-- If the farm drifts to lobby showcase coords, rooms stream out (Boss_Spawn nil)
+-- and the floor softlocks with stars done / CurrentRoom=0.
+local function farmEnsureInDungeon(dungeon)
+	if not dungeon or not farmBusy then
+		return false
+	end
+	local root = routeRoot()
+	if not root then
+		return false
+	end
+	local anchor = nil
+	local idx = tonumber(rt.farmRoomIdx)
+	if idx then
+		local zone = Rooms.zone(dungeon, idx)
+		if zone then
+			anchor = zone.Position
+		end
+	end
+	if not anchor then
+		pcall(function()
+			local spawn = Rooms.bossSpawn(dungeon)
+			if spawn then
+				anchor = spawn.Position
+			end
+		end)
+	end
+	if not anchor then
+		local altar = dungeon:FindFirstChild('Blessing_Altar')
+		if altar then
+			pcall(function()
+				anchor = altar:GetPivot().Position
+			end)
+		end
+	end
+	if not anchor then
+		for _, child in ipairs(dungeon:GetChildren()) do
+			local i = tonumber(tostring(child.Name):match('^Room_(%d+)$'))
+			local zone = i and Rooms.zone(dungeon, i)
+			if zone then
+				anchor = zone.Position
+				break
+			end
+		end
+	end
+	if typeof(anchor) ~= 'Vector3' then
+		return false
+	end
+	if (root.Position - anchor).Magnitude <= 1200 then
+		return false
+	end
+	farmLabel = 'return dungeon'
+	local pos = anchor + Vector3.new(0, 4, 0)
+	rt.chestLooting = true
+	Pin.at(pos, true)
+	pcall(function()
+		root.CFrame = CFrame.new(pos)
+		root.AssemblyLinearVelocity = Vector3.zero
+		root.AssemblyAngularVelocity = Vector3.zero
+	end)
+	task.wait(0.35)
+	rt.chestLooting = false
+	return true
+end
+
+-- Pre-boss stars filled, boss star open, but NPC not spawned yet — stand on
+-- Boss_Spawn / poke the boss zone until the server drops the fight.
+local function waitForBossSpawn(dungeon)
+	if not dungeon then
+		return false
+	end
+	farmEnsureInDungeon(dungeon)
+	if findFloorBoss() then
+		return false
+	end
+	-- Special spawner / Scarlet packs block the floor boss. Bail so the farm
+	-- kills leftovers instead of parking on Boss_Spawn forever.
+	if findLiveSpecial() then
+		return false
+	end
+	if unclearedSpecialRoom(dungeon) then
+		return false
+	end
+	local leftover = pickFarmTarget()
+	if leftover and not isFinalBoss(leftover) then
+		return false
+	end
+	local bossOpen, preDone = false, false
+	pcall(function()
+		bossOpen = Rooms.bossStarOpen() == true
+	end)
+	pcall(function()
+		preDone = Rooms.preBossStarsDone() == true
+	end)
+	-- Need the boss star (or all pre-boss stars filled).
+	if not bossOpen and not preDone then
+		return false
+	end
+	if not preDone then
+		return false
+	end
+	local bossIdx = nil
+	pcall(function()
+		bossIdx = Rooms.layoutBossRoom()
+	end)
+	bossIdx = tonumber(bossIdx) or Rooms.maxRoom(dungeon)
+	local spawn = nil
+	pcall(function()
+		spawn = Rooms.bossSpawn(dungeon)
+	end)
+	-- Prefer the Boss_Spawn under the boss-star room; fallback scans all rooms.
+	if not spawn and bossIdx then
+		local room = dungeon:FindFirstChild('Room_' .. tostring(bossIdx))
+		local spawns = room and room:FindFirstChild('Spawns')
+		spawn = spawns and (spawns:FindFirstChild('Boss_Spawn') or spawns:FindFirstChild('BossSpawn'))
+	end
+	-- Rooms streamed out while we were in lobby — snap near a live room first.
+	if not spawn then
+		farmEnsureInDungeon(dungeon)
+		task.wait(0.5)
+		pcall(function()
+			spawn = Rooms.bossSpawn(dungeon)
+		end)
+		if not spawn and bossIdx then
+			local room = dungeon:FindFirstChild('Room_' .. tostring(bossIdx))
+			local spawns = room and room:FindFirstChild('Spawns')
+			spawn = spawns and (spawns:FindFirstChild('Boss_Spawn') or spawns:FindFirstChild('BossSpawn'))
+		end
+	end
+	farmLabel = ('boss spawn Room_%d'):format(bossIdx or 0)
+	rt.farmRoomFilter = nil
+	rt.farmRoomIdx = bossIdx
+	rt.farmRoomPhase = 'fight'
+	local stand = (spawn and spawn:IsA('BasePart') and spawn.Position) or nil
+	if not stand and bossIdx then
+		local zone = Rooms.zone(dungeon, bossIdx)
+		if zone then
+			stand = zone.Position
+		end
+	end
+	if typeof(stand) ~= 'Vector3' then
+		return false
+	end
+	-- Snap exactly onto Boss_Spawn. Keep chestLooting true for the whole wait
+	-- so farmHoldCf cannot bury Y under the pad (was ~28 studs below).
+	local pos = stand + Vector3.new(0, 3.2, 0)
+	rt.chestLooting = true
+	rt.bossPadUntil = os.clock() + 2.5
+	Pin.at(pos, true)
+	local root = routeRoot()
+	if root then
+		pcall(function()
+			root.CFrame = CFrame.new(pos)
+			root.AssemblyLinearVelocity = Vector3.zero
+			root.AssemblyAngularVelocity = Vector3.zero
+			rt.pinHoldCf = root.CFrame
+			root.CanCollide = true
+		end)
+	end
+	local zone = bossIdx and Rooms.zone(dungeon, bossIdx)
+	if root and type(firetouchinterest) == 'function' then
+		if zone then
+			pcall(firetouchinterest, root, zone, 0)
+			pcall(firetouchinterest, root, zone, 1)
+		end
+		if spawn and spawn:IsA('BasePart') then
+			pcall(firetouchinterest, root, spawn, 0)
+			pcall(firetouchinterest, root, spawn, 1)
+		end
+	end
+	-- Hold the pad; re-snap every frame so bury cannot win.
+	local holdUntil = os.clock() + 1.2
+	local interrupted = false
+	while os.clock() < holdUntil and farmActive() and not findFloorBoss() do
+		if findLiveSpecial() or unclearedSpecialRoom(dungeon) then
+			interrupted = true
+			break
+		end
+		local mid = pickFarmTarget()
+		if mid and not isFinalBoss(mid) then
+			interrupted = true
+			break
+		end
+		root = routeRoot()
+		if root then
+			pcall(function()
+				root.CFrame = CFrame.new(pos)
+				root.AssemblyLinearVelocity = Vector3.zero
+				root.AssemblyAngularVelocity = Vector3.zero
+			end)
+			Pin.at(pos, true)
+		end
+		task.wait(0.05)
+	end
+	rt.chestLooting = false
+	return not interrupted
+end
+
 local SWEEP_MARK = '_DLSweep'
 local sweepMarks = {}
 
@@ -10221,59 +10710,87 @@ local function unmarkRoomSwept(dungeon, idx)
 end
 
 local function goToOpenStar(dungeon, maxRoom)
-	if not dungeon or not Rooms.hudHasOpenStar() then
+	if not dungeon then
 		return false
 	end
+	local function roomNeedsVisit(i)
+		if not i or (rt.lootBan and rt.lootBan[i] or 0) > os.clock() then
+			return false
+		end
+		if not dungeon:FindFirstChild('Room_' .. tostring(i)) then
+			markRoomSwept(dungeon, i)
+			return false
+		end
+		if Rooms.isCorridor(dungeon, i) or Rooms.isStartRoom(dungeon, i) then
+			return false
+		end
+		local pending = Rooms.aliveCount(dungeon, i) > 0
+			or Rooms.dormantCount(dungeon, i) > 0
+			or roomHasPendingChest(dungeon, i)
+			or roomHasPendingGate(dungeon, i)
+		if pending then
+			return true
+		end
+		local room = dungeon:FindFirstChild('Room_' .. tostring(i))
+		if room and room:GetAttribute('IsLootRoom') == true and not roomIsSwept(dungeon, i) then
+			return true
+		end
+		if room and room:GetAttribute('IsCheckpoint') == true and not roomIsSwept(dungeon, i)
+			and on('DLChestAnywhere')
+		then
+			-- Checkpoint pads often hold a chest with no combat star.
+			return roomHasPendingChest(dungeon, i)
+		end
+		if roomIsSwept(dungeon, i) then
+			return false
+		end
+		return Rooms.layoutRoomOpen(i) == true
+	end
+
 	local star
-	-- Ordered sweep: take the lowest room number that still has work. The star
-	-- list is HUD layout order, which sends the farm back and forth across the
-	-- floor (Room_4, then 13, then 2) even though every room is equally close.
+	-- 1) HUD combat stars in order.
 	if on('DLRoomsInOrder') then
 		for _, i in ipairs(Rooms.layoutCombatRooms()) do
-			if (rt.lootBan and rt.lootBan[i] or 0) > os.clock() then
-				continue
-			end
-			if Rooms.layoutRoomOpen(i)
-				or Rooms.aliveCount(dungeon, i) > 0
-				or Rooms.dormantCount(dungeon, i) > 0
-				or roomHasPendingChest(dungeon, i)
-			then
+			if roomNeedsVisit(i) then
 				star = i
 				break
 			end
 		end
 	end
+	-- 2) Any remaining Room_N with chests / loot pads / dormants — including
+	-- rooms that never appear on the star bar (the yellow IsLootRoom boxes).
 	if not star then
+		for i = 1, maxRoom or Rooms.maxRoom(dungeon) do
+			if roomNeedsVisit(i) then
+				star = i
+				break
+			end
+		end
+	end
+	if not star and Rooms.hudHasOpenStar() then
 		pcall(function()
 			star = Rooms.nextStarRoom(dungeon) or Rooms.nextGapRoom(dungeon)
 		end)
-	end
-	if not star then
-		for i = 1, maxRoom or Rooms.maxRoom(dungeon) do
-			if Rooms.isCorridor(dungeon, i) or Rooms.isStartRoom(dungeon, i) then
-				continue
-			end
-			if Rooms.dormantCount(dungeon, i) > 0 or roomHasPendingChest(dungeon, i) then
-				star = i
-				break
-			end
-			local room = dungeon:FindFirstChild('Room_' .. tostring(i))
-			if room and room:GetAttribute('IsLootRoom') == true and not roomIsSwept(dungeon, i) then
-				star = i
-				break
-			end
+		-- Open HUD stars must still be visited even if we falsely marked the
+		-- room swept (empty loot pass). Discarding them left CurrentRoom stuck
+		-- and the floor boss never spawned.
+		if star then
+			unmarkRoomSwept(dungeon, star)
 		end
 	end
 	if not star then
 		return false
 	end
-	unmarkRoomSwept(dungeon, star)
+	local needsWork = Rooms.aliveCount(dungeon, star) > 0
+		or Rooms.dormantCount(dungeon, star) > 0
+		or roomHasPendingChest(dungeon, star)
+		or roomHasPendingGate(dungeon, star)
+	if needsWork then
+		unmarkRoomSwept(dungeon, star)
+	end
 	rt.farmRoomIdx = star
 	rt.farmRoomPhase = 'wait'
 	rt.farmRoomFilter = nil
-	-- Point the ordered slot at this star. Leaving slot past the end made
-	-- the next tour pass set idx = maxRoom+1 and call us again forever
-	-- (stuck on "star Room_N" after the special).
 	pcall(function()
 		for i, s in ipairs(Rooms.layoutCombatRooms()) do
 			if s == star then
@@ -10290,6 +10807,15 @@ local function markRoomSwept(dungeon, idx)
 	if not idx then
 		return
 	end
+	-- Never stamp a layout room swept while the controller still says Done=false
+	-- (HUD treasure stars). That parked the farm on the boss pad with 2 stars open.
+	local layoutOpen = false
+	pcall(function()
+		layoutOpen = Rooms.layoutRoomOpen(idx) == true
+	end)
+	if layoutOpen then
+		return
+	end
 	rt.roomSweepDone = rt.roomSweepDone or {}
 	rt.roomSweepDone[idx] = true
 	local key = roomPosKey(dungeon, idx)
@@ -10297,7 +10823,8 @@ local function markRoomSwept(dungeon, idx)
 		rt.roomSweepDonePos = rt.roomSweepDonePos or {}
 		rt.roomSweepDonePos[key] = true
 	end
-	-- Force skipTour to see 'done' immediately.
+	-- Do NOT flip zoneLayout.Done here — markRoomSwept used to poison the cache
+	-- and hide incomplete treasure rooms until reload.
 	if type(rt.skipTourCache) == 'table' then
 		rt.skipTourCache.at[idx] = nil
 		rt.skipTourCache.why[idx] = nil
@@ -10331,12 +10858,22 @@ function roomHasPendingChest(dungeon, idx)
 	if not dungeon or not idx then
 		return false
 	end
-	if not rt.chestsNow() then
+	-- Tour must see unstarred loot pads even before pre-boss stars fill.
+	-- chestsNow() (stars-ready gate) only throttles the bulk post-star sweep.
+	if not on('DLChestAnywhere') then
+		return false
+	end
+	-- Soft-ban after a failed loot pass — otherwise skipTour keeps re-picking
+	-- the same IsLootRoom forever (stuck on Room_N · loot).
+	if (rt.lootBan and rt.lootBan[idx] or 0) > os.clock() then
 		return false
 	end
 	local found = false
 	rt.eachDungeonChest(dungeon, function(child)
 		if found or not chestBelongsToRoom(dungeon, idx, child) then
+			return
+		end
+		if (rt.chestSkip and rt.chestSkip[child] or 0) > os.clock() then
 			return
 		end
 		if chestIsClaimed(child) then
@@ -10430,6 +10967,16 @@ local function skipTourRoom(dungeon, idx)
 	elseif Rooms.dormantCount(dungeon, idx) > 0 or roomHasPendingChest(dungeon, idx) then
 		why = nil
 	else
+		local room = dungeon:FindFirstChild('Room_' .. tostring(idx))
+		-- Empty loot pads with nothing left: mark done so the tour does not
+		-- bounce wait→done forever after chests are gone.
+		if room and room:GetAttribute('IsLootRoom') == true
+			and Rooms.aliveCount(dungeon, idx) <= 0
+			and not roomHasPendingGate(dungeon, idx)
+		then
+			why = 'done'
+			markRoomSwept(dungeon, idx)
+		else
 		-- Incomplete HUD stars (loot / empty circle) must still be visited even if
 		-- we already stamped the room swept after a dry loot pass.
 		local hudOpen = false
@@ -10437,24 +10984,14 @@ local function skipTourRoom(dungeon, idx)
 			hudOpen = Rooms.layoutRoomOpen(idx) == true
 		end)
 		if hudOpen then
-			-- HUD can stay empty after we already cleared and looted. Going back
-			-- every pass is the "stuck in Room_N" loop.
-			if roomIsSwept(dungeon, idx)
-				and Rooms.aliveCount(dungeon, idx) <= 0
-				and Rooms.dormantCount(dungeon, idx) <= 0
-				and not roomHasPendingChest(dungeon, idx)
-				and not roomHasPendingGate(dungeon, idx)
-			then
-				why = 'done'
-			else
-				why = nil
-			end
+			-- Controller still has this star open — keep touring / waking it.
+			why = nil
+			unmarkRoomSwept(dungeon, idx)
 		elseif roomIsSwept(dungeon, idx) then
 			why = 'done'
 		elseif type(rt.shrineRoomDone) == 'function' and rt.shrineRoomDone(dungeon, idx) then
 			why = 'shrine'
 		else
-			local room = dungeon:FindFirstChild('Room_' .. tostring(idx))
 			if room and room:GetAttribute('IsCheckpoint') == true
 				and Rooms.aliveCount(dungeon, idx) <= 0
 				and Rooms.dormantCount(dungeon, idx) <= 0
@@ -10465,6 +11002,7 @@ local function skipTourRoom(dungeon, idx)
 			else
 				why = nil
 			end
+		end
 		end
 	end
 	cache.at[idx] = now
@@ -10610,12 +11148,19 @@ local function farmKillNpc(npc)
 	if npc:GetAttribute('IsDormant') == true then
 		farmLabel = ('wake %s'):format(npc.Name)
 		wakeTarget(npc)
-	else
-		local okKill, errKill = pcall(farmKill, npc)
-		if not okKill then
-			farmFinished[npc] = os.clock() + 2
-			Library:Notify('Farm skip: ' .. tostring(errKill))
+		-- Loot-room Demon packs often stay IsDormant=true forever. After a wake
+		-- poke, still swing if they have real HealthOverride.
+		if npc:GetAttribute('IsDormant') == true then
+			local ov = tonumber(npc:GetAttribute('HealthOverride')) or 0
+			if ov < 500 then
+				return
+			end
 		end
+	end
+	local okKill, errKill = pcall(farmKill, npc)
+	if not okKill then
+		farmFinished[npc] = os.clock() + 2
+		Library:Notify('Farm skip: ' .. tostring(errKill))
 	end
 end
 
@@ -10676,7 +11221,30 @@ local function tourFarmRooms(dungeon)
 		task.wait(0.25)
 		return
 	end
+	farmEnsureInDungeon(dungeon)
 	rt.farmStep = 'tour:rooms'
+	-- Re-sync controller layout (throttled — getgc every pass was the hitch).
+	if os.clock() - (rt.layoutSyncAt or 0) > 2 then
+		rt.layoutSyncAt = os.clock()
+		pcall(function()
+			local openIdx = nil
+			for _, i in ipairs(Rooms.layoutCombatRooms()) do
+				if Rooms.layoutRoomOpen(i) then
+					unmarkRoomSwept(dungeon, i)
+					openIdx = openIdx or i
+				end
+			end
+			if openIdx and (not tonumber(rt.farmRoomIdx) or not Rooms.layoutRoomOpen(rt.farmRoomIdx)) then
+				if Rooms.isBossRoom(dungeon, tonumber(rt.farmRoomIdx) or -1)
+					or not Rooms.layoutRoomOpen(tonumber(rt.farmRoomIdx) or -1)
+				then
+					rt.farmRoomIdx = openIdx
+					rt.farmRoomPhase = 'wait'
+					rt.farmRoomFilter = nil
+				end
+			end
+		end)
+	end
 	-- Sweep marks live on the combat heartbeat (throttled). Calling them here
 	-- every tour pass re-walked every Room_N skipTour + chest GetDescendants.
 	local dname = dungeon.Name
@@ -10699,36 +11267,82 @@ local function tourFarmRooms(dungeon)
 	local maxRoom = Rooms.maxRoom(dungeon)
 	local idx = tonumber(rt.farmRoomIdx) or 1
 	if on('DLRoomsInOrder') then
-		local stars = {}
+		-- Combat stars PLUS unstarred loot/checkpoint pads with chests, in
+		-- Room_N order. Star-only walking skipped the yellow IsLootRoom boxes.
+		local candidates = {}
+		local seen = {}
+		local function add(i)
+			i = tonumber(i)
+			if not i or seen[i] or i < 1 or i > maxRoom then
+				return
+			end
+			if (rt.lootBan and rt.lootBan[i] or 0) > os.clock() then
+				return
+			end
+			seen[i] = true
+			candidates[#candidates + 1] = i
+		end
 		pcall(function()
-			local list = Rooms.layoutCombatRooms()
-			if type(list) == 'table' then
-				stars = list
+			for _, i in ipairs(Rooms.layoutCombatRooms()) do
+				add(i)
 			end
 		end)
-		if #stars > 0 then
-			local slot = tonumber(rt.farmStarSlot)
-			if not slot then
-				slot = 1
+		for i = 1, maxRoom do
+			if seen[i] then
+				continue
 			end
-			while slot <= #stars do
-				local okSkip, why = pcall(skipTourRoom, dungeon, stars[slot])
-				if okSkip and why then
-					slot += 1
-				else
-					break
+			local room = dungeon:FindFirstChild('Room_' .. tostring(i))
+			if not room or Rooms.isCorridor(dungeon, i) or Rooms.isStartRoom(dungeon, i) then
+				continue
+			end
+			-- Re-open only once when a chest appears after a false sweep — not every
+			-- tour pass (that kept empty HUD stars in a wait/holdRoom loop).
+			if room:GetAttribute('IsLootRoom') == true
+				or room:GetAttribute('IsCheckpoint') == true
+			then
+				-- Only tour loot/checkpoint pads that still need work.
+				if roomHasPendingChest(dungeon, i)
+					or Rooms.dormantCount(dungeon, i) > 0
+					or Rooms.aliveCount(dungeon, i) > 0
+					or not roomIsSwept(dungeon, i)
+				then
+					add(i)
 				end
+			elseif roomHasPendingChest(dungeon, i)
+				or Rooms.dormantCount(dungeon, i) > 0
+				or Rooms.aliveCount(dungeon, i) > 0
+			then
+				add(i)
 			end
-			rt.farmStarSlot = slot
-			if slot <= #stars then
-				idx = stars[slot]
-				rt.farmRoomIdx = idx
-			elseif tonumber(rt.farmRoomIdx) and rt.farmRoomIdx <= maxRoom then
-				idx = rt.farmRoomIdx
-			else
-				idx = maxRoom + 1
-				rt.farmRoomIdx = idx
+		end
+		table.sort(candidates)
+		local pick
+		for _, i in ipairs(candidates) do
+			local okSkip, why = pcall(skipTourRoom, dungeon, i)
+			if not (okSkip and why) then
+				pick = i
+				break
 			end
+		end
+		if pick then
+			-- Keep fight/loot phase when the tour re-selects the same room.
+			-- Resetting to wait re-ran holdRoom(1s) forever on empty chest pads.
+			if tonumber(rt.farmRoomIdx) ~= pick then
+				rt.farmRoomPhase = 'wait'
+			end
+			idx = pick
+			rt.farmRoomIdx = pick
+			pcall(function()
+				for s, star in ipairs(Rooms.layoutCombatRooms()) do
+					if star == pick then
+						rt.farmStarSlot = s
+						return
+					end
+				end
+			end)
+		else
+			idx = maxRoom + 1
+			rt.farmRoomIdx = idx
 		end
 	end
 	if maxRoom < 1 then
@@ -10737,6 +11351,45 @@ local function tourFarmRooms(dungeon)
 		return
 	end
 	if idx > maxRoom then
+		rt.farmRoomFilter = nil
+		local boss = findFloorBoss()
+		if boss then
+			farmKillNpc(boss)
+			return
+		end
+		-- Special spawner packs block the floor boss — clear them before padding.
+		local specialNpc = findLiveSpecial()
+		if specialNpc then
+			farmKillNpc(specialNpc)
+			return
+		end
+		local specialIdx = unclearedSpecialRoom(dungeon)
+		if specialIdx then
+			rt.farmRoomIdx = specialIdx
+			rt.farmRoomFilter = specialIdx
+			rt.farmRoomPhase = 'fight'
+			farmLabel = ('special Room_%d'):format(specialIdx)
+			local wake = pickFarmTarget()
+			if wake then
+				farmKillNpc(wake)
+			else
+				pcall(function()
+					Rooms.enter(dungeon, specialIdx)
+				end)
+				task.wait(0.35)
+			end
+			return
+		end
+		local leftover = pickFarmTarget()
+		if leftover and not isFinalBoss(leftover) then
+			farmKillNpc(leftover)
+			return
+		end
+		-- Boss star open but NPC not up yet — pad before leftover chests.
+		local okBossPad, onPad = pcall(waitForBossSpawn, dungeon)
+		if okBossPad and onPad then
+			return
+		end
 		local backChest = rt.firstChestRoom(dungeon)
 		if backChest and rt.roomClear(dungeon, backChest) then
 			idx = backChest
@@ -10747,17 +11400,11 @@ local function tourFarmRooms(dungeon)
 			rt.farmRoomIdx = backChest
 			rt.farmRoomPhase = 'fight'
 		else
-		rt.farmRoomFilter = nil
-		local boss = findFloorBoss()
-		if boss then
-			farmKillNpc(boss)
-			return
-		end
 		local okStar, went = pcall(goToOpenStar, dungeon, maxRoom)
 		if okStar and went then
 			return
 		end
-		local leftover = pickFarmTarget()
+		leftover = pickFarmTarget()
 		if leftover then
 			farmKillNpc(leftover)
 			return
@@ -10792,6 +11439,43 @@ local function tourFarmRooms(dungeon)
 		rt.packRoom = nil
 	end
 	if idx > maxRoom then
+		rt.farmRoomFilter = nil
+		local boss = findFloorBoss()
+		if boss then
+			farmKillNpc(boss)
+			return
+		end
+		local specialNpc = findLiveSpecial()
+		if specialNpc then
+			farmKillNpc(specialNpc)
+			return
+		end
+		local specialIdx = unclearedSpecialRoom(dungeon)
+		if specialIdx then
+			rt.farmRoomIdx = specialIdx
+			rt.farmRoomFilter = specialIdx
+			rt.farmRoomPhase = 'fight'
+			farmLabel = ('special Room_%d'):format(specialIdx)
+			local wake = pickFarmTarget()
+			if wake then
+				farmKillNpc(wake)
+			else
+				pcall(function()
+					Rooms.enter(dungeon, specialIdx)
+				end)
+				task.wait(0.35)
+			end
+			return
+		end
+		local leftover = pickFarmTarget()
+		if leftover and not isFinalBoss(leftover) then
+			farmKillNpc(leftover)
+			return
+		end
+		local okBossPad, onPad = pcall(waitForBossSpawn, dungeon)
+		if okBossPad and onPad then
+			return
+		end
 		local backChest = rt.firstChestRoom(dungeon)
 		if backChest and rt.roomClear(dungeon, backChest) then
 			idx = backChest
@@ -10802,17 +11486,11 @@ local function tourFarmRooms(dungeon)
 			rt.farmRoomIdx = backChest
 			rt.farmRoomPhase = 'fight'
 		else
-		rt.farmRoomFilter = nil
-		local boss = findFloorBoss()
-		if boss then
-			farmKillNpc(boss)
-			return
-		end
 		local okStar, went = pcall(goToOpenStar, dungeon, maxRoom)
 		if okStar and went then
 			return
 		end
-		local leftover = pickFarmTarget()
+		leftover = pickFarmTarget()
 		if leftover then
 			farmKillNpc(leftover)
 			return
@@ -10822,8 +11500,9 @@ local function tourFarmRooms(dungeon)
 	end
 	local phase = rt.farmRoomPhase or 'wait'
 	-- Leftover chests only after THIS room is dead. Yanking to a chest
-	-- during wait/load skipped the pack.
-	if rt.chestsNow() and phase ~= 'fight' and rt.roomClear(dungeon, idx) then
+	-- during wait/load skipped the pack. Only redirect once we're already
+	-- in loot and this room has nothing left — otherwise stay on Room_N order.
+	if phase == 'loot' and rt.roomClear(dungeon, idx) and not roomHasPendingChest(dungeon, idx) then
 		local backChest = rt.firstChestRoom(dungeon)
 		if backChest and backChest ~= idx and rt.roomClear(dungeon, backChest) then
 			idx = backChest
@@ -10840,7 +11519,7 @@ local function tourFarmRooms(dungeon)
 		phase = 'loot'
 		rt.farmRoomPhase = 'loot'
 	end
-	rt.farmRoomFilter = idx
+		rt.farmRoomFilter = idx
 	if phase == 'wait' then
 		farmLabel = ('Room_%d · wait'):format(idx)
 		local model = dungeon:FindFirstChild('Room_' .. tostring(idx))
@@ -10850,6 +11529,19 @@ local function tourFarmRooms(dungeon)
 			farmLabel = ('skip missing Room_%d'):format(idx)
 			advanceFromRoom(dungeon, idx)
 			return
+		end
+		-- Warp into the room when far so wait/fight run in the right pad.
+		do
+			local ok, pivot = pcall(function()
+				return model:GetPivot().Position
+			end)
+			if ok and typeof(pivot) == 'Vector3' then
+				local stand = standingSpot(pivot, 0)
+				local here = routeRoot()
+				if not here or (here.Position - stand).Magnitude > 18 then
+					Pin.at(stand, true)
+				end
+			end
 		end
 		if not Rooms.zone(dungeon, idx) then
 			farmLabel = ('Room_%d · load'):format(idx)
@@ -10865,20 +11557,46 @@ local function tourFarmRooms(dungeon)
 					Pin.at(stand, true)
 				end
 			end
+			-- Checkpoint / loot pads sometimes never get a Zone. After a short
+			-- stream wait, treat empty no-zone rooms as loot so we don't sit
+			-- on "Room_N · load" forever (Room_17 chest with IsCheckpoint).
+			rt.loadStallIdx = rt.loadStallIdx or {}
+			if rt.loadStallIdx[idx] == nil then
+				rt.loadStallIdx[idx] = os.clock()
+			end
+			if os.clock() - rt.loadStallIdx[idx] > 2.5 then
+				if Rooms.aliveCount(dungeon, idx) <= 0 and Rooms.dormantCount(dungeon, idx) <= 0 then
+					rt.farmRoomPhase = 'loot'
+					rt.loadStallIdx[idx] = nil
+				elseif Rooms.zone(dungeon, idx) then
+					rt.loadStallIdx[idx] = nil
+				end
+			end
 			task.wait(0.35)
 			return
 		end
+		rt.loadStallIdx = rt.loadStallIdx or {}
+		rt.loadStallIdx[idx] = nil
 		if Rooms.aliveCount(dungeon, idx) > 0 then
 			rt.farmRoomPhase = 'fight'
 			return
 		end
-		local spawned = Rooms.holdRoom(dungeon, idx, 1)
+		-- Throttle holdRoom — re-picking the same empty pad used to burn 1s/pass.
+		rt.holdRoomAt = rt.holdRoomAt or {}
+		local pokedRecently = (rt.holdRoomAt[idx] or 0) + 4 > os.clock()
+		local spawned = false
+		if not pokedRecently then
+			rt.holdRoomAt[idx] = os.clock()
+			spawned = Rooms.holdRoom(dungeon, idx, 1)
+		end
 		if spawned or Rooms.aliveCount(dungeon, idx) > 0 then
 			rt.farmRoomPhase = 'fight'
-		else
-			rt.farmRoomPhase = 'loot'
+			return
 		end
-		return
+		-- Fall through into loot this same pass — do not return as wait and
+		-- re-hold forever on empty IsLootRoom pads.
+		phase = 'loot'
+		rt.farmRoomPhase = 'loot'
 	end
 	if phase == 'fight' then
 		if Rooms.aliveCount(dungeon, idx) <= 0 then
@@ -10907,6 +11625,32 @@ local function tourFarmRooms(dungeon)
 		return
 	end
 	farmLabel = ('Room_%d · loot'):format(idx)
+	-- Warp into the room when far so loot does not claim from another pad.
+	do
+		local stand
+		local chest = rt.listRoomChests(dungeon, idx)[1]
+		if chest then
+			stand = chestStandPos(chest) or chestAnchor(chest)
+		end
+		if not stand then
+			local model = dungeon:FindFirstChild('Room_' .. tostring(idx))
+			if model then
+				local ok, pivot = pcall(function()
+					return model:GetPivot().Position
+				end)
+				if ok and typeof(pivot) == 'Vector3' then
+					stand = standingSpot(pivot, 0)
+				end
+			end
+		end
+		if stand then
+			local here = routeRoot()
+			if not here or (here.Position - stand).Magnitude > 12 then
+				Pin.at(stand, true)
+				rt.snapRoot(stand)
+			end
+		end
+	end
 	-- Gate unlock at most once/sec here. fireKeyPrompt waits HoldDuration (~0.8s)
 	-- and was burning the loot tour every frame when Open gates was on.
 	if wantOpenGates() and os.clock() - (rt.lootGateAt or 0) > 1.0 then
@@ -10949,9 +11693,9 @@ local function tourFarmRooms(dungeon)
 				rt.farmRoomPhase = 'fight'
 				return
 			end
-			if rt.chestsNow() and roomHasPendingChest(dungeon, idx) then
+			if roomHasPendingChest(dungeon, idx) then
 				rt.lootStallTries = (rt.lootStallTries or 0) + 1
-				if rt.lootStallTries < 2 then
+				if rt.lootStallTries < 3 then
 					if rt.lootPassDone then
 						rt.lootPassDone[idx] = nil
 					end
@@ -10963,10 +11707,13 @@ local function tourFarmRooms(dungeon)
 				end
 				rt.chestSkip = rt.chestSkip or {}
 				rt.eachDungeonChest(dungeon, function(child)
-					if rt.chestInRoom(dungeon, idx, child) then
+					if rt.chestInRoom(dungeon, idx, child) or chestBelongsToRoom(dungeon, idx, child) then
 						rt.chestSkip[child] = os.clock() + 90
 					end
 				end)
+				-- Ban the room so skipTour / candidates do not bounce back here.
+				rt.lootBan = rt.lootBan or {}
+				rt.lootBan[idx] = os.clock() + 90
 			end
 			rt.lootStallIdx = nil
 			markRoomSwept(dungeon, idx)
@@ -11089,36 +11836,85 @@ local function farmLoop()
 					farmKillNpc(specialNpc)
 				else
 				local floorBoss = findFloorBoss()
-				local awakeLeft = false
+				local packsLeft = false
 				if floorBoss then
 					eachFarmNpc(function(npc)
-						if awakeLeft or npc == floorBoss or not enemyAlive(npc) or farmSkipped(npc) then
+						if packsLeft or npc == floorBoss or not enemyAlive(npc) or farmSkipped(npc) then
 							return
 						end
-						if npc:GetAttribute('IsDormant') == true then
-							return
-						end
-						awakeLeft = true
+						-- Dormant Demon packs still need a wake+kill. Treating them
+						-- as "floor clear" jumped straight to chests and never swung.
+						packsLeft = true
 					end)
 				end
-				if floorBoss and not awakeLeft then
-					-- Walk-to chests: only after pre-boss stars, never the last room.
-					if rt.chestsNow() and dungeon and rt.firstChestRoom(dungeon) then
-						step('chests')
-						pcall(rt.grabPreBossChests, dungeon)
-						if rt.firstChestRoom(dungeon) then
-							rt.farmRoomIdx = rt.firstChestRoom(dungeon)
-							rt.farmRoomPhase = 'loot'
-							tourFarmRooms(dungeon)
-						end
-					else
+				if floorBoss and not packsLeft then
+					-- Live boss NPC first. Else pad Boss_Spawn when the star is open.
+					-- Leftover chests used to run forever and the boss never appeared.
+					local liveBoss = findFloorBoss() or floorBoss
+					if liveBoss and enemyAlive(liveBoss) and enemyRoot(liveBoss) then
 						rt.farmRoomFilter = nil
 						step('boss')
-						farmKillNpc(floorBoss)
+						farmKillNpc(liveBoss)
+					else
+						local okPad, onPad = pcall(waitForBossSpawn, dungeon)
+						if okPad and onPad then
+							step('boss')
+						else
+							local chestRoom = dungeon and rt.firstChestRoom(dungeon)
+							if chestRoom then
+								step('chests')
+								rt.farmRoomIdx = chestRoom
+								rt.farmRoomPhase = 'loot'
+								tourFarmRooms(dungeon)
+							elseif rt.chestsNow() and dungeon then
+								step('chests')
+								pcall(rt.grabPreBossChests, dungeon)
+								if rt.firstChestRoom(dungeon) then
+									rt.farmRoomIdx = rt.firstChestRoom(dungeon)
+									rt.farmRoomPhase = 'loot'
+									tourFarmRooms(dungeon)
+								end
+							else
+								rt.farmRoomFilter = nil
+								step('boss')
+								farmKillNpc(floorBoss)
+							end
+						end
 					end
 				elseif on('DLRoomsInOrder') then
-					step('tour')
-					tourFarmRooms(dungeon)
+					-- Stars done, boss not up: clear special leftovers, then pad.
+					local specialNpc = findLiveSpecial()
+					if specialNpc then
+						rt.farmRoomFilter = nil
+						step('special')
+						farmKillNpc(specialNpc)
+					else
+						local specialIdx = unclearedSpecialRoom(dungeon)
+						if specialIdx then
+							rt.farmRoomIdx = specialIdx
+							rt.farmRoomFilter = specialIdx
+							rt.farmRoomPhase = 'fight'
+							farmLabel = ('special Room_%d'):format(specialIdx)
+							step('special')
+							local wake = pickFarmTarget()
+							if wake then
+								farmKillNpc(wake)
+							else
+								pcall(function()
+									Rooms.enter(dungeon, specialIdx)
+								end)
+								task.wait(0.35)
+							end
+						else
+							local okPad, onPad = pcall(waitForBossSpawn, dungeon)
+							if okPad and onPad then
+								step('boss')
+							else
+								step('tour')
+								tourFarmRooms(dungeon)
+							end
+						end
+					end
 				else
 					local aggroNpc = nearestAggro(60)
 					if aggroNpc then
@@ -12926,6 +13722,7 @@ local BlessPick = (function()
 		-- the shrine does not block the run forever.
 		if click(best.btn) then
 			Library:Notify(('Blessing: %s'):format(best.title))
+			rt.blessClaimed = true
 			return true
 		end
 		if not silent then
@@ -12996,8 +13793,8 @@ local BlessPick = (function()
 	end
 
 	local function shrineLooksSpent(model, prompt)
-		-- Enabled=false while far away is NORMAL (server arms in range).
-		-- Only treat as spent after we already stood on this altar this floor.
+		-- Enabled=false while FAR away is normal (server arms in range).
+		-- Enabled=false while INSIDE activation range means already claimed.
 		if not model and not prompt then
 			return true
 		end
@@ -13007,7 +13804,19 @@ local BlessPick = (function()
 		end)
 		local key = shrinePosKey(ok and pos or nil)
 		local tried = (model and rt.shrineTried[model]) or (key and rt.shrineTried[key])
-		if tried and prompt and prompt.Enabled ~= true then
+		-- One visit this floor already finished → never re-claim.
+		if tried then
+			return true
+		end
+		if not prompt or prompt.Enabled == true then
+			return false
+		end
+		local root = routeRoot()
+		if not root or typeof(pos) ~= 'Vector3' then
+			return false
+		end
+		local arm = tonumber(prompt.MaxActivationDistance) or 10
+		if (root.Position - pos).Magnitude <= arm + 3 then
 			return true
 		end
 		return false
@@ -13023,38 +13832,25 @@ local BlessPick = (function()
 			return true
 		end
 		local skip = skipBucket()
+		local floorId = shrineFloorId()
+		-- Exact key for THIS floor only. The old fuzzy scan across 1000+ leftover
+		-- skip keys from prior Generated_ maps marked unused altars as spent.
 		if key and skip[key] == true then
 			return true
 		end
 		local xz = shrineXZKey(pos)
-		if xz and (skip[xz] == true or rt.shrineUsed[xz] == true) then
+		-- XZ-only skips are too sticky across floors — only honor them when
+		-- stamped this floor (rt.shrineUsed), not the global skip bucket.
+		if xz and rt.shrineUsed[xz] == true then
 			return true
 		end
-		-- Match any stored full/raw key near this altar (id / grid / %.0f mismatch).
-		if typeof(pos) == 'Vector3' then
-			for k, v in pairs(skip) do
-				if v == true and type(k) == 'string' then
-					local sx, _sy, sz = string.match(k, '^s:[^:]+:(-?%d+):(-?%d+):(-?%d+)$')
-					if sx and math.abs(tonumber(sx) - pos.X) <= 8 and math.abs(tonumber(sz) - pos.Z) <= 8 then
-						return true
-					end
-					local zx, zz = string.match(k, '^xz:(-?%d+):(-?%d+)$')
-					if zx and math.abs(tonumber(zx) - pos.X) <= 8 and math.abs(tonumber(zz) - pos.Z) <= 8 then
-						return true
-					end
-				end
-			end
-			-- Also honor prior-floor %.0f keys that shared this XZ.
-			local used = rt.shrineUsed
-			if type(used) == 'table' then
-				for k, v in pairs(used) do
-					if v == true and type(k) == 'string' then
-						local sx, _sy, sz = string.match(k, '^s:[^:]+:(-?%d+):(-?%d+):(-?%d+)$')
-						if sx and math.abs(tonumber(sx) - pos.X) <= 8 and math.abs(tonumber(sz) - pos.Z) <= 8 then
-							return true
-						end
-					end
-				end
+		if typeof(pos) == 'Vector3' and floorId ~= '' then
+			local x = snapStud(pos.X, 4)
+			local y = snapStud(pos.Y, 4)
+			local z = snapStud(pos.Z, 4)
+			local exact = string.format('s:%s:%d:%d:%d', floorId, x, y, z)
+			if skip[exact] == true or rt.shrineUsed[exact] == true then
+				return true
 			end
 		end
 		return false
@@ -13073,7 +13869,7 @@ local BlessPick = (function()
 		end
 		local xz = shrineXZKey(pos)
 		if xz then
-			skip[xz] = true
+			-- Floor-local only — do not put XZ into the persistent skip bucket.
 			rt.shrineUsed[xz] = true
 		end
 		-- Stamp common id variants so reloads / attribute ids cannot miss.
@@ -13081,18 +13877,19 @@ local BlessPick = (function()
 			local x = snapStud(pos.X, 4)
 			local y = snapStud(pos.Y, 4)
 			local z = snapStud(pos.Z, 4)
-			-- Also stamp %.0f raw keys (legacy) so mid-session tables still hit.
 			local rx = math.floor(pos.X + (pos.X >= 0 and 0.5 or -0.5))
 			local ry = math.floor(pos.Y + (pos.Y >= 0 and 0.5 or -0.5))
 			local rz = math.floor(pos.Z + (pos.Z >= 0 and 0.5 or -0.5))
+			local floorId = shrineFloorId()
 			for _, id in ipairs({
-				shrineFloorId(),
+				floorId,
 				tostring(LocalPlayer:GetAttribute('CurrentDungeon') or ''),
 				tostring(rt.farmDungeonId or ''),
-				'',
 			}) do
-				skip[string.format('s:%s:%d:%d:%d', id, x, y, z)] = true
-				skip[string.format('s:%s:%d:%d:%d', id, rx, ry, rz)] = true
+				if id and id ~= '' then
+					skip[string.format('s:%s:%d:%d:%d', id, x, y, z)] = true
+					skip[string.format('s:%s:%d:%d:%d', id, rx, ry, rz)] = true
+				end
 			end
 		end
 	end
@@ -13122,9 +13919,12 @@ local BlessPick = (function()
 		rt.blessDungeonId = id
 		rt.shrineUsed = {}
 		rt.shrineTried = {}
+		rt.blessClaimed = false
 		shrineNext = 0
 		rt.blessPriAt = 0
 		rt.shrineDeepAt = 0
+		-- Drop cross-floor skip junk (grew to 1000+ keys and blocked new altars).
+		getgenv().DLShrineSkipKeys = {}
 		-- Drop a stuck shrine trip from the previous floor.
 		if not shrineBusy then
 			return
@@ -13140,6 +13940,10 @@ local BlessPick = (function()
 	-- Any unclaimed altar on this floor — Enabled may be false until we stand on it.
 	local function liveAltarIn(dungeon)
 		if not dungeon then
+			return nil
+		end
+		-- Already took a blessing this floor — do not re-warp / re-pick.
+		if rt.blessClaimed == true then
 			return nil
 		end
 		local function take(model)
@@ -13208,6 +14012,9 @@ local BlessPick = (function()
 			return
 		end
 		resetShrineFloor(activeDungeonRoot())
+		if rt.blessClaimed == true then
+			return
+		end
 		local dungeonNow = activeDungeonRoot()
 		local pending = liveAltarIn(dungeonNow)
 		if pending then
@@ -13224,7 +14031,16 @@ local BlessPick = (function()
 			return
 		end
 		if api.open(true) then
-			pcall(api.run, true)
+			if api.run(true) then
+				local altar = dungeonNow and dungeonNow:FindFirstChild('Blessing_Altar')
+				if altar then
+					local ok, pos = pcall(function()
+						return altar:GetPivot().Position
+					end)
+					markShrineUsed(altar, ok and pos or nil)
+					markShrineTried(altar, ok and pos or nil)
+				end
+			end
 			return
 		end
 		local maxDist = 8000
@@ -13330,6 +14146,7 @@ local BlessPick = (function()
 			task.wait(0.12)
 			local deadline = os.clock() + 5.0
 			local opened = false
+			local sawEnabled = false
 			while os.clock() < deadline and currentInstance() do
 				if api.open(true) then
 					opened = true
@@ -13337,11 +14154,9 @@ local BlessPick = (function()
 				end
 				bestPrompt = (bestModel and bestModel:FindFirstChildWhichIsA('ProximityPrompt', true)) or bestPrompt
 				if bestPrompt and bestPrompt.Parent then
-					pcall(function()
-						bestPrompt.MaxActivationDistance = math.max(tonumber(bestPrompt.MaxActivationDistance) or 10, 20)
-						bestPrompt.Enabled = true
-					end)
-					if bestPrompt.Enabled then
+					-- Do not force Enabled=true — that re-arms spent altars client-side.
+					if bestPrompt.Enabled == true then
+						sawEnabled = true
 						chestFiredAt[bestPrompt] = nil
 						fireChestPrompt(bestPrompt)
 					end
@@ -13358,11 +14173,13 @@ local BlessPick = (function()
 					picked = api.run(true) == true
 				end
 			end
+			-- One visit per altar per floor — always stamp used so we never loop.
+			markShrineUsed(bestModel, bestPos)
 			if picked or opened then
-				markShrineUsed(bestModel, bestPos)
-			elseif bestPrompt and bestPrompt.Parent and bestPrompt.Enabled ~= true then
-				-- Stood on it; still dead → spent.
-				markShrineUsed(bestModel, bestPos)
+				rt.blessClaimed = true
+			elseif not sawEnabled then
+				-- Stood on it; prompt never armed → already spent.
+				rt.blessClaimed = true
 			end
 			-- Resume farm stand. Do not freeze on the altar.
 			local live = routeRoot()
@@ -13389,11 +14206,7 @@ local BlessPick = (function()
 				Pin.stop()
 			end
 			routeLabel = nil
-			if shrineAlreadyUsed(bestModel, bestPos) then
-				shrineNext = os.clock() + 6
-			else
-				shrineNext = os.clock() + 1.5
-			end
+			shrineNext = os.clock() + 8
 			end)
 			routeBusy = false
 			shrineBusy = false
@@ -13414,6 +14227,9 @@ local BlessPick = (function()
 		end
 		local dungeon = activeDungeonRoot()
 		resetShrineFloor(dungeon)
+		if rt.blessClaimed == true then
+			return false
+		end
 		if shrineBusy then
 			if os.clock() - (rt.shrineBusyAt or 0) > 12 then
 				shrineBusy = false
@@ -13432,19 +14248,31 @@ local BlessPick = (function()
 				rt.blessPriAt = now
 				if api.open(true) then
 					farmLabel = 'blessing'
-					pcall(api.run, true)
+					if api.run(true) then
+						local ok, pos = pcall(function()
+							return pending:GetPivot().Position
+						end)
+						markShrineUsed(pending, ok and pos or nil)
+						markShrineTried(pending, ok and pos or nil)
+						rt.blessClaimed = true
+						return false
+					end
 					return true
 				end
 				rt.blessFromFarm = true
 				pcall(api.shrineTick)
 				rt.blessFromFarm = nil
 			end
-			if shrineBusy or api.open(true) then
+			if shrineBusy then
 				farmLabel = 'blessing shrine'
 				return true
 			end
-			farmLabel = 'blessing shrine'
-			return true
+			-- Still pending and not busy → keep yielding so shrineTick can start.
+			if liveAltarIn(dungeon) then
+				farmLabel = 'blessing shrine'
+				return true
+			end
+			return false
 		end
 		if now - (rt.blessPriAt or 0) < 0.75 then
 			return false
@@ -13452,7 +14280,17 @@ local BlessPick = (function()
 		rt.blessPriAt = now
 		if api.open(true) then
 			farmLabel = 'blessing'
-			pcall(api.run, true)
+			if api.run(true) then
+				rt.blessClaimed = true
+				local altar = dungeon and dungeon:FindFirstChild('Blessing_Altar')
+				if altar then
+					local ok, pos = pcall(function()
+						return altar:GetPivot().Position
+					end)
+					markShrineUsed(altar, ok and pos or nil)
+				end
+				return false
+			end
 			return true
 		end
 		rt.blessFromFarm = true
@@ -14008,6 +14846,7 @@ local Replay = (function()
 					-- shrine blacklist so the new floor altar is first again.
 					rt.shrineUsed = {}
 					rt.shrineTried = {}
+					rt.blessClaimed = false
 					rt.blessDungeonId = nil
 					rt.blessPriAt = 0
 					rt.shrineDeepAt = 0
@@ -16526,7 +17365,7 @@ end)
 FarmBox:AddToggle('DLRoomsInOrder', {
 	Text = 'Rooms in order',
 	Default = true,
-	Tooltip = 'Each floor: blessings → special → then rooms in order. Each room: kill all → locked gates (if on) → chests (if on) → next room.',
+	Tooltip = 'Each floor: blessings → special → rooms by number (combat stars and unstarred loot/chest pads). Each room: kill → gates → chests → next.',
 }):OnChanged(function(v)
 	Library:Notify(v and 'Rooms in order on' or 'Rooms in order off — HUD star order')
 end)
