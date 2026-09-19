@@ -93,7 +93,7 @@ Library.ToggleKeybind = { Value = 'Home' }
 Library.Animations = Library.Animations or {}
 Library.Animations.TabSwitch = false
 
-local DL_BUILD = '1.0.81'
+local DL_BUILD = '1.0.82'
 getgenv().DLBuild = DL_BUILD
 
 local Window = Library:CreateWindow({
@@ -8096,6 +8096,46 @@ local function enemyAttackY(npc)
 	return atkMin, atkMax
 end
 
+-- The server resolves M1 hits from a fixed box in front of wherever the character
+-- actually stands (Inputs.Attack carries no arguments), so the swing volume itself
+-- cannot be widened from here. What we can choose is the approach side: sweep the
+-- candidate angles around the pack and keep whichever one rakes the box over the
+-- most bodies. Only a strict improvement wins, so the rig does not orbit.
+local function bestPackFacing(pack, centre, stand, current)
+	if #pack < 2 then
+		return current
+	end
+	local hb = equippedHitboxSize()
+	local halfW = math.max(hb.X * 0.5, 2)
+	local reach = math.max(hb.Z, 6)
+	local function covers(dir)
+		local standPos = centre + dir * stand
+		local fwd = dir * -1
+		local right = Vector3.new(-fwd.Z, 0, fwd.X)
+		local n = 0
+		for _, p in ipairs(pack) do
+			local rel = p - standPos
+			local f = rel.X * fwd.X + rel.Z * fwd.Z
+			local s = rel.X * right.X + rel.Z * right.Z
+			if f >= -2 and f <= reach and math.abs(s) <= halfW then
+				n += 1
+			end
+		end
+		return n
+	end
+	local bestDir = current
+	local bestN = covers(current)
+	for i = 0, 11 do
+		local a = (math.pi * 2 / 12) * i
+		local dir = Vector3.new(math.cos(a), 0, math.sin(a))
+		local n = covers(dir)
+		if n > bestN then
+			bestDir, bestN = dir, n
+		end
+	end
+	return bestDir
+end
+
 -- Hold station next to one enemy for the whole fight. The approach side is locked in
 -- once here on purpose: the old code recomputed it from our own live position every
 -- tick, which fed the previous write's error back into the next goal and made the
@@ -8202,9 +8242,10 @@ local function holdOnEnemy(npc)
 			cachedOffY = y - live.Position.Y
 			cachedStand = stand
 			cachedAim = nil
-			-- Face the clump, not a stray on the edge. Same-room fodder within 22.
+			-- Face the clump, not a stray on the edge. Same-room fodder within 28.
 			if enemyRank(npc) < 3 then
 				local sx, sz, n = live.Position.X, live.Position.Z, 1
+				local pack = { live.Position }
 				local room = Rooms.indexOf(npc)
 				eachFarmNpc(function(other)
 					if other == npc or not enemyAlive(other) or farmSkipped(other) then
@@ -8224,10 +8265,12 @@ local function holdOnEnemy(npc)
 						sx += p.Position.X
 						sz += p.Position.Z
 						n += 1
+						pack[#pack + 1] = p.Position
 					end
 				end)
 				if n >= 2 then
 					cachedAim = Vector3.new(sx / n, live.Position.Y, sz / n)
+					dir = bestPackFacing(pack, cachedAim, stand, dir)
 				end
 			end
 		end

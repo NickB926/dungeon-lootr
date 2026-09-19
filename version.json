@@ -1,6 +1,6 @@
 {
-    "version":  "1.0.81",
-    "message":  "stop warping to room centre mid-fight, target densest pack when aggroed",
+    "version":  "1.0.82",
+    "message":  "pick the approach angle whose swing box covers the most mobs",
     "files":  [
                   "dungeon-lootr/launch.lua",
                   "dungeon-lootr/DungeonLootr.lua",
