@@ -141,7 +141,7 @@ Library.ToggleKeybind = { Value = 'Home' }
 Library.Animations = Library.Animations or {}
 Library.Animations.TabSwitch = false
 
-local DL_BUILD = '1.0.86'
+local DL_BUILD = '1.0.87'
 getgenv().DLBuild = DL_BUILD
 -- Do NOT wipe DLShrineSkipKeys on every reload — that re-warps spent altars.
 
@@ -9499,6 +9499,51 @@ local function studentCasting(npc)
 	return hit
 end
 
+-- How far into a heal/cast anim (higher = closer to the heal landing).
+local function studentCastProgress(npc)
+	local best = 0
+	pcall(function()
+		local ctrl = npc and npc:FindFirstChildOfClass('AnimationController')
+		local hum = enemyHumanoid(npc)
+		local an = (ctrl and ctrl:FindFirstChildOfClass('Animator'))
+			or (hum and hum:FindFirstChildOfClass('Animator'))
+			or (npc and npc:FindFirstChildOfClass('Animator'))
+		if not an then
+			return
+		end
+		for _, track in ipairs(an:GetPlayingAnimationTracks()) do
+			if track.IsPlaying == false then
+				continue
+			end
+			local n = string.lower(tostring(track.Name or (track.Animation and track.Animation.Name) or ''))
+			if n:find('idle', 1, true)
+				or n:find('walk', 1, true)
+				or n:find('run', 1, true)
+				or n:find('loco', 1, true)
+				or n:find('move', 1, true)
+			then
+				continue
+			end
+			local t = tonumber(track.TimePosition) or 0
+			if t > best then
+				best = t
+			end
+		end
+	end)
+	return best
+end
+
+local function furthestCaster(casters)
+	local best, bestP = nil, -1
+	for i = 1, #(casters or {}) do
+		local p = studentCastProgress(casters[i])
+		if p > bestP then
+			best, bestP = casters[i], p
+		end
+	end
+	return best or (casters and casters[1]) or nil
+end
+
 local function studentStandAt(npc)
 	local part = enemyRoot(npc)
 	if not part then
@@ -9535,19 +9580,22 @@ local function closestStudent(list, from)
 	return best
 end
 
--- Spread students: one heal restores the boss. When several cast at once,
--- hop ONLY among casters (not the idle pack) so every windup gets a hit.
--- Single caster: stick until the cast breaks, then resume patrol/burn.
+-- Spread students: one heal restores the boss. Multi-caster hops stay planted
+-- until Hit_Count bumps (M1 actually connected) — 70ms hops left before the
+-- swing registered. Prefer the cast furthest along when choosing next target.
 local function holdOnStudentPack()
 	rt.studentHopAt = 0
 	rt.studentHopIdx = 0
 	rt.studentSticky = nil
 	rt.studentStickyClearAt = 0
+	rt.studentHopNpc = nil
+	rt.studentHopHits0 = 0
 	Pin.follow(function()
 		local list = listMageStudents()
 		if #list == 0 then
 			rt.studentHopping = false
 			rt.studentSticky = nil
+			rt.studentHopNpc = nil
 			return nil
 		end
 		local me = routeRoot()
@@ -9562,32 +9610,62 @@ local function holdOnStudentPack()
 		local target = nil
 		local mode = 'patrol'
 		local now = os.clock()
+		local hitsNow = tonumber(LocalPlayer:GetAttribute('Hit_Count')) or 0
 
 		if #casters >= 2 then
-			-- Parallel heals across the arena — round-robin casters only.
-			-- ~70ms dwell: long enough for M1+skills to connect, short enough
-			-- that the far caster cannot finish while we sit on one.
 			rt.studentSticky = nil
 			rt.studentStickyClearAt = 0
 			rt.studentHopping = true
-			if now - (rt.studentHopAt or 0) >= 0.07 or (rt.studentHopIdx or 0) < 1 then
-				rt.studentHopAt = now
-				rt.studentHopIdx = ((rt.studentHopIdx or 0) % #casters) + 1
+			local cur = rt.studentHopNpc
+			local stillCasting = cur
+				and cur.Parent
+				and enemyAlive(cur)
+				and not farmSkipped(cur)
+				and studentCasting(cur)
+			local hitLanded = hitsNow > (rt.studentHopHits0 or 0)
+			local dwell = now - (rt.studentHopAt or 0)
+			-- Need ~0.2s+ for Attack remote → hitbox → Hit_Count. Leave early
+			-- only once a hit registers or the cast already broke.
+			local done = (not stillCasting)
+				or hitLanded
+				or dwell >= 0.28
+			if stillCasting and not done then
+				target = cur
+			else
+				-- Next: furthest-along cast among others (skip current if still listed).
+				local pool = {}
+				for i = 1, #casters do
+					if casters[i] ~= cur then
+						pool[#pool + 1] = casters[i]
+					end
+				end
+				if #pool == 0 then
+					pool = casters
+				end
+				target = furthestCaster(pool) or closestStudent(pool, mePos) or pool[1]
+				if target ~= cur then
+					rt.studentHopNpc = target
+					rt.studentHopAt = now
+					rt.studentHopHits0 = hitsNow
+					rt.studentHopSwing = true
+					rt.studentBurst = true
+				elseif hitLanded then
+					-- Same target still casting after a hit — refresh baseline, keep swinging.
+					rt.studentHopHits0 = hitsNow
+					rt.studentHopAt = now
+				end
 			end
-			local idx = rt.studentHopIdx
-			if idx < 1 or idx > #casters then
-				idx = 1
-				rt.studentHopIdx = 1
-			end
-			target = casters[idx]
 			mode = 'interrupt'
-			rt.studentHopLabel = ('students · INTERRUPT hop %d/%d'):format(idx, #casters)
+			rt.studentHopLabel = ('students · INTERRUPT hit %d casting'):format(#casters)
 		elseif #casters == 1 then
-			-- One windup: bury them until it dies, then snap off.
 			local caster = casters[1]
+			rt.studentHopNpc = caster
 			if rt.studentSticky ~= caster then
 				rt.studentSticky = caster
 				rt.studentStickyClearAt = 0
+				rt.studentHopAt = now
+				rt.studentHopHits0 = hitsNow
+				rt.studentBurst = true
 			end
 			if studentCasting(caster) then
 				target = caster
@@ -9597,12 +9675,13 @@ local function holdOnStudentPack()
 				if (rt.studentStickyClearAt or 0) == 0 then
 					rt.studentStickyClearAt = now
 				end
-				if now - rt.studentStickyClearAt < 0.15 then
+				if now - rt.studentStickyClearAt < 0.12 then
 					target = caster
 					mode = 'interrupt'
 				else
 					rt.studentSticky = nil
 					rt.studentStickyClearAt = 0
+					rt.studentHopNpc = nil
 				end
 			end
 			if target then
@@ -9611,6 +9690,7 @@ local function holdOnStudentPack()
 		else
 			rt.studentSticky = nil
 			rt.studentStickyClearAt = 0
+			rt.studentHopNpc = nil
 		end
 
 		if not target then
@@ -9648,7 +9728,10 @@ local function holdOnStudentPack()
 		end
 		rt.farmCrowdAim = aim
 		rt.stickyPlant = nil
-		rt.studentHopSwing = true
+		-- Keep swing latch hot the whole interrupt dwell so farmKill never idles.
+		if mode == 'interrupt' then
+			rt.studentHopSwing = true
+		end
 		return stand, aim
 	end)
 end
@@ -11523,12 +11606,13 @@ local function farmKill(npc)
 			-- Student / crystal hops: swing every teleport so each target gets hit.
 			local swingDue = (studentPack and rt.studentHopSwing == true)
 				or (crystalPack and rt.crystalHopSwing == true)
-			-- Interrupt: dump M1 hard; skills throttle so CD isn't burned idle.
 			local interrupting = studentPack and (
 				rt.studentSticky ~= nil
 				or (type(rt.studentHopLabel) == 'string' and rt.studentHopLabel:find('INTERRUPT', 1, true))
 			)
-			local gap = interrupting and 0.04
+			-- Interrupt needs the swing to register before we leave — spam M1,
+			-- and on each new hop dump a short burst after the teleport lands.
+			local gap = interrupting and 0.03
 				or (crystalPack and 0.12)
 				or (studentPack and (rt.studentHopping and 0.08 or 0.1))
 				or attackDelay()
@@ -11539,18 +11623,38 @@ local function farmKill(npc)
 				pcall(fireAttack)
 				if studentPack then
 					pcall(fireAttack)
-					if interrupting or rt.studentHopping then
-						task.delay(0.035, function()
-							pcall(fireAttack)
-						end)
-					end
-					if interrupting and type(fireSkill) == 'function' then
+					if interrupting then
+						pcall(fireAttack)
+						if rt.studentBurst then
+							rt.studentBurst = false
+							-- Staggered taps after CFrame snap — immediate FireServer
+							-- often lands before the hitbox is at the new stand.
+							for _, delay in ipairs({ 0.05, 0.1, 0.16, 0.22 }) do
+								task.delay(delay, function()
+									pcall(fireAttack)
+								end)
+							end
+							if type(fireSkill) == 'function' then
+								pcall(fireSkill, 1)
+								task.delay(0.08, function()
+									pcall(fireSkill, 2)
+								end)
+							end
+						else
+							task.delay(0.04, function()
+								pcall(fireAttack)
+							end)
+						end
 						local skillAt = rt.studentSkillAt or 0
-						if now - skillAt >= 0.35 then
+						if type(fireSkill) == 'function' and now - skillAt >= 0.28 then
 							rt.studentSkillAt = now
 							pcall(fireSkill, 1)
 							pcall(fireSkill, 2)
 						end
+					elseif rt.studentHopping then
+						task.delay(0.04, function()
+							pcall(fireAttack)
+						end)
 					end
 				end
 			end
@@ -11596,7 +11700,7 @@ local function farmKill(npc)
 					break
 				end
 			end
-			task.wait(0.05)
+			task.wait(interrupting and 0.03 or 0.05)
 		end
 	end
 	rt.farmFighting = false
@@ -11618,6 +11722,9 @@ local function farmKill(npc)
 	rt.studentSticky = nil
 	rt.studentStickyClearAt = 0
 	rt.studentSkillAt = 0
+	rt.studentHopNpc = nil
+	rt.studentHopHits0 = 0
+	rt.studentBurst = false
 	rt.crystalHopping = false
 	rt.crystalHopSwing = false
 	rt.crystalHopLabel = nil

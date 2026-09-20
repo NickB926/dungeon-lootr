@@ -1,6 +1,6 @@
 {
-    "version":  "1.0.86",
-    "message":  "P3 spread students: hop all casting heals, sticky only when one caster",
+    "version":  "1.0.87",
+    "message":  "P3 interrupt: hit-confirm dwell + burst M1 after teleport, prefer furthest cast",
     "files":  [
                   "dungeon-lootr/launch.lua",
                   "dungeon-lootr/DungeonLootr.lua",
