@@ -9417,21 +9417,116 @@ local function listMageStudents()
 	return out
 end
 
--- Teleport between every Mage Student in a tight loop so each heal cast is hit.
+-- Prefer a student mid-heal cast so the interrupt lands before the heal goes off.
+local function studentCasting(npc)
+	if not npc then
+		return false
+	end
+	local hit = false
+	pcall(function()
+		if npc:GetAttribute('Casting') == true or npc:GetAttribute('IsCasting') == true then
+			hit = true
+			return
+		end
+		local ctrl = npc:FindFirstChildOfClass('AnimationController')
+		local hum = enemyHumanoid(npc)
+		local an = (ctrl and ctrl:FindFirstChildOfClass('Animator'))
+			or (hum and hum:FindFirstChildOfClass('Animator'))
+			or npc:FindFirstChildOfClass('Animator')
+		if not an then
+			return
+		end
+		for _, track in ipairs(an:GetPlayingAnimationTracks()) do
+			local n = string.lower(tostring(track.Name or (track.Animation and track.Animation.Name) or ''))
+			if n:find('heal', 1, true)
+				or n:find('cast', 1, true)
+				or n:find('channel', 1, true)
+				or n:find('spell', 1, true)
+				or n:find('buff', 1, true)
+			then
+				hit = true
+				return
+			end
+		end
+	end)
+	return hit
+end
+
+local function studentStandAt(npc)
+	local part = enemyRoot(npc)
+	if not part then
+		return nil, nil
+	end
+	local hover = rt.combatHover()
+	local pos = part.Position
+	local fy = rt.refreshFarmFloor and rt.refreshFarmFloor(pos) or nil
+	local y
+	if type(fy) == 'number' then
+		y = fy + (hover ~= 0 and hover or 3)
+	elseif hover < 0 then
+		y = pos.Y + hover
+	else
+		y = pos.Y
+	end
+	local stand = Vector3.new(pos.X, y, pos.Z)
+	if hover >= 0 then
+		local me = routeRoot()
+		local flat = me and Vector3.new(me.Position.X - pos.X, 0, me.Position.Z - pos.Z)
+		if flat and flat.Magnitude > 0.4 then
+			stand = pos + flat.Unit * 5
+			stand = Vector3.new(stand.X, y, stand.Z)
+		else
+			stand = Vector3.new(pos.X + 5, y, pos.Z)
+		end
+	end
+	return stand, pos
+end
+
+-- Solo: park and burn (hopping one target jitters M1s and lets heals finish).
+-- Multi: teleport-hop fast; interrupt is one hit each — cycle before any cast completes.
 local function holdOnStudentPack()
-	rt.studentHopping = true
 	rt.studentHopAt = 0
 	rt.studentHopIdx = 0
 	Pin.follow(function()
 		local list = listMageStudents()
 		if #list == 0 then
+			rt.studentHopping = false
 			return nil
 		end
+		-- One left: lock on, spam swings. No teleport thrash.
+		if #list == 1 then
+			rt.studentHopping = false
+			local npc = list[1]
+			rt.farmFightNpc = npc
+			local stand, aim = studentStandAt(npc)
+			if not stand then
+				return nil
+			end
+			rt.farmCrowdAim = aim
+			rt.stickyPlant = nil
+			rt.studentHopSwing = true
+			rt.studentHopLabel = 'students · solo burn'
+			return stand, aim
+		end
+		rt.studentHopping = true
 		local now = os.clock()
-		-- ~3–4 hops/sec — short enough that every student eats an M1 before heal.
-		if now - (rt.studentHopAt or 0) >= 0.22 or (rt.studentHopIdx or 0) < 1 then
+		-- ~8 hops/sec — one interrupt hit per student before the next heal winds up.
+		local hopEvery = 0.12
+		if now - (rt.studentHopAt or 0) >= hopEvery or (rt.studentHopIdx or 0) < 1 then
 			rt.studentHopAt = now
-			rt.studentHopIdx = ((rt.studentHopIdx or 0) % #list) + 1
+			-- Cast priority: jump to whoever is healing right now.
+			local castIdx = nil
+			for i = 1, #list do
+				if studentCasting(list[i]) then
+					castIdx = i
+					break
+				end
+			end
+			if castIdx then
+				rt.studentHopIdx = castIdx
+			else
+				rt.studentHopIdx = ((rt.studentHopIdx or 0) % #list) + 1
+			end
 			rt.studentHopSwing = true
 		end
 		local idx = rt.studentHopIdx
@@ -9440,39 +9535,19 @@ local function holdOnStudentPack()
 			rt.studentHopIdx = 1
 		end
 		local npc = list[idx]
-		local part = enemyRoot(npc)
-		if not part then
+		local stand, aim = studentStandAt(npc)
+		if not stand then
 			return nil
 		end
 		rt.farmFightNpc = npc
-		rt.farmCrowdAim = part.Position
+		rt.farmCrowdAim = aim
 		rt.stickyPlant = nil
-		local hover = rt.combatHover()
-		local pos = part.Position
-		local fy = rt.refreshFarmFloor and rt.refreshFarmFloor(pos) or nil
-		local y
-		if type(fy) == 'number' then
-			y = fy + (hover ~= 0 and hover or 3)
-		elseif hover < 0 then
-			-- Look-up M1: sit under this student.
-			y = pos.Y + hover
-		else
-			y = pos.Y
-		end
-		-- Negative hover: plant under them. Otherwise stand on their XZ.
-		local stand = Vector3.new(pos.X, y, pos.Z)
-		if hover >= 0 then
-			local me = routeRoot()
-			local flat = me and Vector3.new(me.Position.X - pos.X, 0, me.Position.Z - pos.Z)
-			if flat and flat.Magnitude > 0.4 then
-				stand = pos + flat.Unit * 5
-				stand = Vector3.new(stand.X, y, stand.Z)
-			else
-				stand = Vector3.new(pos.X + 5, y, pos.Z)
-			end
-		end
-		rt.studentHopLabel = ('students · hop %d/%d'):format(idx, #list)
-		return stand, pos
+		rt.studentHopLabel = ('students · hop %d/%d%s'):format(
+			idx,
+			#list,
+			studentCasting(npc) and ' · cast' or ''
+		)
+		return stand, aim
 	end)
 end
 
@@ -11347,12 +11422,21 @@ local function farmKill(npc)
 			local swingDue = (studentPack and rt.studentHopSwing == true)
 				or (crystalPack and rt.crystalHopSwing == true)
 			local hopPack = studentPack or crystalPack
-			if not volley and (swingDue or now - lastHit >= (hopPack and 0.12 or attackDelay())) then
+			-- Solo student burn: full attack-speed spam. Multi-hop: swing every land.
+			local gap = crystalPack and 0.12
+				or (studentPack and (rt.studentHopping and 0.08 or 0.1))
+				or attackDelay()
+			if not volley and (swingDue or now - lastHit >= gap) then
 				lastHit = now
 				rt.studentHopSwing = false
 				rt.crystalHopSwing = false
-				-- SkillIFrame sticks true on some classes and used to skip every M1.
 				pcall(fireAttack)
+				-- Second tap on hop land — interrupt needs a connect, not a windup miss.
+				if studentPack and rt.studentHopping then
+					task.delay(0.05, function()
+						pcall(fireAttack)
+					end)
+				end
 			end
 			-- Stall detection needs a readable HP bar; a boss without one only gets
 			-- the timeout above. Specials / minis are never stall-abandoned — that
@@ -17619,8 +17703,8 @@ rt.RaidLoop = (function()
 	end
 
 	function api.replay(silent)
-		-- Prefer clicking REPLAY so party state stays intact. RequestReturn
-		-- (old fallback) sent you to lobby and kicked party members.
+		-- Click the on-screen REPLAY button only. Never RequestReturn — that
+		-- sends you to lobby and kicks party members.
 		local clicked = false
 		pcall(function()
 			local pg = LocalPlayer:FindFirstChild('PlayerGui')
@@ -17628,15 +17712,27 @@ rt.RaidLoop = (function()
 			if not main then
 				return
 			end
+			local function chainVisible(gui)
+				local n = gui
+				while n and n ~= main do
+					if n:IsA('GuiObject') and n.Visible == false then
+						return false
+					end
+					n = n.Parent
+				end
+				return true
+			end
 			for _, d in ipairs(main:GetDescendants()) do
-				if d:IsA('GuiButton') and d.Visible ~= false and d.Active ~= false then
+				if d:IsA('GuiButton') and d.Active ~= false and chainVisible(d) then
 					local lab = d:FindFirstChildWhichIsA('TextLabel', true)
 					local t = string.upper(tostring(lab and lab.Text or d.Name or ''))
-					-- Never click RETURN / LEAVE — that dissolves the party run.
-					if t:find('REPLAY', 1, true) then
-						if clickGui(d) then
-							clicked = true
-							break
+					-- Exact REPLAY only — never RETURN / LEAVE / CHANGE DUNGEON.
+					if t == 'REPLAY' or t:find('REPLAY', 1, true) then
+						if not t:find('RETURN', 1, true) and not t:find('LEAVE', 1, true) then
+							if clickGui(d) then
+								clicked = true
+								break
+							end
 						end
 					end
 				end
@@ -17648,6 +17744,7 @@ rt.RaidLoop = (function()
 			end
 			return true
 		end
+		-- Button click missed (protected GUI): same remote the REPLAY button fires.
 		local rf = RunLoops.knitRF('RaidRunService', 'RequestReplay')
 		if rf then
 			local ok, res = pcall(function()
@@ -17661,6 +17758,39 @@ rt.RaidLoop = (function()
 			end
 		end
 		return false
+	end
+
+	local function replayButtonShowing()
+		local found = false
+		pcall(function()
+			local pg = LocalPlayer:FindFirstChild('PlayerGui')
+			local main = pg and pg:FindFirstChild('Main')
+			if not main then
+				return
+			end
+			for _, d in ipairs(main:GetDescendants()) do
+				if d:IsA('GuiButton') and d.Active ~= false then
+					local vis = true
+					local n = d
+					while n and n ~= main do
+						if n:IsA('GuiObject') and n.Visible == false then
+							vis = false
+							break
+						end
+						n = n.Parent
+					end
+					if vis then
+						local lab = d:FindFirstChildWhichIsA('TextLabel', true)
+						local t = string.upper(tostring(lab and lab.Text or d.Name or ''))
+						if t:find('REPLAY', 1, true) and not t:find('RETURN', 1, true) then
+							found = true
+							return
+						end
+					end
+				end
+			end
+		end)
+		return found
 	end
 
 	function api.onLobby()
@@ -17688,55 +17818,13 @@ rt.RaidLoop = (function()
 			armedAt = 0
 			return
 		end
-		-- Mid-raid: on completion, click REPLAY / RequestReplay only (party-safe).
+		-- Mid-raid: the moment REPLAY pops up, click it. No RequestReturn.
 		if inRaidNow() then
 			armedAt = 0
-			local rf = RunLoops.knitRF('RaidRunService', 'GetSessionState')
-			local done = false
-			if rf then
-				local ok, st = pcall(function()
-					return rf:InvokeServer()
-				end)
-				if ok and type(st) == 'table' then
-					local phase = tostring(st.Phase or st.State or st.Status or '')
-					done = phase:lower():find('complete', 1, true)
-						or phase:lower():find('victory', 1, true)
-						or phase:lower():find('defeat', 1, true)
-						or st.Complete == true
-						or st.Finished == true
-				end
-			end
-			-- HUD / completion buttons also mean the run ended.
-			if not done then
-				pcall(function()
-					local pg = LocalPlayer:FindFirstChild('PlayerGui')
-					local main = pg and pg:FindFirstChild('Main')
-					if not main then
-						return
-					end
-					for _, d in ipairs(main:GetDescendants()) do
-						if d:IsA('TextLabel') or d:IsA('TextButton') then
-							local t = string.upper(tostring(d.Text or ''))
-							if (t:find('REPLAY', 1, true) or t:find('VICTORY', 1, true) or t:find('DEFEAT', 1, true))
-								and d.Visible ~= false
-							then
-								done = true
-								break
-							end
-						end
-					end
-				end)
-			end
-			if done and os.clock() - (rt.raidReplayAt or 0) > 2.5 then
+			if replayButtonShowing() and os.clock() - (rt.raidReplayAt or 0) > 1.2 then
 				rt.raidReplayAt = os.clock()
 				task.spawn(function()
-					-- Retry Replay only — never RequestReturn (that leaves the party).
-					for _ = 1, 4 do
-						if api.replay(true) then
-							break
-						end
-						task.wait(0.45)
-					end
+					api.replay(true)
 				end)
 			end
 			return
@@ -21627,7 +21715,7 @@ ReplayBox:AddLabel('Hunt sets Loop dungeon to Underworld Gate + Nightmare, farms
 ReplayBox:AddToggle('DLRaidLoop', {
 	Text = 'Event raid loop',
 	Default = false,
-	Tooltip = 'Loops Event RAID (The First Test): Normal/Extreme/Impossible + ENTER. On clear, clicks REPLAY only (keeps the party — never RequestReturn). Turns Auto farm on when you enter.',
+	Tooltip = 'Loops Event RAID: ENTER from lobby. As soon as the REPLAY button pops up, clicks it (keeps the party — never RequestReturn). Turns Auto farm on when you enter.',
 }):OnChanged(function(v)
 	if not v then
 		Library:Notify('Event raid loop off')

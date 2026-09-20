@@ -1,6 +1,6 @@
 {
     "version":  "1.0.85",
-    "message":  "P4 crystals: teleport-hop cycle like Mage Students",
+    "message":  "students: solo burn lock; multi hop faster + cast priority + double M1",
     "files":  [
                   "dungeon-lootr/launch.lua",
                   "dungeon-lootr/DungeonLootr.lua",
