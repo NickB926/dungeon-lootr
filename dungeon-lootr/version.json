@@ -1,6 +1,6 @@
 {
-    "version":  "1.0.87",
-    "message":  "P3 interrupt: hit-confirm dwell + burst M1 after teleport, prefer furthest cast",
+    "version":  "1.0.88",
+    "message":  "P3 students: party split burn (timer kill), not interrupt hop",
     "files":  [
                   "dungeon-lootr/launch.lua",
                   "dungeon-lootr/DungeonLootr.lua",
