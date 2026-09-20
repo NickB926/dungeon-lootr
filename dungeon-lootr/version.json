@@ -1,5 +1,5 @@
 {
-    "version":  "1.0.81",
+    "version":  "1.0.82",
     "message":  "Menu toggle: Auto inject on join (no_autoload off-switch)",
     "files":  [
                   "dungeon-lootr/launch.lua",
