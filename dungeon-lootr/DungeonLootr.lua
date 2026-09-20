@@ -141,7 +141,7 @@ Library.ToggleKeybind = { Value = 'Home' }
 Library.Animations = Library.Animations or {}
 Library.Animations.TabSwitch = false
 
-local DL_BUILD = '1.0.53'
+local DL_BUILD = '1.0.54'
 getgenv().DLBuild = DL_BUILD
 -- Do NOT wipe DLShrineSkipKeys on every reload — that re-warps spent altars.
 
@@ -600,6 +600,83 @@ local function skillReady(n)
 	return ('S%s ready'):format(n)
 end
 
+-- Bound on rt (not new chunk locals) — this file is already near Luau's 200-local limit.
+rt.fmtClock = function(sec)
+	sec = math.max(0, math.floor(tonumber(sec) or 0))
+	local h = math.floor(sec / 3600)
+	local m = math.floor((sec % 3600) / 60)
+	local s = sec % 60
+	if h > 0 then
+		return ('%d:%02d:%02d'):format(h, m, s)
+	end
+	return ('%d:%02d'):format(m, s)
+end
+
+rt.refreshMysteryMerchant = function(force)
+	local now = os.clock()
+	if not force and type(rt.mmInfo) == 'table' and now - (rt.mmAt or 0) < 10 then
+		return rt.mmInfo
+	end
+	if rt.mmBusy and now - (rt.mmBusyAt or 0) < 8 then
+		return rt.mmInfo
+	end
+	local rf = rt.mmRF
+	if not (rf and rf.Parent) then
+		rf = nil
+		local packages = game:GetService('ReplicatedStorage'):FindFirstChild('Packages')
+		local index = packages and packages:FindFirstChild('_Index')
+		if index then
+			for _, pack in ipairs(index:GetChildren()) do
+				local knit = pack:FindFirstChild('knit')
+				local services = knit and knit:FindFirstChild('Services')
+				local svc = services and services:FindFirstChild('MysteryMerchantService')
+				local found = svc and svc:FindFirstChild('RF') and svc.RF:FindFirstChild('GetShopInfo')
+				if found and found:IsA('RemoteFunction') then
+					rf = found
+					rt.mmRF = found
+					break
+				end
+			end
+		end
+	end
+	if not rf then
+		return rt.mmInfo
+	end
+	rt.mmBusy = true
+	rt.mmBusyAt = now
+	task.spawn(function()
+		local ok, info = pcall(function()
+			return rf:InvokeServer()
+		end)
+		if ok and type(info) == 'table' then
+			rt.mmInfo = info
+			rt.mmAt = os.clock()
+		end
+		rt.mmBusy = nil
+	end)
+	return rt.mmInfo
+end
+
+rt.mysteryMerchantLine = function()
+	local info = rt.refreshMysteryMerchant(false)
+	if type(info) ~= 'table' then
+		return 'mystery  ·  …'
+	end
+	local now = os.time()
+	if info.Active == true then
+		local left = (tonumber(info.LeavesAt) or 0) - now
+		if left < 0 then
+			left = 0
+		end
+		return ('mystery  ·  HERE  %s'):format(rt.fmtClock(left))
+	end
+	local untilArr = (tonumber(info.NextArrival) or 0) - now
+	if untilArr < 0 then
+		untilArr = 0
+	end
+	return ('mystery  ·  in  %s'):format(rt.fmtClock(untilArr))
+end
+
 local function statsText()
 	local char = character()
 	local hp, maxHp = rt.readHp()
@@ -620,6 +697,7 @@ local function statsText()
 		skillReady(1) .. '    ' .. skillReady(2),
 		skillReady(3) .. '    ' .. skillReady(4),
 		parryText .. (iframe and '  ·  i-frame' or ''),
+		rt.mysteryMerchantLine(),
 	}
 	if on('DLAutoParry') then
 		lines[#lines + 1] = os.clock() < rt.parryArmed and 'auto parry  ·  armed' or 'auto parry on'
@@ -679,6 +757,16 @@ local function statsText()
 				boss, (diff ~= '' and diff ~= 'nil') and diff or '?')
 		else
 			lines[#lines + 1] = 'challenge loop on'
+		end
+	end
+	if on('DLPayloadLoop') then
+		local map = Options.DLPayloadMap and tostring(Options.DLPayloadMap.Value or '') or ''
+		local diff = Options.DLPayloadDifficulty and tostring(Options.DLPayloadDifficulty.Value or '') or ''
+		if map ~= '' and map ~= 'nil' then
+			lines[#lines + 1] = ('payload loop  ·  %s · %s'):format(
+				map, (diff ~= '' and diff ~= 'nil') and diff or '?')
+		else
+			lines[#lines + 1] = 'payload loop on'
 		end
 	end
 	if on('DLHuntSpecial') then
@@ -3932,6 +4020,27 @@ function rt.noteCanRise(npc)
 	rt.canRise[npc] = os.clock()
 end
 
+-- Shared append for damage-learned and CanAttack fall-edge samples.
+function rt.noteHitLagSample(name, lag)
+	lag = tonumber(lag)
+	if not name or not lag then
+		return
+	end
+	if lag < 0.12 or lag > 2.5 then
+		return
+	end
+	local list = rt.hitLag[name]
+	if not list then
+		list = {}
+		rt.hitLag[name] = list
+	end
+	list[#list + 1] = lag
+	if #list > 10 then
+		table.remove(list, 1)
+	end
+	rt.pdbg('learn %s hit at rise+%.2f (n=%d)', name, lag, #list)
+end
+
 function rt.learnHitLag()
 	local now = os.clock()
 	local best, bestT = nil, nil
@@ -3945,29 +4054,15 @@ function rt.learnHitLag()
 	if not best then
 		return
 	end
-	local lag = now - bestT
-	-- Under 0.15s is the hit we already ate before the cue; over 2.5s is unrelated.
-	if lag < 0.15 or lag > 2.5 then
-		return
-	end
-	local name = tostring(best.Name)
-	local list = rt.hitLag[name]
-	if not list then
-		list = {}
-		rt.hitLag[name] = list
-	end
-	list[#list + 1] = lag
-	if #list > 10 then
-		table.remove(list, 1)
-	end
-	rt.pdbg('learn %s hit at rise+%.2f (n=%d)', name, lag, #list)
+	rt.noteHitLagSample(tostring(best.Name), now - bestT)
 end
 
 -- Press delay that keeps the whole observed spread inside one window:
 -- press <= earliestHit - open, and press >= latestHit - (open + hold).
 function rt.learnedLead(name)
 	local list = rt.hitLag[tostring(name)]
-	if not list or #list < 3 then
+	-- 2 samples is enough once fall-edge learning runs during farm.
+	if not list or #list < 2 then
 		return nil
 	end
 	local lo, hi = math.huge, -math.huge
@@ -4044,17 +4139,22 @@ function rt.noteFCueAnim(npc, track)
 		if now - (rt.fOnAt or 0) > 6 then
 			return
 		end
-		-- F is the telegraph. The swing clip starts ~0.35s later; pressing the
-		-- instant the letter shows expires before the long channel's 89s.
+		-- Fire-edge schedule (F+~0.45) owns the press. Short clips used to
+		-- overwrite followAt to `now` and burn F ~0.5s early on Gatekeeper.
+		local pending = (rt.fFollowParryAt or 0) > now
 		if len >= 1.05 then
 			rt.fLongUntil = now + len
-			rt.fFollowParryAt = now + 0.40
-			rt.fFollowParryUntil = now + len + 0.2
+			local aim = now + 0.40
+			if pending then
+				aim = math.max(aim, rt.fFollowParryAt)
+			end
+			rt.fFollowParryAt = aim
+			rt.fFollowParryUntil = math.max(rt.fFollowParryUntil or 0, now + len + 0.2)
 			return
 		end
-		if len < 0.35 then
-			rt.fFollowParryAt = now
-			rt.fFollowParryUntil = now + 0.55
+		-- Mid/short clips: widen the late window only — never pull earlier.
+		if pending then
+			rt.fFollowParryUntil = math.max(rt.fFollowParryUntil or 0, now + 0.95)
 		end
 		return
 	end
@@ -5541,12 +5641,12 @@ local function watchEnemy(npc)
 					rt.dodgeOnlyUntil = math.max(rt.dodgeOnlyUntil or 0, os.clock() + 0.9)
 					return
 				end
-				-- Do not press yet. 60s probe: every F+0.07 press was early;
-				-- the swing clip starts ~F+0.35 (short 0.28s / long 2.28s).
-				-- Fallback if Animator misses the clip.
+				-- Do not press yet. Hit lands ~F+0.45–0.70; keep a wide late
+				-- window so a missed tick still catches before the letter hides.
+				-- Animator must not pull this earlier (see noteFCueAnim).
 				local now = os.clock()
-				rt.fFollowParryAt = now + 0.50
-				rt.fFollowParryUntil = now + 0.85
+				rt.fFollowParryAt = now + 0.42
+				rt.fFollowParryUntil = now + 1.05
 			elseif lastFire == true then
 				-- Do not press on a blind timer: that was the too-early 2nd.
 				-- Short combo plays the follow-up clip ~0.36s after F hides;
@@ -5733,12 +5833,19 @@ local function watchEnemy(npc)
 				elseif bossy then
 					armParry(windDelay(), 'boss-wind', npc.Name .. '/can-rise')
 				else
-					-- No samples yet: fodder wind-ups run ~0.06-0.5s, so fire almost at
-					-- once and let the hold cover the impact.
-					armParry(0.04, nil, npc.Name .. '/can-rise')
+					-- Unlearned fodder: ~0.30s matches live rise→impact lag so the
+					-- hold still covers the hit (0.04 opened and closed too early).
+					armParry(0.30, nil, npc.Name .. '/can-rise')
 				end
 			elseif v == false and prev == true then
-				-- Falling edge is the impact. Retime onto it if we have not fired.
+				-- Falling edge ≈ impact. Teach lag from rise→fall (no HP loss needed).
+				if not bossy then
+					local riseAt = rt.canRise[npc]
+					if type(riseAt) == 'number' then
+						rt.noteHitLagSample(tostring(npc.Name), now - riseAt)
+					end
+				end
+				-- Retime onto impact if we have not fired yet.
 				if bossy then
 					armParry(0, 'boss-hit', npc.Name .. '/can-fall')
 				else
@@ -15943,6 +16050,10 @@ local Replay = (function()
 			-- ChallengeLoop.tick owns challenge enter + RequestReplay.
 			return
 		end
+		if on('DLPayloadLoop') then
+			-- PayloadLoop.tick owns enter + RequestReturn (no RequestReplay).
+			return
+		end
 		if not wantReplay and not rushContinue then
 			runCompleteAt = nil
 			replayArmedAt = nil
@@ -16579,8 +16690,8 @@ local DungeonStart = (function()
 			armedAt = 0
 			return
 		end
-		-- Event raid / Challenge loops own lobby starts — do not pick Bandits Den.
-		if on('DLRaidLoop') or on('DLChallengeLoop') then
+		-- Event raid / Challenge / Payload loops own lobby starts — do not pick Bandits Den.
+		if on('DLRaidLoop') or on('DLChallengeLoop') or on('DLPayloadLoop') then
 			armedAt = 0
 			return
 		end
@@ -17487,6 +17598,770 @@ rt.ChallengeLoop = (function()
 			end
 			return
 		end
+		if not inLobby() then
+			armedAt = 0
+			return
+		end
+		if busy or os.clock() < nextCheck then
+			return
+		end
+		if os.clock() - lastStart < 8 then
+			return
+		end
+		if armedAt == 0 then
+			armedAt = os.clock()
+			return
+		end
+		local delay = Options.DLDungeonDelay and tonumber(Options.DLDungeonDelay.Value) or 2
+		if os.clock() - armedAt < delay then
+			return
+		end
+		nextCheck = os.clock() + 5
+		api.enter(true)
+	end
+
+	return api
+end)()
+
+-- Payload loop (Floating Aisles / Torus): Easy–Nightmare + ENTER.
+-- PayloadRunService has RequestReturn but no RequestReplay — clear → return → re-enter.
+rt.PayloadLoop = (function()
+	local ReplicatedStorage = game:GetService('ReplicatedStorage')
+	local api = {}
+	local nextCheck, lastStart, busy, armedAt = 0, 0, false, 0
+	local lastLabel = ''
+	local DIFFS = { 'Easy', 'Normal', 'Hard', 'Nightmare' }
+
+	local function payloadData()
+		local ok, pd = pcall(require, ReplicatedStorage.GameInfo.PayloadData)
+		if ok and type(pd) == 'table' then
+			return pd
+		end
+		return nil
+	end
+
+	local function listMaps()
+		local names = {}
+		local pd = payloadData()
+		if pd and type(pd.MapOrder) == 'table' then
+			for _, id in ipairs(pd.MapOrder) do
+				local m = pd.Maps and pd.Maps[id]
+				local label = (type(m) == 'table' and (m.DisplayName or m.Name)) or id
+				names[#names + 1] = tostring(label)
+			end
+		end
+		if #names == 0 then
+			names[1] = 'Floating Aisles'
+		end
+		return names
+	end
+
+	local function listDifficulties()
+		local pd = payloadData()
+		if pd and type(pd.DifficultyOrder) == 'table' then
+			local out = {}
+			for _, d in ipairs(pd.DifficultyOrder) do
+				out[#out + 1] = tostring(d)
+			end
+			if #out > 0 then
+				return out
+			end
+		end
+		return DIFFS
+	end
+
+	local function mapIdFromLabel(label)
+		label = tostring(label or '')
+		local pd = payloadData()
+		if pd and type(pd.Maps) == 'table' then
+			for id, m in pairs(pd.Maps) do
+				if tostring(id) == label then
+					return tostring(id)
+				end
+				if type(m) == 'table' then
+					local dn = tostring(m.DisplayName or m.Name or '')
+					if dn ~= '' and dn == label then
+						return tostring(id)
+					end
+				end
+			end
+		end
+		local low = string.lower(label)
+		if low:find('floating', 1, true) or low:find('aisle', 1, true) or low:find('torus', 1, true) then
+			return 'Floating_Aisles'
+		end
+		return 'Floating_Aisles'
+	end
+
+	local function inLobby()
+		return LocalPlayer:GetAttribute('InDungeon') ~= true
+			and LocalPlayer:GetAttribute('InPayload') ~= true
+			and LocalPlayer:GetAttribute('DungeonRun') ~= true
+			and not rt.inPayloadFarm()
+	end
+
+	local function inPayloadNow()
+		return rt.inPayloadFarm() == true
+	end
+
+	local function invoke(name, ...)
+		local rem = RunLoops.knitRF('DungeonQueueService', name)
+		if not rem then
+			return false, nil, nil
+		end
+		local args = table.pack(...)
+		local packed = table.pack(pcall(function()
+			return rem:InvokeServer(table.unpack(args, 1, args.n))
+		end))
+		if not packed[1] then
+			return false, nil, packed[2]
+		end
+		-- RF returns (ok, errMsg) — keep both so "Stand on a pad" is visible.
+		return true, packed[2], packed[3]
+	end
+
+	local function clickGui(btn)
+		if not btn then
+			return false
+		end
+		local function fire(sig)
+			if not sig then
+				return false
+			end
+			local ok, conns = pcall(getconnections, sig)
+			if not ok or type(conns) ~= 'table' or #conns == 0 then
+				return false
+			end
+			if type(firesignal) == 'function' then
+				pcall(firesignal, sig)
+				return true
+			end
+			local fired = false
+			for _, c in ipairs(conns) do
+				if c.Function then
+					task.spawn(c.Function)
+					fired = true
+				end
+			end
+			return fired
+		end
+		return fire(btn.Activated) or fire(btn.MouseButton1Click) or fire(btn.MouseButton1Down)
+	end
+
+	local function payloadPanel()
+		local pg = LocalPlayer:FindFirstChild('PlayerGui')
+		local main = pg and pg:FindFirstChild('Main')
+		local frames = main and main:FindFirstChild('Frames')
+		return frames and frames:FindFirstChild('Payload_Select') or nil
+	end
+
+	local function openPayloadViaUIController()
+		local ps = LocalPlayer:FindFirstChild('PlayerScripts')
+		local client = ps and ps:FindFirstChild('Client')
+		local ctrls = client and client:FindFirstChild('Controllers')
+		local mod = ctrls and ctrls:FindFirstChild('UIController')
+		if not mod then
+			return false
+		end
+		local ok, UI = pcall(require, mod)
+		if not ok or type(UI) ~= 'table' or type(UI.names) ~= 'table' then
+			return false
+		end
+		local pl = UI.names.Payload_Select
+		if type(pl) == 'table' and type(pl.open) == 'function' then
+			return pcall(function()
+				pl:open()
+			end)
+		end
+		return false
+	end
+
+	local function ensurePayloadOpen()
+		local p = payloadPanel()
+		if p and p.Visible then
+			return p
+		end
+		openPayloadViaUIController()
+		task.wait(0.35)
+		p = payloadPanel()
+		if p and not p.Visible then
+			pcall(function()
+				p.Visible = true
+				p.Position = UDim2.new(0.5, 0, 0.5, 0)
+				p.AnchorPoint = Vector2.new(0.5, 0.5)
+			end)
+		end
+		return payloadPanel()
+	end
+
+	-- Server rejects select/start unless you are on Payload_Pod_* (WarpIn / Touch).
+	-- Plain CFrame warp is not enough — occupancy is Touch-based; firetouchinterest
+	-- is what actually registers the pad. First lobby attempt often needs several pulses.
+	local function findPayloadPod()
+		local lobby = workspace:FindFirstChild('PayloadLobby')
+		if not lobby then
+			for _ = 1, 20 do
+				lobby = workspace:FindFirstChild('PayloadLobby')
+				if lobby then
+					break
+				end
+				task.wait(0.15)
+			end
+		end
+		if not lobby then
+			return nil, nil
+		end
+		local pod = lobby:FindFirstChild('Payload_Pod_1') or lobby:FindFirstChild('Payload_Pod_2')
+		if not pod then
+			for _, ch in ipairs(lobby:GetChildren()) do
+				if tostring(ch.Name):find('Payload_Pod', 1, true) then
+					pod = ch
+					break
+				end
+			end
+		end
+		return lobby, pod
+	end
+
+	local function pulsePodTouch(root, pod)
+		if not root or not pod or type(firetouchinterest) ~= 'function' then
+			return
+		end
+		local priority = {}
+		for _, name in ipairs({ 'WarpIn', 'Touch' }) do
+			local p = pod:FindFirstChild(name, true)
+			if p and p:IsA('BasePart') then
+				priority[#priority + 1] = p
+			end
+		end
+		for _, d in ipairs(pod:GetDescendants()) do
+			if d:IsA('BasePart') and d.CanTouch then
+				priority[#priority + 1] = d
+			end
+		end
+		for _, part in ipairs(priority) do
+			pcall(firetouchinterest, root, part, 0)
+			task.wait(0.03)
+			pcall(firetouchinterest, root, part, 1)
+			task.wait(0.02)
+		end
+	end
+
+	local function standOnPayloadPod()
+		local lobby, pod = findPayloadPod()
+		if not pod then
+			return false
+		end
+		local anchor = pod:FindFirstChild('WarpIn', true)
+			or pod:FindFirstChild('Touch', true)
+			or (pod:IsA('Model') and (pod.PrimaryPart or pod:FindFirstChildWhichIsA('BasePart')))
+			or (pod:IsA('BasePart') and pod)
+		if not anchor or not anchor:IsA('BasePart') then
+			return false
+		end
+		local char = character()
+		local root = char and char:FindFirstChild('HumanoidRootPart')
+		if not root then
+			return false
+		end
+		-- Enter AccessZone first so the lobby streams / zone scripts wake up.
+		local access = lobby and lobby:FindFirstChild('AccessZone')
+		if access and access:IsA('BasePart') then
+			pcall(function()
+				root.AssemblyLinearVelocity = Vector3.zero
+				root.CFrame = CFrame.new(access.Position)
+			end)
+			if type(firetouchinterest) == 'function' then
+				pcall(firetouchinterest, root, access, 0)
+				task.wait(0.05)
+				pcall(firetouchinterest, root, access, 1)
+			end
+			task.wait(0.2)
+		end
+		local base = anchor.Position
+		-- Slight jitters help cold-start touch replication.
+		local offsets = {
+			Vector3.new(0, 3, 0),
+			Vector3.new(0.5, 3, 0),
+			Vector3.new(-0.5, 3, 0.5),
+			Vector3.new(0, 2.5, -0.5),
+		}
+		for _, off in ipairs(offsets) do
+			pcall(function()
+				root.AssemblyLinearVelocity = Vector3.zero
+				root.AssemblyAngularVelocity = Vector3.zero
+				root.CFrame = CFrame.new(base + off)
+			end)
+			pulsePodTouch(root, pod)
+			task.wait(0.12)
+		end
+		pcall(function()
+			root.CFrame = CFrame.new(base + Vector3.new(0, 3, 0))
+		end)
+		pulsePodTouch(root, pod)
+		return true
+	end
+
+	-- Keep touching the pad until RequestSelectPayload accepts the difficulty.
+	local function selectPayloadDiff(diff, attempts)
+		attempts = attempts or 6
+		local lastMsg = ''
+		for i = 1, attempts do
+			standOnPayloadPod()
+			task.wait(0.2 + (i - 1) * 0.08)
+			local okSel, selRes, selMsg = invoke('RequestSelectPayload', diff)
+			if okSel and selRes ~= false then
+				return true, nil
+			end
+			lastMsg = tostring(selMsg or selRes or 'select failed')
+			local why = string.lower(lastMsg)
+			if why:find('queue', 1, true) then
+				invoke('RequestLeaveQueue')
+				task.wait(0.3)
+			end
+			-- Re-pulse only; do not open UI yet (that used to race ahead of pad register).
+		end
+		return false, lastMsg
+	end
+
+	function api.target()
+		local wantMap = Options.DLPayloadMap and tostring(Options.DLPayloadMap.Value or '') or ''
+		local wantDiff = Options.DLPayloadDifficulty and tostring(Options.DLPayloadDifficulty.Value or '') or ''
+		if wantMap == '' or wantMap == 'nil' then
+			local maps = listMaps()
+			wantMap = maps[1] or 'Floating Aisles'
+		end
+		local okDiff = false
+		for _, d in ipairs(DIFFS) do
+			if d == wantDiff then
+				okDiff = true
+				break
+			end
+		end
+		if not okDiff then
+			wantDiff = 'Nightmare'
+		end
+		return wantMap, wantDiff
+	end
+
+	local function infoRoot(panel)
+		local contents = panel and panel:FindFirstChild('Contents')
+		local right = contents and contents:FindFirstChild('RightSection')
+		return right and right:FindFirstChild('Info') or nil
+	end
+
+	local function clickDifficulty(panel, diff)
+		local info = infoRoot(panel)
+		if not info then
+			return false
+		end
+		local btn = info:FindFirstChild(diff)
+			or info:FindFirstChild(string.upper(diff))
+			or info:FindFirstChild(string.lower(diff))
+		if not btn then
+			for _, ch in ipairs(info:GetChildren()) do
+				if string.lower(ch.Name) == string.lower(diff) then
+					btn = ch
+					break
+				end
+			end
+		end
+		return clickGui(btn)
+	end
+
+	local function enterButtonLabel(panel)
+		local info = infoRoot(panel)
+		local buttons = info and info:FindFirstChild('Buttons')
+		local enter = buttons and buttons:FindFirstChild('Enter')
+		local lab = enter and enter:FindFirstChildWhichIsA('TextLabel', true)
+		return string.upper(tostring(lab and lab.Text or enter and enter.Name or ''))
+	end
+
+	local function isQueuedUi(panel)
+		local label = enterButtonLabel(panel)
+		return label:find('START', 1, true) ~= nil
+	end
+
+	local function clickEnter(panel)
+		local info = infoRoot(panel)
+		local buttons = info and info:FindFirstChild('Buttons')
+		local enter = buttons and buttons:FindFirstChild('Enter')
+		if clickGui(enter) then
+			return true
+		end
+		for _, d in ipairs(panel:GetDescendants()) do
+			if d:IsA('GuiButton') then
+				local lab = d:FindFirstChildWhichIsA('TextLabel', true)
+				local t = string.upper(tostring(lab and lab.Text or d.Name or ''))
+				if t == 'ENTER' or t:find('START', 1, true) then
+					if clickGui(d) then
+						return true
+					end
+				end
+			end
+		end
+		return false
+	end
+
+	function api.enter(silent)
+		if busy then
+			return false
+		end
+		if inPayloadNow() then
+			if not silent then
+				Library:Notify('Already in Payload')
+			end
+			return false
+		end
+		if not inLobby() then
+			if not silent then
+				Library:Notify('Leave the dungeon before starting Payload')
+			end
+			return false
+		end
+		local mapLabel, diff = api.target()
+		busy = true
+		task.spawn(function()
+			local ok = false
+			local failWhy = ''
+			-- Cold lobby: pad register often fails 1–2 times. Retry the whole
+			-- select → queue → START NOW chain before giving up.
+			for attempt = 1, 4 do
+				if inPayloadNow() or LocalPlayer:GetAttribute('InPayload') == true then
+					ok = true
+					failWhy = ''
+					break
+				end
+				standOnPayloadPod()
+				task.wait(0.25)
+				local panel = ensurePayloadOpen()
+				local alreadyQueued = panel and isQueuedUi(panel)
+
+				if alreadyQueued then
+					standOnPayloadPod()
+					task.wait(0.15)
+					local okRf, res, msg = invoke('RequestStartNow')
+					ok = okRf and res ~= false
+					if not ok and panel then
+						ok = clickEnter(panel)
+					end
+					if not ok then
+						failWhy = tostring(msg or res or 'START NOW failed')
+					else
+						failWhy = ''
+						break
+					end
+				else
+					invoke('RequestPartyData')
+					task.wait(0.08)
+					local okSel, selMsg = selectPayloadDiff(diff, 5)
+					if not okSel then
+						failWhy = tostring(selMsg or 'Stand on a Payload pad first.')
+						-- Keep trying next outer attempt.
+					else
+						panel = ensurePayloadOpen() or panel
+						if panel then
+							clickDifficulty(panel, diff)
+							task.wait(0.12)
+						end
+						standOnPayloadPod()
+						task.wait(0.15)
+						local okRf, res, msg = invoke('RequestStartPodQueue')
+						if not (okRf and res ~= false) then
+							failWhy = tostring(msg or res or failWhy)
+							if panel then
+								clickEnter(panel)
+								task.wait(0.3)
+							end
+						end
+						task.wait(0.3)
+						standOnPayloadPod()
+						task.wait(0.15)
+						okRf, res, msg = invoke('RequestStartNow')
+						ok = okRf and res ~= false
+						if not ok then
+							failWhy = tostring(msg or res or failWhy)
+							panel = payloadPanel() or panel
+							if panel then
+								ok = clickEnter(panel)
+								if ok then
+									failWhy = ''
+								end
+							end
+						else
+							failWhy = ''
+						end
+						if ok then
+							break
+						end
+					end
+				end
+				task.wait(0.45)
+			end
+
+			-- Confirm we actually left the lobby select (departing / InPayload).
+			if ok then
+				local deadline = os.clock() + 8
+				while os.clock() < deadline do
+					if inPayloadNow() or LocalPlayer:GetAttribute('InPayload') == true then
+						failWhy = ''
+						break
+					end
+					local p = payloadPanel()
+					if p and isQueuedUi(p) then
+						standOnPayloadPod()
+						invoke('RequestStartNow')
+						clickEnter(p)
+					elseif p and p.Visible then
+						-- Still showing ENTER — pad may have dropped; one more select/start.
+						local okSel = selectPayloadDiff(diff, 2)
+						if okSel then
+							standOnPayloadPod()
+							invoke('RequestStartPodQueue')
+							task.wait(0.25)
+							invoke('RequestStartNow')
+							clickEnter(p)
+						end
+					end
+					pcall(function()
+						-- Board/Ready may already be up during departing.
+						if rt.PayloadLoop then
+							-- boardReadyTick is local; click Ready directly here.
+							local pg = LocalPlayer:FindFirstChild('PlayerGui')
+							local ready = pg and pg.Main and pg.Main.HUD
+								and pg.Main.HUD.Dungeon_Container
+								and pg.Main.HUD.Dungeon_Container:FindFirstChild('Ready')
+							if ready and ready.Visible then
+								local lab = ready:FindFirstChild('TextLabel')
+								local t = string.upper(tostring(lab and lab.Text or ''))
+								if t == 'BOARD' or t == 'READY' then
+									clickGui(ready)
+								end
+							end
+						end
+					end)
+					task.wait(0.4)
+				end
+				if not inPayloadNow() and LocalPlayer:GetAttribute('InPayload') ~= true then
+					local p = payloadPanel()
+					if p and p.Visible and not isQueuedUi(p) then
+						ok = false
+						failWhy = failWhy ~= '' and failWhy or 'Stand on a Payload pad first.'
+					end
+				end
+			end
+
+			lastStart = os.clock()
+			lastLabel = ('%s · %s'):format(mapLabel, diff)
+			busy = false
+			if not silent or not ok then
+				Library:Notify(('Payload start: %s%s'):format(
+					lastLabel, ok and '' or (' (' .. (failWhy ~= '' and failWhy or 'failed') .. ')')))
+			elseif not silent then
+				Library:Notify(('Payload start: %s'):format(lastLabel))
+			end
+		end)
+		return true
+	end
+
+	function api.returnLobby(silent)
+		local rf = RunLoops.knitRF('PayloadRunService', 'RequestReturn')
+		if rf then
+			local ok, res = pcall(function()
+				return rf:InvokeServer()
+			end)
+			if ok and res ~= false then
+				if not silent then
+					Library:Notify('Payload return')
+				end
+				return true
+			end
+		end
+		rt.forceReturnLobby(silent == true)
+		return false
+	end
+
+	function api.onLobby()
+		armedAt = os.clock()
+	end
+
+	function api.label()
+		return lastLabel
+	end
+
+	function api.inPayload()
+		return inPayloadNow()
+	end
+
+	function api.listMaps()
+		return listMaps()
+	end
+
+	function api.listDifficulties()
+		return listDifficulties()
+	end
+
+	local function payloadRF(name, ...)
+		local rem = RunLoops.knitRF('PayloadRunService', name)
+		if not rem then
+			return false, nil, nil
+		end
+		local args = table.pack(...)
+		local packed = table.pack(pcall(function()
+			return rem:InvokeServer(table.unpack(args, 1, args.n))
+		end))
+		if not packed[1] then
+			return false, nil, packed[2]
+		end
+		return true, packed[2], packed[3]
+	end
+
+	-- HUD.Dungeon_Container.Ready: BOARD → ReturnToShip, READY → SetReady(true).
+	-- Same slot becomes CANCEL while ready / Departing... — never press those.
+	local function boardReadyTick()
+		if os.clock() - (rt.payloadBoardAt or 0) < 0.85 then
+			return false
+		end
+		local pg = LocalPlayer:FindFirstChild('PlayerGui')
+		local main = pg and pg:FindFirstChild('Main')
+		local hud = main and main:FindFirstChild('HUD')
+		local container = hud and hud:FindFirstChild('Dungeon_Container')
+		local readyBtn = container and container:FindFirstChild('Ready')
+		if not readyBtn or not readyBtn:IsA('GuiButton') or readyBtn.Visible ~= true then
+			return false
+		end
+		local lab = readyBtn:FindFirstChild('TextLabel')
+			or readyBtn:FindFirstChildWhichIsA('TextLabel', true)
+		local label = string.upper(tostring(lab and lab.Text or ''))
+		if label == '' or label == 'CANCEL' or label:find('DEPART', 1, true) then
+			return false
+		end
+		if label ~= 'BOARD' and label ~= 'READY' then
+			return false
+		end
+
+		local st = nil
+		local okSt, session = payloadRF('GetSessionState')
+		if okSt and type(session) == 'table' then
+			st = session
+		end
+		if st then
+			if st.Active ~= true or st.CanReady ~= true then
+				-- Still click BOARD/READY if the HUD says so — CanReady can lag a frame.
+			end
+			if st.IsReady == true and label == 'READY' then
+				return false
+			end
+			if label == 'BOARD' or st.OnBoat ~= true then
+				rt.payloadBoardAt = os.clock()
+				payloadRF('ReturnToShip')
+				clickGui(readyBtn)
+				return true
+			end
+			if label == 'READY' and st.OnBoat == true then
+				rt.payloadBoardAt = os.clock()
+				payloadRF('SetReady', st.RunId, st.Generation, true)
+				clickGui(readyBtn)
+				return true
+			end
+		end
+
+		rt.payloadBoardAt = os.clock()
+		if label == 'BOARD' then
+			payloadRF('ReturnToShip')
+		end
+		clickGui(readyBtn)
+		return true
+	end
+
+	function api.tick()
+		if not on('DLPayloadLoop') then
+			armedAt = 0
+			rt.payloadEnteredAt = nil
+			return
+		end
+		-- Board / Ready while the departing HUD is up (even mid-lobby transition).
+		pcall(boardReadyTick)
+		if inPayloadNow() then
+			armedAt = 0
+			if not rt.payloadEnteredAt then
+				rt.payloadEnteredAt = os.clock()
+			end
+			pcall(boardReadyTick)
+			-- Do not return during boarding / loading. Game phases that mean "done":
+			-- PrototypeComplete (and Active == false after a real run).
+			local done = false
+			local rf = RunLoops.knitRF('PayloadRunService', 'GetSessionState')
+			if rf then
+				local ok, st = pcall(function()
+					return rf:InvokeServer()
+				end)
+				if ok and type(st) == 'table' then
+					local phase = tostring(st.Phase or st.State or st.Status or '')
+					local low = string.lower(phase)
+					-- Exact end states only — substring "complete" matched PrototypeComplete
+					-- (good) but also risked other phases; require Active==false or known end.
+					if low == 'prototypecomplete'
+						or low == 'victory'
+						or low == 'defeat'
+						or low == 'finished'
+						or low == 'completed'
+					then
+						done = true
+					elseif st.Active == false
+						and (os.clock() - (rt.payloadEnteredAt or os.clock())) > 20
+						and phase ~= ''
+						and not low:find('board', 1, true)
+						and not low:find('depart', 1, true)
+						and not low:find('escort', 1, true)
+						and not low:find('load', 1, true)
+						and not low:find('await', 1, true)
+					then
+						done = low:find('complete', 1, true) ~= nil
+					end
+				end
+			end
+			-- Ignore LEAVE on Payload_Select — that is the lobby panel, not completion.
+			if not done then
+				pcall(function()
+					local pg = LocalPlayer:FindFirstChild('PlayerGui')
+					local main = pg and pg:FindFirstChild('Main')
+					local hud = main and main:FindFirstChild('HUD')
+					local container = hud and hud:FindFirstChild('Dungeon_Container')
+					local info = container and container:FindFirstChild('Completion_Info')
+					if info and info.Visible == true then
+						for _, d in ipairs(info:GetDescendants()) do
+							if d:IsA('GuiButton') then
+								local lab = d:FindFirstChildWhichIsA('TextLabel', true)
+								local t = string.upper(tostring(lab and lab.Text or d.Name or ''))
+								if t:find('RETURN', 1, true) then
+									done = true
+									break
+								end
+							end
+						end
+					end
+				end)
+			end
+			-- Grace: never auto-return in the first 25s (boarding / stream / first wave).
+			if done
+				and (os.clock() - (rt.payloadEnteredAt or 0)) > 25
+				and os.clock() - (rt.payloadReturnAt or 0) > 2.5
+			then
+				rt.payloadReturnAt = os.clock()
+				rt.payloadEnteredAt = nil
+				task.spawn(function()
+					api.returnLobby(true)
+					local deadline = os.clock() + 16
+					while os.clock() < deadline and not inLobby() do
+						task.wait(0.4)
+					end
+					api.onLobby()
+				end)
+			end
+			return
+		end
+		rt.payloadEnteredAt = nil
 		if not inLobby() then
 			armedAt = 0
 			return
@@ -20079,6 +20954,9 @@ ReplayBox:AddToggle('DLRaidLoop', {
 		if Toggles.DLChallengeLoop then
 			Toggles.DLChallengeLoop:SetValue(false)
 		end
+		if Toggles.DLPayloadLoop then
+			Toggles.DLPayloadLoop:SetValue(false)
+		end
 		if Toggles.DLAutoReplay then
 			Toggles.DLAutoReplay:SetValue(false)
 		end
@@ -20181,6 +21059,9 @@ ReplayBox:AddToggle('DLChallengeLoop', {
 		if Toggles.DLRaidLoop then
 			Toggles.DLRaidLoop:SetValue(false)
 		end
+		if Toggles.DLPayloadLoop then
+			Toggles.DLPayloadLoop:SetValue(false)
+		end
 		if Toggles.DLAutoReplay then
 			Toggles.DLAutoReplay:SetValue(false)
 		end
@@ -20247,6 +21128,109 @@ ReplayBox:AddButton('Enter Challenge now', function()
 end)
 ReplayBox:AddLabel('Challenge loop: Mode Challenge → featured dungeon → difficulty → boss preview → RequestStartPodQueue / ENTER.')
 
+ReplayBox:AddToggle('DLPayloadLoop', {
+	Text = 'Payload loop',
+	Default = false,
+	Tooltip = 'Warps onto a Payload pod, selects Easy–Nightmare, StartPodQueue → Start Now, then auto Board/Ready on the departing HUD. On clear, RequestReturn then re-enters. Turns Auto farm on when you enter.',
+}):OnChanged(function(v)
+	if not v then
+		Library:Notify('Payload loop off')
+		return
+	end
+	pcall(function()
+		if Options.DLPayloadMap and Options.DLPayloadMap.SetValue then
+			local cur = tostring(Options.DLPayloadMap.Value or '')
+			if cur == '' or cur == 'nil' then
+				local maps = (rt.PayloadLoop and rt.PayloadLoop.listMaps()) or {}
+				Options.DLPayloadMap:SetValue(maps[1] or 'Floating Aisles')
+			end
+		end
+		if Options.DLPayloadDifficulty and Options.DLPayloadDifficulty.SetValue then
+			local cur = tostring(Options.DLPayloadDifficulty.Value or '')
+			if cur == '' or cur == 'nil' then
+				Options.DLPayloadDifficulty:SetValue('Nightmare')
+			end
+		end
+		if Toggles.DLLoopSpecific then
+			Toggles.DLLoopSpecific:SetValue(false)
+		end
+		if Toggles.DLAutoDungeon then
+			Toggles.DLAutoDungeon:SetValue(false)
+		end
+		if Toggles.DLHuntSpecial then
+			Toggles.DLHuntSpecial:SetValue(false)
+		end
+		if Toggles.DLRaidLoop then
+			Toggles.DLRaidLoop:SetValue(false)
+		end
+		if Toggles.DLChallengeLoop then
+			Toggles.DLChallengeLoop:SetValue(false)
+		end
+		if Toggles.DLAutoReplay then
+			Toggles.DLAutoReplay:SetValue(false)
+		end
+	end)
+	if rt.PayloadLoop then
+		rt.PayloadLoop.onLobby()
+		local map, diff = rt.PayloadLoop.target()
+		Library:Notify(('Payload loop · %s · %s'):format(map, diff))
+		task.spawn(function()
+			task.wait(0.35)
+			if rt.PayloadLoop then
+				rt.PayloadLoop.enter(false)
+			end
+			local deadline = os.clock() + 25
+			while os.clock() < deadline do
+				local inPay = LocalPlayer:GetAttribute('InPayload') == true
+				if not inPay and rt.PayloadLoop and rt.PayloadLoop.inPayload then
+					inPay = rt.PayloadLoop.inPayload()
+				end
+				if inPay then
+					if Toggles.DLAutoFarm then
+						Toggles.DLAutoFarm:SetValue(true)
+					end
+					break
+				end
+				task.wait(0.4)
+			end
+		end)
+	end
+end)
+ReplayBox:AddDropdown('DLPayloadMap', {
+	Text = 'Payload map',
+	Values = (rt.PayloadLoop and rt.PayloadLoop.listMaps()) or { 'Floating Aisles' },
+	Default = 1,
+	Tooltip = 'From PayloadData.MapOrder (Floating Aisles / Torus).',
+})
+ReplayBox:AddDropdown('DLPayloadDifficulty', {
+	Text = 'Payload difficulty',
+	Values = (rt.PayloadLoop and rt.PayloadLoop.listDifficulties())
+		or { 'Easy', 'Normal', 'Hard', 'Nightmare' },
+	Default = 4,
+	Tooltip = 'Easy / Normal / Hard / Nightmare — same buttons on Payload_Select.',
+})
+ReplayBox:AddButton('Refresh payload maps', function()
+	local names = rt.PayloadLoop and rt.PayloadLoop.listMaps() or {}
+	if Options.DLPayloadMap and Options.DLPayloadMap.SetValues then
+		Options.DLPayloadMap:SetValues(names)
+	end
+	Library:Notify((#names) .. ' payload maps')
+end)
+ReplayBox:AddButton('Enter Payload now', function()
+	task.spawn(function()
+		local P = rt.PayloadLoop
+		if not P then
+			return
+		end
+		if P.inPayload() then
+			P.returnLobby(false)
+			return
+		end
+		P.enter(false)
+	end)
+end)
+ReplayBox:AddLabel('Payload: pad touch → select diff → StartPodQueue → Start Now. Do not LeaveQueue while queued.')
+
 local LobbyBox = RunTab:AddLeftGroupbox('Lobby')
 LobbyBox:AddToggle('DLAutoDungeon', {
 	Text = 'Auto start best dungeon',
@@ -20306,6 +21290,10 @@ SessionBox:AddToggle('DLNoPause', {
 	end
 end)
 SessionBox:AddLabel('Roblox overlay, not the game\'s. The 17-minute AFK warp is in the game\'s own Settings.')
+SessionBox:AddLabel('Mystery merchant timer is on the HUD (HERE mm:ss / in h:mm:ss).')
+pcall(function()
+	rt.refreshMysteryMerchant(true)
+end)
 
 local MoveBox = MoveTab:AddLeftGroupbox('Walkspeed')
 MoveBox:AddToggle('DLWalkOn', { Text = 'Override walkspeed', Default = true }):OnChanged(function(v)
@@ -20863,6 +21851,11 @@ hbEspConn = track(RunService.Heartbeat:Connect(function(dt)
 	pcall(function()
 		if rt.ChallengeLoop then
 			rt.ChallengeLoop.tick()
+		end
+	end)
+	pcall(function()
+		if rt.PayloadLoop then
+			rt.PayloadLoop.tick()
 		end
 	end)
 	-- Gear/stat polls are not frame-critical — half rate while farming.
