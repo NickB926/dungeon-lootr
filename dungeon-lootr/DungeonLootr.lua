@@ -141,7 +141,7 @@ Library.ToggleKeybind = { Value = 'Home' }
 Library.Animations = Library.Animations or {}
 Library.Animations.TabSwitch = false
 
-local DL_BUILD = '1.0.55'
+local DL_BUILD = '1.0.56'
 getgenv().DLBuild = DL_BUILD
 -- Do NOT wipe DLShrineSkipKeys on every reload — that re-warps spent altars.
 
@@ -9135,6 +9135,17 @@ rt.tryFarmUlt = function()
 	return true
 end
 
+local function isMageStudent(npc)
+	if not npc then
+		return false
+	end
+	local id = string.lower(tostring(npc:GetAttribute('ItemId') or ''))
+	local name = string.lower(tostring(npc.Name or ''))
+	-- Exact family: "Mage Student" / "Mage Student 2" (ItemId or Name).
+	return id:find('mage student', 1, true) ~= nil
+		or name:find('mage student', 1, true) ~= nil
+end
+
 local function isAwakeAdd(npc)
 	if not npc or not enemyAlive(npc) or farmSkipped(npc) then
 		return false
@@ -9142,10 +9153,34 @@ local function isAwakeAdd(npc)
 	if npc:GetAttribute('IsDormant') == true then
 		return false
 	end
+	-- Dark Professor summons — always treat as killable adds even if tagged weird.
+	if isMageStudent(npc) then
+		return enemyRoot(npc) ~= nil
+	end
 	if enemyRank(npc) >= 4 or isFinalBoss(npc) then
 		return false
 	end
 	return enemyRoot(npc) ~= nil
+end
+
+-- Nearest live Mage Student anywhere in Raid_NPCs (no ADD_NEAR clamp).
+local function findMageStudent()
+	local me = routeRoot()
+	local best, bestD = nil, nil
+	eachFarmNpc(function(npc)
+		if not isMageStudent(npc) or not enemyAlive(npc) or farmSkipped(npc) then
+			return
+		end
+		local part = enemyRoot(npc)
+		if not part then
+			return
+		end
+		local d = me and (part.Position - me.Position).Magnitude or 0
+		if not bestD or d < bestD then
+			best, bestD = npc, d
+		end
+	end)
+	return best, bestD
 end
 
 local function addsNearSpecial(anchor)
@@ -9154,6 +9189,11 @@ local function addsNearSpecial(anchor)
 	local from = (ap and ap.Position) or (me and me.Position)
 	if not from then
 		return nil
+	end
+	-- Mage Students first — distance-unlimited; they wipe the run if ignored.
+	local student, studentD = findMageStudent()
+	if student then
+		return student, studentD
 	end
 	local best, bestD = nil, nil
 	eachFarmNpc(function(npc)
@@ -9216,7 +9256,11 @@ local function holdOnAddPack(anchor)
 			rt.aoeScanAt = os.clock()
 			pcall(rt.avoidFloorAoe)
 		end
-		if typeof(rt.aoeGoal) == 'Vector3' and os.clock() < (rt.aoeUntil or 0) then
+		-- Student meteors are harmless — stay on the pack, don't yield to gaps.
+		if not rt.commitStudent
+			and typeof(rt.aoeGoal) == 'Vector3'
+			and os.clock() < (rt.aoeUntil or 0)
+		then
 			return rt.aoeGoal
 		end
 		local list = listAddsNearSpecial(anchor)
@@ -9279,6 +9323,12 @@ local function pickFarmTarget()
 	-- Raid boss / special still yields to crystals + summoned adds (Mage Students).
 	local held = rt.farmFightNpc
 	if held and rt.farmFighting and enemyAlive(held) and enemyRoot(held) and not farmSkipped(held) then
+		-- Never stay glued to the Professor while a Mage Student is alive.
+		local student, studentD = findMageStudent()
+		if student and not isMageStudent(held) then
+			farmLock = nil
+			return student, studentD
+		end
 		if isRaidBossNpc(held) or enemyRank(held) >= 4 then
 			local crystal, crystalD = nearestCrystal()
 			if crystal then
@@ -9308,12 +9358,22 @@ local function pickFarmTarget()
 	if tonumber(rt.farmRoomFilter) then
 		skipFinal = false
 	end
-	-- Crystals first (Dark Professor wipe if they finish). Hunt special next
-	-- (Scarlet Knight loop), then raid / room special, then summoned adds.
+	-- Prefer bosses / Payload: Torus + adds used to hide the final boss forever
+	-- (IsBoss + Enemies>0 → skipFinal). Fight the boss when asked / in Payload.
+	if preferBoss or rt.inPayloadFarm() then
+		skipFinal = false
+	end
+	-- Crystals first (Dark Professor wipe if they finish). Mage Students next
+	-- at all costs, then hunt / raid special / fodder.
 	local crystal, crystalD = nearestCrystal()
 	if crystal then
 		farmLock = nil
 		return crystal, crystalD
+	end
+	local student, studentD = findMageStudent()
+	if student then
+		farmLock = nil
+		return student, studentD
 	end
 	if on('DLHuntSpecial') then
 		local hunt, huntD = findHuntTarget()
@@ -10465,8 +10525,13 @@ local function holdOnEnemy(npc)
 			rt.aoeScanAt = os.clock()
 			pcall(rt.avoidFloorAoe)
 		end
-		-- Floor discs win over the boss stand pin for the whole telegraph lifetime.
-		if typeof(rt.aoeGoal) == 'Vector3' and os.clock() < (rt.aoeUntil or 0) then
+		-- Floor discs win over the boss stand pin — except Mage Students:
+		-- their meteors are harmless and dodging them abandons the kill.
+		if not isMageStudent(npc)
+			and not rt.commitStudent
+			and typeof(rt.aoeGoal) == 'Vector3'
+			and os.clock() < (rt.aoeUntil or 0)
+		then
 			rt.pinAoeN = (rt.pinAoeN or 0) + 1
 			rt.pinGoal = rt.aoeGoal
 			return rt.aoeGoal, cachedAim
@@ -10776,10 +10841,25 @@ local function farmKill(npc)
 	local crystalPack = isRaidCrystal(npc)
 	local addAnchor = nil
 	local addPack = false
+	local studentTarget = isMageStudent(npc)
+	if studentTarget then
+		-- Commit hard: clear gap pin and never stall-ban these.
+		rt.commitStudent = true
+		rt.aoeGoal = nil
+		rt.aoeUntil = 0
+		rt.stickyPlant = nil
+		sticky = true
+		timeout = 180
+		farmBan[npc] = nil
+	end
 	if not crystalPack and isAwakeAdd(npc) then
 		addAnchor = raidSpecialAnchor()
 		if addAnchor and #listAddsNearSpecial(addAnchor) >= 2 then
 			addPack = true
+		end
+		-- Single Mage Student still counts as sticky add fight.
+		if studentTarget then
+			addPack = false
 		end
 	end
 	if (tonumber(npc:GetAttribute('HealthOverride')) or 0) >= 1e7
@@ -10810,6 +10890,9 @@ local function farmKill(npc)
 		farmLabel = ('adds · %d'):format(#listAddsNearSpecial(addAnchor))
 	else
 		holdOnEnemy(npc)
+		if studentTarget then
+			farmLabel = ('student · %s'):format(npc.Name)
+		end
 	end
 	pcall(watchEnemy, npc)
 	rt.farmFightNpc = npc
@@ -10885,7 +10968,7 @@ local function farmKill(npc)
 					rt.farmFighting = false
 					break
 				end
-				local add = select(1, addsNearSpecial(npc))
+				local add = select(1, findMageStudent()) or select(1, addsNearSpecial(npc))
 				if not add then
 					-- Arena edge spawns: any live Raid_NPCs fodder counts.
 					eachFarmNpc(function(other)
@@ -10898,7 +10981,9 @@ local function farmKill(npc)
 					end)
 				end
 				if add then
-					farmLabel = ('adds · %s'):format(add.Name)
+					farmLabel = isMageStudent(add)
+						and ('student · %s'):format(add.Name)
+						or ('adds · %s'):format(add.Name)
 					if farmLock == npc then
 						farmLock = nil
 					end
@@ -10921,7 +11006,7 @@ local function farmKill(npc)
 			-- ~8s and used to farmBan him for 30s → long gap before re-engage.
 			local aoeBusy = os.clock() < (rt.aoeUntil or 0)
 				or (rt.aoeClearAt and os.clock() - rt.aoeClearAt < 1.25)
-			if aoeBusy or isRaidBossNpc(npc) or enemyRank(npc) >= 4 then
+			if aoeBusy or isRaidBossNpc(npc) or enemyRank(npc) >= 4 or studentTarget then
 				lastDrop = now
 			end
 			if readable and not sticky and not crystalPack and not addPack then
@@ -10970,6 +11055,7 @@ local function farmKill(npc)
 	rt.farmPitchYaw = nil
 	rt.crystalPack = false
 	rt.addPack = false
+	rt.commitStudent = false
 	if not (farmBusy and rt.hoverN() < 0) then
 		rt.setFarmPitchHum(false)
 	end
@@ -11059,6 +11145,11 @@ local function findRaidFocus()
 	if crystal then
 		return crystal
 	end
+	-- Mage Student / Mage Student 2 before the Professor — always.
+	local student = select(1, findMageStudent())
+	if student then
+		return student
+	end
 	local boss
 	eachFarmNpc(function(npc)
 		if isRaidBossNpc(npc) and enemyAlive(npc) and not farmSkipped(npc) then
@@ -11070,7 +11161,7 @@ local function findRaidFocus()
 		if add then
 			return add
 		end
-		-- Any awake Raid_NPCs fodder even if outside ADD_NEAR (player buried far).
+		-- Arena edge spawns: any live Raid_NPCs fodder even if outside ADD_NEAR.
 		local anyAdd
 		eachFarmNpc(function(npc)
 			if anyAdd or npc == boss or isRaidBossNpc(npc) or isRaidCrystal(npc) then
@@ -12910,6 +13001,12 @@ local function farmLoop()
 				if raidNpc then
 					step('raid')
 					farmLabel = ('raid · %s'):format(raidNpc.Name)
+					if isMageStudent(raidNpc) then
+						rt.commitStudent = true
+						rt.aoeGoal = nil
+						rt.aoeUntil = 0
+						farmLabel = ('student · %s'):format(raidNpc.Name)
+					end
 					pcall(snapToRaidTarget, raidNpc)
 					farmKillNpc(raidNpc)
 				else
@@ -17044,6 +17141,35 @@ rt.RaidLoop = (function()
 	end
 
 	function api.replay(silent)
+		-- Prefer clicking REPLAY so party state stays intact. RequestReturn
+		-- (old fallback) sent you to lobby and kicked party members.
+		local clicked = false
+		pcall(function()
+			local pg = LocalPlayer:FindFirstChild('PlayerGui')
+			local main = pg and pg:FindFirstChild('Main')
+			if not main then
+				return
+			end
+			for _, d in ipairs(main:GetDescendants()) do
+				if d:IsA('GuiButton') and d.Visible ~= false and d.Active ~= false then
+					local lab = d:FindFirstChildWhichIsA('TextLabel', true)
+					local t = string.upper(tostring(lab and lab.Text or d.Name or ''))
+					-- Never click RETURN / LEAVE — that dissolves the party run.
+					if t:find('REPLAY', 1, true) then
+						if clickGui(d) then
+							clicked = true
+							break
+						end
+					end
+				end
+			end
+		end)
+		if clicked then
+			if not silent then
+				Library:Notify('Raid replay')
+			end
+			return true
+		end
 		local rf = RunLoops.knitRF('RaidRunService', 'RequestReplay')
 		if rf then
 			local ok, res = pcall(function()
@@ -17056,23 +17182,6 @@ rt.RaidLoop = (function()
 				return true
 			end
 		end
-		-- Completion UI REPLAY / ENTER again.
-		pcall(function()
-			local pg = LocalPlayer:FindFirstChild('PlayerGui')
-			local main = pg and pg:FindFirstChild('Main')
-			if not main then
-				return
-			end
-			for _, d in ipairs(main:GetDescendants()) do
-				if d:IsA('GuiButton') and d.Visible ~= false then
-					local lab = d:FindFirstChildWhichIsA('TextLabel', true)
-					local t = string.upper(tostring(lab and lab.Text or d.Name or ''))
-					if t:find('REPLAY', 1, true) or t == 'ENTER' then
-						clickGui(d)
-					end
-				end
-			end
-		end)
 		return false
 	end
 
@@ -17101,7 +17210,7 @@ rt.RaidLoop = (function()
 			armedAt = 0
 			return
 		end
-		-- Mid-raid: on completion, RequestReplay (keeps difficulty).
+		-- Mid-raid: on completion, click REPLAY / RequestReplay only (party-safe).
 		if inRaidNow() then
 			armedAt = 0
 			local rf = RunLoops.knitRF('RaidRunService', 'GetSessionState')
@@ -17130,7 +17239,7 @@ rt.RaidLoop = (function()
 					for _, d in ipairs(main:GetDescendants()) do
 						if d:IsA('TextLabel') or d:IsA('TextButton') then
 							local t = string.upper(tostring(d.Text or ''))
-							if (t:find('REPLAY', 1, true) or t == 'RETURN' or t:find('VICTORY', 1, true))
+							if (t:find('REPLAY', 1, true) or t:find('VICTORY', 1, true) or t:find('DEFEAT', 1, true))
 								and d.Visible ~= false
 							then
 								done = true
@@ -17140,22 +17249,15 @@ rt.RaidLoop = (function()
 					end
 				end)
 			end
-			if done and os.clock() - (rt.raidReplayAt or 0) > 3 then
+			if done and os.clock() - (rt.raidReplayAt or 0) > 2.5 then
 				rt.raidReplayAt = os.clock()
 				task.spawn(function()
-					if not api.replay(true) then
-						-- Fall back: return lobby then re-enter with selected difficulty.
-						local ret = RunLoops.knitRF('RaidRunService', 'RequestReturn')
-						if ret then
-							pcall(function()
-								ret:InvokeServer()
-							end)
+					-- Retry Replay only — never RequestReturn (that leaves the party).
+					for _ = 1, 4 do
+						if api.replay(true) then
+							break
 						end
-						local deadline = os.clock() + 14
-						while os.clock() < deadline and not inLobby() do
-							task.wait(0.4)
-						end
-						api.onLobby()
+						task.wait(0.45)
 					end
 				end)
 			end
@@ -17839,27 +17941,44 @@ rt.PayloadLoop = (function()
 		end
 	end
 
+	-- Hold TouchInterest "entered" across the select/start invoke so the server
+	-- still sees pad occupancy while the RF round-trips.
+	local function holdPodTouch(root, pod, holding)
+		if not root or not pod or type(firetouchinterest) ~= 'function' then
+			return
+		end
+		local state = holding and 0 or 1
+		for _, name in ipairs({ 'WarpIn', 'Touch' }) do
+			local part = pod:FindFirstChild(name, true)
+			if part and part:IsA('BasePart') then
+				pcall(firetouchinterest, root, part, state)
+			end
+		end
+	end
+
 	local function standOnPayloadPod()
 		local lobby, pod = findPayloadPod()
 		if not pod then
-			return false
+			return false, nil, nil
 		end
 		local anchor = pod:FindFirstChild('WarpIn', true)
 			or pod:FindFirstChild('Touch', true)
 			or (pod:IsA('Model') and (pod.PrimaryPart or pod:FindFirstChildWhichIsA('BasePart')))
 			or (pod:IsA('BasePart') and pod)
 		if not anchor or not anchor:IsA('BasePart') then
-			return false
+			return false, nil, nil
 		end
 		local char = character()
 		local root = char and char:FindFirstChild('HumanoidRootPart')
 		if not root then
-			return false
+			return false, nil, nil
 		end
 		-- Live probe: standing 1.6 studs on the pad still failed select until a
 		-- fresh CFrame onto WarpIn + firetouchinterest. Always re-seat.
-		-- Noclip / CanCollide=false also blocks server pad occupancy.
-		rt.holdCollideUntil = os.clock() + 8
+		-- Noclip / CanCollide=false also blocks server pad occupancy — and farm
+		-- maintainNoclip will re-enable unless noclipOn is cleared too.
+		rt.holdCollideUntil = os.clock() + 12
+		noclipOn = false
 		pcall(setCharNoclip, false)
 		pcall(function()
 			for _, p in ipairs(char:GetDescendants()) do
@@ -17878,6 +17997,7 @@ rt.PayloadLoop = (function()
 				pcall(firetouchinterest, root, access, 0)
 				pcall(firetouchinterest, root, access, 1)
 			end
+			task.wait(0.05)
 		end
 		pcall(function()
 			root.AssemblyLinearVelocity = Vector3.zero
@@ -17885,17 +18005,28 @@ rt.PayloadLoop = (function()
 			root.CFrame = CFrame.new(anchor.Position + Vector3.new(0, 3, 0))
 		end)
 		pulsePodTouch(root, pod)
-		return true
+		task.wait(0.08)
+		-- Re-assert seat — farm / physics can nudge HRP off in one frame.
+		pcall(function()
+			root.AssemblyLinearVelocity = Vector3.zero
+			root.CFrame = CFrame.new(anchor.Position + Vector3.new(0, 3, 0))
+		end)
+		holdPodTouch(root, pod, true)
+		return true, root, pod
 	end
 
 	-- Hammer select with a fresh pad seat each try (probe: pulse-only was not enough).
 	local function selectPayloadDiff(diff, budget)
-		budget = budget or 1.0
+		budget = budget or 1.6
 		local lastMsg = ''
 		local deadline = os.clock() + budget
 		while os.clock() < deadline do
-			standOnPayloadPod()
+			local seated, root, pod = standOnPayloadPod()
 			local okSel, selRes, selMsg = invoke('RequestSelectPayload', diff)
+			if seated and root and pod then
+				holdPodTouch(root, pod, false)
+			end
+			print('[PL] select', okSel, selRes, selMsg)
 			if okSel and selRes ~= false then
 				return true, nil
 			end
@@ -17904,7 +18035,7 @@ rt.PayloadLoop = (function()
 			if why:find('queue', 1, true) then
 				invoke('RequestLeaveQueue')
 			end
-			task.wait(0.05)
+			task.wait(0.08)
 		end
 		return false, lastMsg
 	end
@@ -17989,17 +18120,21 @@ rt.PayloadLoop = (function()
 	end
 
 	local function fireStartChain(panel, diff)
-		standOnPayloadPod()
+		local seated, root, pod = standOnPayloadPod()
 		if panel then
 			clickDifficulty(panel, diff)
 			clickEnter(panel)
 		end
 		local okQ, resQ, msgQ = invoke('RequestStartPodQueue')
 		local okS, resS, msgS = invoke('RequestStartNow')
+		if seated and root and pod then
+			holdPodTouch(root, pod, false)
+		end
 		if panel then
 			clickEnter(panel)
 		end
 		local ok = (okQ and resQ ~= false) or (okS and resS ~= false)
+		print('[PL] startChain Q', okQ, resQ, msgQ, 'S', okS, resS, msgS)
 		return ok, tostring(msgS or msgQ or resS or resQ or '')
 	end
 
@@ -18025,7 +18160,9 @@ rt.PayloadLoop = (function()
 			local ok = false
 			local failWhy = ''
 			-- Proven: collide on → CFrame WarpIn → firetouch → Select → PodQueue → StartNow.
-			rt.holdCollideUntil = os.clock() + 10
+			-- Kill farm noclip for the whole enter — it was deseating the pad mid-select.
+			rt.holdCollideUntil = os.clock() + 14
+			noclipOn = false
 			pcall(setCharNoclip, false)
 			standOnPayloadPod()
 			local panel = ensurePayloadOpen()
@@ -18036,7 +18173,7 @@ rt.PayloadLoop = (function()
 				failWhy = ok and '' or tostring(msg or res or 'START NOW failed')
 			else
 				invoke('RequestPartyData')
-				local okSel, selMsg = selectPayloadDiff(diff, 1.2)
+				local okSel, selMsg = selectPayloadDiff(diff, 2.0)
 				panel = ensurePayloadOpen() or panel
 				if okSel then
 					local started, why = fireStartChain(panel, diff)
@@ -18056,8 +18193,8 @@ rt.PayloadLoop = (function()
 					end
 				else
 					failWhy = tostring(selMsg or 'Stand on a Payload pad first.')
-					for _ = 1, 6 do
-						if selectPayloadDiff(diff, 0.4) then
+					for _ = 1, 8 do
+						if selectPayloadDiff(diff, 0.5) then
 							local started = fireStartChain(panel or ensurePayloadOpen(), diff)
 							if started or isQueuedUi(payloadPanel()) or inPayloadNow() then
 								ok = true
@@ -18071,7 +18208,7 @@ rt.PayloadLoop = (function()
 			end
 
 			if ok then
-				local deadline = os.clock() + 3
+				local deadline = os.clock() + 4
 				while os.clock() < deadline do
 					if inPayloadNow() or LocalPlayer:GetAttribute('InPayload') == true then
 						failWhy = ''
@@ -18079,7 +18216,14 @@ rt.PayloadLoop = (function()
 					end
 					local p = payloadPanel()
 					if p and p.Visible then
-						fireStartChain(p, diff)
+						-- Keep hammering Start while the panel is up; do not flip ok
+						-- back to false just because the label is still ENTER.
+						if isQueuedUi(p) then
+							invoke('RequestStartNow')
+							clickEnter(p)
+						else
+							fireStartChain(p, diff)
+						end
 					end
 					pcall(function()
 						local pg = LocalPlayer:FindFirstChild('PlayerGui')
@@ -18094,20 +18238,14 @@ rt.PayloadLoop = (function()
 							end
 						end
 					end)
-					task.wait(0.1)
-				end
-				if not inPayloadNow() and LocalPlayer:GetAttribute('InPayload') ~= true then
-					local p = payloadPanel()
-					if p and p.Visible and not isQueuedUi(p) then
-						ok = false
-						failWhy = failWhy ~= '' and failWhy or 'Stand on a Payload pad first.'
-					end
+					task.wait(0.12)
 				end
 			end
 
 			lastStart = os.clock()
 			lastLabel = ('%s · %s'):format(mapLabel, diff)
 			busy = false
+			print('[PL]', DL_BUILD, ok and 'started' or 'FAILED', lastLabel, failWhy)
 			if not silent or not ok then
 				Library:Notify(('Payload start: %s%s'):format(
 					lastLabel, ok and '' or (' (' .. (failWhy ~= '' and failWhy or 'failed') .. ')')))
@@ -20231,6 +20369,147 @@ local Gear = (function()
 		return successes
 	end
 
+	local SHOP_ALL = { 'Shop', 'PayloadShop', 'RaidShop', 'ItemShop', 'Stars_Shop' }
+
+	local function uiController()
+		local ps = LocalPlayer:FindFirstChild('PlayerScripts')
+		local client = ps and ps:FindFirstChild('Client')
+		local ctrls = client and client:FindFirstChild('Controllers')
+		local mod = ctrls and ctrls:FindFirstChild('UIController')
+		if not mod then
+			return nil
+		end
+		local ok, UI = pcall(require, mod)
+		if not ok or type(UI) ~= 'table' then
+			return nil
+		end
+		return UI
+	end
+
+	local function shopFrame(name)
+		local pg = LocalPlayer:FindFirstChild('PlayerGui')
+		local main = pg and pg:FindFirstChild('Main')
+		local frames = main and main:FindFirstChild('Frames')
+		return frames and frames:FindFirstChild(name) or nil
+	end
+
+	local function shopObj(name)
+		local UI = uiController()
+		return UI and type(UI.names) == 'table' and UI.names[name] or nil
+	end
+
+	local function pinShopFrame(name, obj)
+		local frame = shopFrame(name)
+		if not frame then
+			return false
+		end
+		frame.Visible = true
+		frame.Active = true
+		local home = obj and typeof(obj.originalPosition) == 'UDim2' and obj.originalPosition
+		if home then
+			frame.Position = home
+		elseif frame.AbsolutePosition.Y < -40 then
+			frame.Position = UDim2.new(0.5, 0, 0.5, 0)
+			frame.AnchorPoint = Vector2.new(0.5, 0.5)
+		end
+		return true
+	end
+
+	function api.isShopOpen(name)
+		name = tostring(name or '')
+		local obj = shopObj(name)
+		if obj and obj.isOpen == true then
+			local frame = shopFrame(name)
+			if frame and frame.AbsolutePosition.Y < -40 then
+				return false
+			end
+			return true
+		end
+		local frame = shopFrame(name)
+		return frame ~= nil and frame.Visible == true and (frame.AbsolutePosition.Y or 0) > -40
+	end
+
+	function api.setShopOpen(name, want, silent)
+		name = tostring(name or '')
+		if name == '' then
+			return false
+		end
+		local obj = shopObj(name)
+		local frame = shopFrame(name)
+		if not obj and not frame then
+			if not silent then
+				Library:Notify(name .. ' missing')
+			end
+			return false
+		end
+		if want then
+			if obj and type(obj.open) == 'function' then
+				pcall(function()
+					obj:open()
+				end)
+			end
+			local ok = pinShopFrame(name, obj)
+			if not silent then
+				Library:Notify(ok and (name .. ' open') or (name .. ' missing'))
+			end
+			return ok
+		end
+		if obj and type(obj.close) == 'function' then
+			pcall(function()
+				obj:close()
+			end)
+		end
+		frame = shopFrame(name)
+		if frame then
+			local exit = frame:FindFirstChild('Exit')
+			if exit then
+				pcall(clickGuiButton, exit)
+			end
+			frame.Visible = false
+		end
+		if not silent then
+			Library:Notify(name .. ' closed')
+		end
+		return true
+	end
+
+	function api.openShop(name, silent)
+		return api.setShopOpen(name, true, silent)
+	end
+
+	function api.closeShop(name, silent)
+		return api.setShopOpen(name, false, silent)
+	end
+
+	function api.setAllShopsOpen(want, silent)
+		local n = 0
+		for _, name in ipairs(SHOP_ALL) do
+			if api.setShopOpen(name, want == true, true) then
+				n += 1
+			end
+		end
+		if not silent then
+			Library:Notify(want and ('Opened %d shops'):format(n) or ('Closed %d shops'):format(n))
+		end
+		return n > 0
+	end
+
+	function api.openAllShops()
+		return api.setAllShopsOpen(true, false)
+	end
+
+	function api.closeAllShops()
+		return api.setAllShopsOpen(false, false)
+	end
+
+	function api.listShops()
+		local out = {}
+		for i, name in ipairs(SHOP_ALL) do
+			out[i] = name
+		end
+		return out
+	end
+
 	return api
 end)()
 
@@ -20351,6 +20630,7 @@ local WorldTab = Window:AddTab('World', 'sun')
 local MoveTab = Window:AddTab('Move', 'person-standing')
 local PlayersTab = Window:AddTab('Players', 'users')
 local DataTab = Window:AddTab('Data', 'scroll')
+local ShopsTab = Window:AddTab('Shops', 'store')
 local MenuTab = Window:AddTab('Menu', 'settings')
 
 local RunBox = RunTab:AddLeftGroupbox('ESP')
@@ -20644,7 +20924,7 @@ end)
 FarmBox:AddToggle('DLFarmBoss', {
 	Text = 'Prefer bosses',
 	Default = false,
-	Tooltip = 'Target elites before fodder. Minibosses / bosses still win. Specials are skipped while anything else is alive.',
+	Tooltip = 'Target elites / bosses before fodder — including the final boss (e.g. Torus) even when adds are up. Specials are skipped while anything else is alive.',
 })
 FarmBox:AddToggle('DLFarmRanged', {
 	Text = 'Prefer ranged',
@@ -20869,7 +21149,7 @@ ReplayBox:AddLabel('Hunt sets Loop dungeon to Underworld Gate + Nightmare, farms
 ReplayBox:AddToggle('DLRaidLoop', {
 	Text = 'Event raid loop',
 	Default = false,
-	Tooltip = 'Loops the Event RAID panel only (The First Test): Normal/Extreme/Impossible + ENTER. Never starts a dungeon. Turns Auto farm on when you enter.',
+	Tooltip = 'Loops Event RAID (The First Test): Normal/Extreme/Impossible + ENTER. On clear, clicks REPLAY only (keeps the party — never RequestReturn). Turns Auto farm on when you enter.',
 }):OnChanged(function(v)
 	if not v then
 		Library:Notify('Event raid loop off')
@@ -21435,6 +21715,49 @@ QuestBox:AddToggle('DLAutoQuest', {
 	end
 end)
 QuestBox:AddLabel('Daily / weekly / limited / NPC / achievements.')
+
+local ShopsBox = ShopsTab:AddLeftGroupbox('Shops')
+ShopsBox:AddLabel('Toggle each shop open / closed.')
+local function shopToggle(id, text, frameName)
+	ShopsBox:AddToggle(id, {
+		Text = text,
+		Default = false,
+		Tooltip = 'Open or close ' .. frameName,
+	}):OnChanged(function(v)
+		if rt.shopToggleQuiet then
+			return
+		end
+		task.spawn(function()
+			Gear.setShopOpen(frameName, v == true, false)
+		end)
+	end)
+end
+shopToggle('DLShopMain', 'Shop', 'Shop')
+shopToggle('DLShopPayload', 'Payload shop', 'PayloadShop')
+shopToggle('DLShopRaid', 'Raid shop', 'RaidShop')
+shopToggle('DLShopItem', 'Item shop', 'ItemShop')
+shopToggle('DLShopStars', 'Stars shop', 'Stars_Shop')
+ShopsBox:AddToggle('DLShopAll', {
+	Text = 'All shops',
+	Default = false,
+	Tooltip = 'Open or close every shop GUI at once.',
+}):OnChanged(function(v)
+	if rt.shopToggleQuiet then
+		return
+	end
+	task.spawn(function()
+		Gear.setAllShopsOpen(v == true, false)
+		rt.shopToggleQuiet = true
+		for _, id in ipairs({ 'DLShopMain', 'DLShopPayload', 'DLShopRaid', 'DLShopItem', 'DLShopStars' }) do
+			if Toggles[id] and Toggles[id].SetValue then
+				pcall(function()
+					Toggles[id]:SetValue(v == true)
+				end)
+			end
+		end
+		rt.shopToggleQuiet = false
+	end)
+end)
 
 local GearBox = DataTab:AddRightGroupbox('Gear')
 Gear.setLabel(GearBox:AddLabel('Reading inventory…'))
