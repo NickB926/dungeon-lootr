@@ -141,7 +141,7 @@ Library.ToggleKeybind = { Value = 'Home' }
 Library.Animations = Library.Animations or {}
 Library.Animations.TabSwitch = false
 
-local DL_BUILD = '1.0.80'
+local DL_BUILD = '1.0.81'
 getgenv().DLBuild = DL_BUILD
 -- Do NOT wipe DLShrineSkipKeys on every reload — that re-warps spent altars.
 
@@ -22230,6 +22230,30 @@ StatBox:AddLabel('Reset is Inventory → Stat Upgrades → RESET. Auto spend wil
 
 local MenuBox = MenuTab:AddLeftGroupbox('Script')
 MenuBox:AddLabel('Home hides/shows this window (same as PlayerTools).')
+do
+	local OFF = 'dungeon-lootr/no_autoload'
+	local hasOff = type(isfile) == 'function' and isfile(OFF) == true
+	MenuBox:AddToggle('DLAutoInject', {
+		Text = 'Auto inject on join',
+		Default = not hasOff,
+		Tooltip = 'When on, Potassium autoexec loads Dungeon Lootr on join / rejoin / place teleport. Off writes dungeon-lootr/no_autoload so autoexec skips.',
+	}):OnChanged(function(v)
+		if v then
+			if type(delfile) == 'function' then
+				pcall(delfile, OFF)
+			end
+			Library:Notify('Auto inject on')
+		else
+			if type(makefolder) == 'function' then
+				pcall(makefolder, 'dungeon-lootr')
+			end
+			if type(writefile) == 'function' then
+				pcall(writefile, OFF, '1')
+			end
+			Library:Notify('Auto inject off')
+		end
+	end)
+end
 if type(Library.AddNotifyToggle) == 'function' then
 	Library:AddNotifyToggle(MenuBox)
 end
@@ -22257,6 +22281,23 @@ buildMenu()
 -- hook before load so the snapshot of defaults is taken untouched
 Config.hook()
 Config.load()
+-- Keep autoexec off-switch file in sync with the Menu toggle after profile load.
+pcall(function()
+	local OFF = 'dungeon-lootr/no_autoload'
+	local want = on('DLAutoInject')
+	if want then
+		if type(delfile) == 'function' and type(isfile) == 'function' and isfile(OFF) then
+			delfile(OFF)
+		end
+	else
+		if type(makefolder) == 'function' then
+			makefolder('dungeon-lootr')
+		end
+		if type(writefile) == 'function' then
+			writefile(OFF, '1')
+		end
+	end
+end)
 pcall(refreshHud)
 pcall(function()
 	local resume = getgenv().DLResumeFarm == true or on('DLAutoFarm')

@@ -1,6 +1,6 @@
 {
-    "version":  "1.0.80",
-    "message":  "loop specific: re-apply Endless after dungeon select resets Easy; block replay until match",
+    "version":  "1.0.81",
+    "message":  "Menu toggle: Auto inject on join (no_autoload off-switch)",
     "files":  [
                   "dungeon-lootr/launch.lua",
                   "dungeon-lootr/DungeonLootr.lua",
