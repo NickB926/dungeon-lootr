@@ -2273,8 +2273,8 @@ local Pin = (function()
 			-- Knockback used to keep velocity after a 1.35 hold, which slid the
 			-- rig while the humanoid stayed Running. Zero it every farm frame.
 			local blown = farmBusy and vel > 12
-			-- Mage Student hop: hard teleport between each caster so heals interrupt.
-			local hopping = rt.studentHopping == true
+			-- Mage Student / crystal hop: hard teleport between each target.
+			local hopping = rt.studentHopping == true or rt.crystalHopping == true
 			local tight = snapExact or dodging or blown or hopping
 			-- Meteor gaps: hard snap (0.2), not a soft 0.55 hold that never left the disc.
 			local hold = snapExact and 0.18
@@ -9217,6 +9217,9 @@ local function savesUltForCrystals(npc)
 end
 
 local function holdOnCrystalPack()
+	rt.crystalHopping = true
+	rt.crystalHopAt = 0
+	rt.crystalHopIdx = 0
 	Pin.follow(function()
 		if os.clock() - (rt.aoeScanAt or 0) > 0.2 then
 			rt.aoeScanAt = os.clock()
@@ -9226,18 +9229,52 @@ local function holdOnCrystalPack()
 			return rt.aoeGoal, rt.aoeGoal
 		end
 		local list = listRaidCrystals()
-		local mid = crystalCentroid(list)
-		if not mid then
+		if #list == 0 then
 			return nil
 		end
-		-- Dead center of the crystal pack so one M1 / ult catches all of them.
-		local hover = rt.combatHover()
-		local fy = rt.refreshFarmFloor and rt.refreshFarmFloor(mid) or nil
-		local y = type(fy) == 'number' and (fy + (hover ~= 0 and hover or 3)) or mid.Y
-		local stand = Vector3.new(mid.X, y, mid.Z)
-		rt.farmCrowdAim = mid
+		local now = os.clock()
+		if now - (rt.crystalHopAt or 0) >= 0.22 or (rt.crystalHopIdx or 0) < 1 then
+			rt.crystalHopAt = now
+			rt.crystalHopIdx = ((rt.crystalHopIdx or 0) % #list) + 1
+			rt.crystalHopSwing = true
+		end
+		local idx = rt.crystalHopIdx
+		if idx < 1 or idx > #list then
+			idx = 1
+			rt.crystalHopIdx = 1
+		end
+		local npc = list[idx]
+		local part = enemyRoot(npc)
+		if not part then
+			return nil
+		end
+		rt.farmFightNpc = npc
+		rt.farmCrowdAim = part.Position
 		rt.stickyPlant = nil
-		return stand, mid
+		local hover = rt.combatHover()
+		local pos = part.Position
+		local fy = rt.refreshFarmFloor and rt.refreshFarmFloor(pos) or nil
+		local y
+		if type(fy) == 'number' then
+			y = fy + (hover ~= 0 and hover or 3)
+		elseif hover < 0 then
+			y = pos.Y + hover
+		else
+			y = pos.Y
+		end
+		local stand = Vector3.new(pos.X, y, pos.Z)
+		if hover >= 0 then
+			local me = routeRoot()
+			local flat = me and Vector3.new(me.Position.X - pos.X, 0, me.Position.Z - pos.Z)
+			if flat and flat.Magnitude > 0.4 then
+				stand = pos + flat.Unit * 5
+				stand = Vector3.new(stand.X, y, stand.Z)
+			else
+				stand = Vector3.new(pos.X + 5, y, pos.Z)
+			end
+		end
+		rt.crystalHopLabel = ('crystals · hop %d/%d'):format(idx, #list)
+		return stand, pos
 	end)
 end
 
@@ -9259,12 +9296,21 @@ rt.tryFarmUlt = function()
 	local crystals = listRaidCrystals()
 	local npc = rt.farmFightNpc
 	local onCrystals = #crystals > 0 and (rt.crystalPack == true or (npc and isRaidCrystal(npc)))
-	-- Dark Professor: G on his body wastes the wipe. Hold until the 4 crystals
-	-- are out, then dump from the pack center. Everything else fires immediately.
+	-- Dark Professor: G on his body wastes the wipe. Hold until crystals are out,
+	-- then dump while hopping (near any crystal).
 	if onCrystals then
-		local mid = crystalCentroid(crystals)
 		local me = routeRoot()
-		if not (mid and me and (me.Position - mid).Magnitude <= 16) then
+		local near = false
+		if me then
+			for i = 1, #crystals do
+				local part = enemyRoot(crystals[i])
+				if part and (me.Position - part.Position).Magnitude <= 22 then
+					near = true
+					break
+				end
+			end
+		end
+		if not near then
 			return false
 		end
 	elseif npc and enemyAlive(npc) and savesUltForCrystals(npc) then
@@ -11240,7 +11286,7 @@ local function farmKill(npc)
 			task.wait(0.15)
 		else
 			if crystalPack then
-				farmLabel = ('crystals · %d'):format(#listRaidCrystals())
+				farmLabel = rt.crystalHopLabel or ('crystals · %d'):format(#listRaidCrystals())
 			elseif studentPack then
 				-- Crystals still beat students.
 				local crystal = select(1, nearestCrystal())
@@ -11297,11 +11343,14 @@ local function farmKill(npc)
 			-- Stick to THIS npc until it dies. Mid-fight retarget hopped the stand
 			-- between pack members every ~0.55s (flicker with M1s still landing).
 			-- During meteor volleys: no M1 — position-only dodge.
-			-- Student hops: swing every teleport so each caster gets interrupted.
-			local swingDue = studentPack and rt.studentHopSwing == true
-			if not volley and (swingDue or now - lastHit >= (studentPack and 0.12 or attackDelay())) then
+			-- Student / crystal hops: swing every teleport so each target gets hit.
+			local swingDue = (studentPack and rt.studentHopSwing == true)
+				or (crystalPack and rt.crystalHopSwing == true)
+			local hopPack = studentPack or crystalPack
+			if not volley and (swingDue or now - lastHit >= (hopPack and 0.12 or attackDelay())) then
 				lastHit = now
 				rt.studentHopSwing = false
+				rt.crystalHopSwing = false
 				-- SkillIFrame sticks true on some classes and used to skip every M1.
 				pcall(fireAttack)
 			end
@@ -11366,6 +11415,9 @@ local function farmKill(npc)
 	rt.studentHopping = false
 	rt.studentHopSwing = false
 	rt.studentHopLabel = nil
+	rt.crystalHopping = false
+	rt.crystalHopSwing = false
+	rt.crystalHopLabel = nil
 	rt.commitStudent = false
 	if not (farmBusy and rt.hoverN() < 0) then
 		rt.setFarmPitchHum(false)

@@ -1,6 +1,6 @@
 {
     "version":  "1.0.84",
-    "message":  "P3 students: teleport-hop between each to interrupt all heals",
+    "message":  "P4 crystals: teleport-hop cycle like Mage Students",
     "files":  [
                   "dungeon-lootr/launch.lua",
                   "dungeon-lootr/DungeonLootr.lua",
