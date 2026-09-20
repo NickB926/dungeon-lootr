@@ -141,7 +141,7 @@ Library.ToggleKeybind = { Value = 'Home' }
 Library.Animations = Library.Animations or {}
 Library.Animations.TabSwitch = false
 
-local DL_BUILD = '1.0.54'
+local DL_BUILD = '1.0.55'
 getgenv().DLBuild = DL_BUILD
 -- Do NOT wipe DLShrineSkipKeys on every reload — that re-warps spent altars.
 
@@ -17800,12 +17800,12 @@ rt.PayloadLoop = (function()
 	local function findPayloadPod()
 		local lobby = workspace:FindFirstChild('PayloadLobby')
 		if not lobby then
-			for _ = 1, 20 do
+			for _ = 1, 10 do
 				lobby = workspace:FindFirstChild('PayloadLobby')
 				if lobby then
 					break
 				end
-				task.wait(0.15)
+				task.wait(0.05)
 			end
 		end
 		if not lobby then
@@ -17827,23 +17827,15 @@ rt.PayloadLoop = (function()
 		if not root or not pod or type(firetouchinterest) ~= 'function' then
 			return
 		end
-		local priority = {}
 		for _, name in ipairs({ 'WarpIn', 'Touch' }) do
-			local p = pod:FindFirstChild(name, true)
-			if p and p:IsA('BasePart') then
-				priority[#priority + 1] = p
+			local part = pod:FindFirstChild(name, true)
+			if part and part:IsA('BasePart') then
+				-- Touch off→on→off→on helps cold register without long waits.
+				pcall(firetouchinterest, root, part, 0)
+				pcall(firetouchinterest, root, part, 1)
+				pcall(firetouchinterest, root, part, 0)
+				pcall(firetouchinterest, root, part, 1)
 			end
-		end
-		for _, d in ipairs(pod:GetDescendants()) do
-			if d:IsA('BasePart') and d.CanTouch then
-				priority[#priority + 1] = d
-			end
-		end
-		for _, part in ipairs(priority) do
-			pcall(firetouchinterest, root, part, 0)
-			task.wait(0.03)
-			pcall(firetouchinterest, root, part, 1)
-			task.wait(0.02)
 		end
 	end
 
@@ -17864,51 +17856,45 @@ rt.PayloadLoop = (function()
 		if not root then
 			return false
 		end
-		-- Enter AccessZone first so the lobby streams / zone scripts wake up.
+		-- Live probe: standing 1.6 studs on the pad still failed select until a
+		-- fresh CFrame onto WarpIn + firetouchinterest. Always re-seat.
+		-- Noclip / CanCollide=false also blocks server pad occupancy.
+		rt.holdCollideUntil = os.clock() + 8
+		pcall(setCharNoclip, false)
+		pcall(function()
+			for _, p in ipairs(char:GetDescendants()) do
+				if p:IsA('BasePart') then
+					p.CanCollide = true
+				end
+			end
+		end)
 		local access = lobby and lobby:FindFirstChild('AccessZone')
-		if access and access:IsA('BasePart') then
+		if access and access:IsA('BasePart') and (root.Position - anchor.Position).Magnitude > 80 then
 			pcall(function()
 				root.AssemblyLinearVelocity = Vector3.zero
 				root.CFrame = CFrame.new(access.Position)
 			end)
 			if type(firetouchinterest) == 'function' then
 				pcall(firetouchinterest, root, access, 0)
-				task.wait(0.05)
 				pcall(firetouchinterest, root, access, 1)
 			end
-			task.wait(0.2)
-		end
-		local base = anchor.Position
-		-- Slight jitters help cold-start touch replication.
-		local offsets = {
-			Vector3.new(0, 3, 0),
-			Vector3.new(0.5, 3, 0),
-			Vector3.new(-0.5, 3, 0.5),
-			Vector3.new(0, 2.5, -0.5),
-		}
-		for _, off in ipairs(offsets) do
-			pcall(function()
-				root.AssemblyLinearVelocity = Vector3.zero
-				root.AssemblyAngularVelocity = Vector3.zero
-				root.CFrame = CFrame.new(base + off)
-			end)
-			pulsePodTouch(root, pod)
-			task.wait(0.12)
 		end
 		pcall(function()
-			root.CFrame = CFrame.new(base + Vector3.new(0, 3, 0))
+			root.AssemblyLinearVelocity = Vector3.zero
+			root.AssemblyAngularVelocity = Vector3.zero
+			root.CFrame = CFrame.new(anchor.Position + Vector3.new(0, 3, 0))
 		end)
 		pulsePodTouch(root, pod)
 		return true
 	end
 
-	-- Keep touching the pad until RequestSelectPayload accepts the difficulty.
-	local function selectPayloadDiff(diff, attempts)
-		attempts = attempts or 6
+	-- Hammer select with a fresh pad seat each try (probe: pulse-only was not enough).
+	local function selectPayloadDiff(diff, budget)
+		budget = budget or 1.0
 		local lastMsg = ''
-		for i = 1, attempts do
+		local deadline = os.clock() + budget
+		while os.clock() < deadline do
 			standOnPayloadPod()
-			task.wait(0.2 + (i - 1) * 0.08)
 			local okSel, selRes, selMsg = invoke('RequestSelectPayload', diff)
 			if okSel and selRes ~= false then
 				return true, nil
@@ -17917,9 +17903,8 @@ rt.PayloadLoop = (function()
 			local why = string.lower(lastMsg)
 			if why:find('queue', 1, true) then
 				invoke('RequestLeaveQueue')
-				task.wait(0.3)
 			end
-			-- Re-pulse only; do not open UI yet (that used to race ahead of pad register).
+			task.wait(0.05)
 		end
 		return false, lastMsg
 	end
@@ -18003,6 +17988,21 @@ rt.PayloadLoop = (function()
 		return false
 	end
 
+	local function fireStartChain(panel, diff)
+		standOnPayloadPod()
+		if panel then
+			clickDifficulty(panel, diff)
+			clickEnter(panel)
+		end
+		local okQ, resQ, msgQ = invoke('RequestStartPodQueue')
+		local okS, resS, msgS = invoke('RequestStartNow')
+		if panel then
+			clickEnter(panel)
+		end
+		local ok = (okQ and resQ ~= false) or (okS and resS ~= false)
+		return ok, tostring(msgS or msgQ or resS or resQ or '')
+	end
+
 	function api.enter(silent)
 		if busy then
 			return false
@@ -18024,123 +18024,77 @@ rt.PayloadLoop = (function()
 		task.spawn(function()
 			local ok = false
 			local failWhy = ''
-			-- Cold lobby: pad register often fails 1–2 times. Retry the whole
-			-- select → queue → START NOW chain before giving up.
-			for attempt = 1, 4 do
-				if inPayloadNow() or LocalPlayer:GetAttribute('InPayload') == true then
-					ok = true
-					failWhy = ''
-					break
-				end
+			-- Proven: collide on → CFrame WarpIn → firetouch → Select → PodQueue → StartNow.
+			rt.holdCollideUntil = os.clock() + 10
+			pcall(setCharNoclip, false)
+			standOnPayloadPod()
+			local panel = ensurePayloadOpen()
+			if panel and isQueuedUi(panel) then
 				standOnPayloadPod()
-				task.wait(0.25)
-				local panel = ensurePayloadOpen()
-				local alreadyQueued = panel and isQueuedUi(panel)
-
-				if alreadyQueued then
-					standOnPayloadPod()
-					task.wait(0.15)
-					local okRf, res, msg = invoke('RequestStartNow')
-					ok = okRf and res ~= false
-					if not ok and panel then
-						ok = clickEnter(panel)
-					end
+				local okRf, res, msg = invoke('RequestStartNow')
+				ok = (okRf and res ~= false) or clickEnter(panel)
+				failWhy = ok and '' or tostring(msg or res or 'START NOW failed')
+			else
+				invoke('RequestPartyData')
+				local okSel, selMsg = selectPayloadDiff(diff, 1.2)
+				panel = ensurePayloadOpen() or panel
+				if okSel then
+					local started, why = fireStartChain(panel, diff)
+					ok = started
+					failWhy = ok and '' or why
 					if not ok then
-						failWhy = tostring(msg or res or 'START NOW failed')
-					else
-						failWhy = ''
-						break
+						for _ = 1, 5 do
+							local s2, w2 = fireStartChain(panel or ensurePayloadOpen(), diff)
+							if s2 or isQueuedUi(payloadPanel()) or inPayloadNow() then
+								ok = true
+								failWhy = ''
+								break
+							end
+							failWhy = w2 ~= '' and w2 or failWhy
+							task.wait(0.05)
+						end
 					end
 				else
-					invoke('RequestPartyData')
-					task.wait(0.08)
-					local okSel, selMsg = selectPayloadDiff(diff, 5)
-					if not okSel then
-						failWhy = tostring(selMsg or 'Stand on a Payload pad first.')
-						-- Keep trying next outer attempt.
-					else
-						panel = ensurePayloadOpen() or panel
-						if panel then
-							clickDifficulty(panel, diff)
-							task.wait(0.12)
-						end
-						standOnPayloadPod()
-						task.wait(0.15)
-						local okRf, res, msg = invoke('RequestStartPodQueue')
-						if not (okRf and res ~= false) then
-							failWhy = tostring(msg or res or failWhy)
-							if panel then
-								clickEnter(panel)
-								task.wait(0.3)
+					failWhy = tostring(selMsg or 'Stand on a Payload pad first.')
+					for _ = 1, 6 do
+						if selectPayloadDiff(diff, 0.4) then
+							local started = fireStartChain(panel or ensurePayloadOpen(), diff)
+							if started or isQueuedUi(payloadPanel()) or inPayloadNow() then
+								ok = true
+								failWhy = ''
+								break
 							end
 						end
-						task.wait(0.3)
-						standOnPayloadPod()
-						task.wait(0.15)
-						okRf, res, msg = invoke('RequestStartNow')
-						ok = okRf and res ~= false
-						if not ok then
-							failWhy = tostring(msg or res or failWhy)
-							panel = payloadPanel() or panel
-							if panel then
-								ok = clickEnter(panel)
-								if ok then
-									failWhy = ''
-								end
-							end
-						else
-							failWhy = ''
-						end
-						if ok then
-							break
-						end
+						task.wait(0.05)
 					end
 				end
-				task.wait(0.45)
 			end
 
-			-- Confirm we actually left the lobby select (departing / InPayload).
 			if ok then
-				local deadline = os.clock() + 8
+				local deadline = os.clock() + 3
 				while os.clock() < deadline do
 					if inPayloadNow() or LocalPlayer:GetAttribute('InPayload') == true then
 						failWhy = ''
 						break
 					end
 					local p = payloadPanel()
-					if p and isQueuedUi(p) then
-						standOnPayloadPod()
-						invoke('RequestStartNow')
-						clickEnter(p)
-					elseif p and p.Visible then
-						-- Still showing ENTER — pad may have dropped; one more select/start.
-						local okSel = selectPayloadDiff(diff, 2)
-						if okSel then
-							standOnPayloadPod()
-							invoke('RequestStartPodQueue')
-							task.wait(0.25)
-							invoke('RequestStartNow')
-							clickEnter(p)
-						end
+					if p and p.Visible then
+						fireStartChain(p, diff)
 					end
 					pcall(function()
-						-- Board/Ready may already be up during departing.
-						if rt.PayloadLoop then
-							-- boardReadyTick is local; click Ready directly here.
-							local pg = LocalPlayer:FindFirstChild('PlayerGui')
-							local ready = pg and pg.Main and pg.Main.HUD
-								and pg.Main.HUD.Dungeon_Container
-								and pg.Main.HUD.Dungeon_Container:FindFirstChild('Ready')
-							if ready and ready.Visible then
-								local lab = ready:FindFirstChild('TextLabel')
-								local t = string.upper(tostring(lab and lab.Text or ''))
-								if t == 'BOARD' or t == 'READY' then
-									clickGui(ready)
-								end
+						local pg = LocalPlayer:FindFirstChild('PlayerGui')
+						local ready = pg and pg.Main and pg.Main.HUD
+							and pg.Main.HUD.Dungeon_Container
+							and pg.Main.HUD.Dungeon_Container:FindFirstChild('Ready')
+						if ready and ready.Visible then
+							local lab = ready:FindFirstChild('TextLabel')
+							local t = string.upper(tostring(lab and lab.Text or ''))
+							if t == 'BOARD' or t == 'READY' then
+								clickGui(ready)
 							end
 						end
 					end)
-					task.wait(0.4)
+					task.wait(0.1)
 				end
 				if not inPayloadNow() and LocalPlayer:GetAttribute('InPayload') ~= true then
 					local p = payloadPanel()
@@ -18218,8 +18172,10 @@ rt.PayloadLoop = (function()
 
 	-- HUD.Dungeon_Container.Ready: BOARD → ReturnToShip, READY → SetReady(true).
 	-- Same slot becomes CANCEL while ready / Departing... — never press those.
+	-- Runs on combat Heartbeat (every frame), not the slow ESP tick (~0.55–2s).
 	local function boardReadyTick()
-		if os.clock() - (rt.payloadBoardAt or 0) < 0.85 then
+		local now = os.clock()
+		if now - (rt.payloadBoardAt or 0) < 0.12 then
 			return false
 		end
 		local pg = LocalPlayer:FindFirstChild('PlayerGui')
@@ -18228,6 +18184,9 @@ rt.PayloadLoop = (function()
 		local container = hud and hud:FindFirstChild('Dungeon_Container')
 		local readyBtn = container and container:FindFirstChild('Ready')
 		if not readyBtn or not readyBtn:IsA('GuiButton') or readyBtn.Visible ~= true then
+			return false
+		end
+		if readyBtn.Active == false then
 			return false
 		end
 		local lab = readyBtn:FindFirstChild('TextLabel')
@@ -18240,38 +18199,26 @@ rt.PayloadLoop = (function()
 			return false
 		end
 
-		local st = nil
-		local okSt, session = payloadRF('GetSessionState')
-		if okSt and type(session) == 'table' then
-			st = session
-		end
-		if st then
-			if st.Active ~= true or st.CanReady ~= true then
-				-- Still click BOARD/READY if the HUD says so — CanReady can lag a frame.
-			end
-			if st.IsReady == true and label == 'READY' then
-				return false
-			end
-			if label == 'BOARD' or st.OnBoat ~= true then
-				rt.payloadBoardAt = os.clock()
-				payloadRF('ReturnToShip')
-				clickGui(readyBtn)
-				return true
-			end
-			if label == 'READY' and st.OnBoat == true then
-				rt.payloadBoardAt = os.clock()
-				payloadRF('SetReady', st.RunId, st.Generation, true)
-				clickGui(readyBtn)
-				return true
-			end
-		end
-
-		rt.payloadBoardAt = os.clock()
-		if label == 'BOARD' then
-			payloadRF('ReturnToShip')
-		end
+		-- Click immediately — do not wait on GetSessionState RTT (that alone was ~1s).
+		rt.payloadBoardAt = now
 		clickGui(readyBtn)
+		if label == 'BOARD' then
+			task.spawn(function()
+				payloadRF('ReturnToShip')
+			end)
+		else
+			task.spawn(function()
+				local okSt, st = payloadRF('GetSessionState')
+				if okSt and type(st) == 'table' and st.OnBoat == true and st.IsReady ~= true then
+					payloadRF('SetReady', st.RunId, st.Generation, true)
+				end
+			end)
+		end
 		return true
+	end
+
+	function api.boardReadyTick()
+		return boardReadyTick()
 	end
 
 	function api.tick()
@@ -18280,7 +18227,7 @@ rt.PayloadLoop = (function()
 			rt.payloadEnteredAt = nil
 			return
 		end
-		-- Board / Ready while the departing HUD is up (even mid-lobby transition).
+		-- Board/Ready is on combat Heartbeat; still poke here as a backup.
 		pcall(boardReadyTick)
 		if inPayloadNow() then
 			armedAt = 0
@@ -21727,6 +21674,10 @@ hbCombatConn = track(RunService.Heartbeat:Connect(function(dt)
 	pcall(autoSkillTick)
 	pcall(RunLoops.autoFarmTick)
 	pcall(RunLoops.stuckFarmTick)
+	-- Payload Board/Ready must be frame-rate — the ESP heartbeat is 0.55–2s.
+	if on('DLPayloadLoop') and rt.PayloadLoop and rt.PayloadLoop.boardReadyTick then
+		pcall(rt.PayloadLoop.boardReadyTick)
+	end
 	-- Sweep marks: once per ~2s while farming (combat+ESP both used to call it).
 	if (farmBusy or LocalPlayer:GetAttribute('InDungeon') == true)
 		and os.clock() - (rt.sweepMarkAt or 0) > (farmBusy and 2.0 or 0.75)

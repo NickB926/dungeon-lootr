@@ -1,5 +1,5 @@
 {
-    "version":  "1.0.54",
+    "version":  "1.0.55",
     "message":  "Go to the floor boss instead of touring empty rooms",
     "files":  [
                   "dungeon-lootr/launch.lua",
