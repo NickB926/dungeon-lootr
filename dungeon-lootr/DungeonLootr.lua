@@ -141,7 +141,7 @@ Library.ToggleKeybind = { Value = 'Home' }
 Library.Animations = Library.Animations or {}
 Library.Animations.TabSwitch = false
 
-local DL_BUILD = '1.0.82'
+local DL_BUILD = '1.0.83'
 getgenv().DLBuild = DL_BUILD
 -- Do NOT wipe DLShrineSkipKeys on every reload — that re-warps spent altars.
 
@@ -13276,7 +13276,7 @@ local function farmLoop()
 						rt.commitStudent = true
 						rt.aoeGoal = nil
 						rt.aoeUntil = 0
-						farmLabel = ('student · %s'):format(raidNpc.Name)
+						farmLabel = ('students · %d'):format(#listMageStudents())
 					end
 					pcall(snapToRaidTarget, raidNpc)
 					farmKillNpc(raidNpc)
