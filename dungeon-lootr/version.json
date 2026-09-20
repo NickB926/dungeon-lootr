@@ -1,6 +1,6 @@
 {
     "version":  "1.0.82",
-    "message":  "Menu toggle: Auto inject on join (no_autoload off-switch)",
+    "message":  "P3 Mage Students: stand pack center to interrupt all heals",
     "files":  [
                   "dungeon-lootr/launch.lua",
                   "dungeon-lootr/DungeonLootr.lua",

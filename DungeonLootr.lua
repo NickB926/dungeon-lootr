@@ -9355,6 +9355,41 @@ local function findMageStudent()
 	return best, bestD
 end
 
+-- All live Mage Students — stand in their center so one M1 interrupts every heal.
+local function listMageStudents()
+	local out = {}
+	eachFarmNpc(function(npc)
+		if isMageStudent(npc) and enemyAlive(npc) and not farmSkipped(npc) and enemyRoot(npc) then
+			out[#out + 1] = npc
+		end
+	end)
+	return out
+end
+
+local function holdOnStudentPack()
+	Pin.follow(function()
+		-- Students cast heals; never yield the center pin to Professor meteors.
+		local list = listMageStudents()
+		local mid = crystalCentroid(list)
+		if not mid then
+			return nil
+		end
+		local hover = rt.combatHover()
+		local fy = rt.refreshFarmFloor and rt.refreshFarmFloor(mid) or nil
+		local y = type(fy) == 'number' and (fy + (hover ~= 0 and hover or 3)) or mid.Y
+		local stand = Vector3.new(mid.X, y, mid.Z)
+		rt.farmCrowdAim = mid
+		rt.stickyPlant = nil
+		-- Face the densest side of the student pack so the M1 slab covers them.
+		local me = routeRoot()
+		local aim = mid
+		if type(crowdAimFrom) == 'function' then
+			aim = crowdAimFrom(me and me.Position or mid, list[1]) or mid
+		end
+		return stand, aim
+	end)
+end
+
 local function addsNearSpecial(anchor)
 	local me = routeRoot()
 	local ap = anchor and enemyRoot(anchor)
@@ -11032,25 +11067,27 @@ local function farmKill(npc)
 	local crystalPack = isRaidCrystal(npc)
 	local addAnchor = nil
 	local addPack = false
+	local studentPack = false
 	local studentTarget = isMageStudent(npc)
 	if studentTarget then
 		-- Commit hard: clear gap pin and never stall-ban these.
+		-- Stand in the CENTER of every Mage Student so one slab interrupts heals
+		-- on all of them — never tunnel one while the others cast.
 		rt.commitStudent = true
 		rt.aoeGoal = nil
 		rt.aoeUntil = 0
+		rt.aoeVolleyUntil = 0
+		rt.aoeDiscs = false
 		rt.stickyPlant = nil
 		sticky = true
 		timeout = 180
+		studentPack = true
 		farmBan[npc] = nil
 	end
-	if not crystalPack and isAwakeAdd(npc) then
+	if not crystalPack and not studentPack and isAwakeAdd(npc) then
 		addAnchor = raidSpecialAnchor()
 		if addAnchor and #listAddsNearSpecial(addAnchor) >= 2 then
 			addPack = true
-		end
-		-- Single Mage Student still counts as sticky add fight.
-		if studentTarget then
-			addPack = false
 		end
 	end
 	if (tonumber(npc:GetAttribute('HealthOverride')) or 0) >= 1e7
@@ -11060,6 +11097,9 @@ local function farmKill(npc)
 		timeout = 1200
 	elseif crystalPack then
 		timeout = 90
+		sticky = true
+	elseif studentPack then
+		timeout = 180
 		sticky = true
 	elseif addPack then
 		timeout = 120
@@ -11073,17 +11113,18 @@ local function farmKill(npc)
 	-- watches health, so its cadence no longer affects how smooth movement looks.
 	rt.crystalPack = crystalPack == true
 	rt.addPack = addPack == true
+	rt.studentPack = studentPack == true
 	if crystalPack then
 		holdOnCrystalPack()
 		farmLabel = ('crystals · %d'):format(#listRaidCrystals())
+	elseif studentPack then
+		holdOnStudentPack()
+		farmLabel = ('students · %d'):format(#listMageStudents())
 	elseif addPack then
 		holdOnAddPack(addAnchor)
 		farmLabel = ('adds · %d'):format(#listAddsNearSpecial(addAnchor))
 	else
 		holdOnEnemy(npc)
-		if studentTarget then
-			farmLabel = ('student · %s'):format(npc.Name)
-		end
 	end
 	pcall(watchEnemy, npc)
 	rt.farmFightNpc = npc
@@ -11098,6 +11139,9 @@ local function farmKill(npc)
 		if crystalPack then
 			return #listRaidCrystals() > 0
 		end
+		if studentPack then
+			return #listMageStudents() > 0
+		end
 		if addPack then
 			return #listAddsNearSpecial(addAnchor) > 0
 		end
@@ -11107,7 +11151,9 @@ local function farmKill(npc)
 		local now = os.clock()
 		-- Meteor volley: dodge only. Swinging at the Professor mid-gap is what
 		-- walked you back into the next disc and stalled re-engage.
-		local volley = not studentTarget
+		-- Student pack: keep swinging — their heals matter more than gaps.
+		local volley = not studentPack
+			and not studentTarget
 			and not crystalPack
 			and rt.aoeVolleyActive
 			and rt.aoeVolleyActive()
@@ -11155,6 +11201,14 @@ local function farmKill(npc)
 		else
 			if crystalPack then
 				farmLabel = ('crystals · %d'):format(#listRaidCrystals())
+			elseif studentPack then
+				-- Crystals still beat students.
+				local crystal = select(1, nearestCrystal())
+				if crystal then
+					farmLabel = ('crystal · %s'):format(crystal.Name)
+					break
+				end
+				farmLabel = ('students · %d'):format(#listMageStudents())
 			elseif addPack then
 				-- Crystals still beat adds — break out so pickFarmTarget can swap.
 				local crystal = select(1, nearestCrystal())
@@ -11190,7 +11244,7 @@ local function farmKill(npc)
 				end
 				if add then
 					farmLabel = isMageStudent(add)
-						and ('student · %s'):format(add.Name)
+						and ('students · %s'):format(add.Name)
 						or ('adds · %s'):format(add.Name)
 					if farmLock == npc then
 						farmLock = nil
@@ -11216,7 +11270,7 @@ local function farmKill(npc)
 			local aoeBusy = volley
 				or os.clock() < (rt.aoeUntil or 0)
 				or (rt.aoeClearAt and os.clock() - rt.aoeClearAt < 1.25)
-			if aoeBusy or isRaidBossNpc(npc) or enemyRank(npc) >= 4 or studentTarget then
+			if aoeBusy or isRaidBossNpc(npc) or enemyRank(npc) >= 4 or studentTarget or studentPack then
 				lastDrop = now
 			end
 			if readable and not sticky and not crystalPack and not addPack then
@@ -11265,6 +11319,7 @@ local function farmKill(npc)
 	rt.farmPitchYaw = nil
 	rt.crystalPack = false
 	rt.addPack = false
+	rt.studentPack = false
 	rt.commitStudent = false
 	if not (farmBusy and rt.hoverN() < 0) then
 		rt.setFarmPitchHum(false)
