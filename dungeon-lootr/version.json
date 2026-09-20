@@ -1,6 +1,6 @@
 {
-    "version":  "1.0.90",
-    "message":  "Meteor dodge: inflate discs + 8stud clearance for overlaps",
+    "version":  "1.0.91",
+    "message":  "Instant farm/dodge resume after death; stop arming replay on die",
     "files":  [
                   "dungeon-lootr/launch.lua",
                   "dungeon-lootr/DungeonLootr.lua",

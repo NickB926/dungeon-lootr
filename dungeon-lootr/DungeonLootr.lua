@@ -141,7 +141,7 @@ Library.ToggleKeybind = { Value = 'Home' }
 Library.Animations = Library.Animations or {}
 Library.Animations.TabSwitch = false
 
-local DL_BUILD = '1.0.90'
+local DL_BUILD = '1.0.91'
 getgenv().DLBuild = DL_BUILD
 -- Do NOT wipe DLShrineSkipKeys on every reload — that re-warps spent altars.
 
@@ -546,7 +546,7 @@ rt.bindCharHp = function(char)
 	end
 	local hum = char:FindFirstChildOfClass('Humanoid')
 	if not hum then
-		hum = char:WaitForChild('Humanoid', 5)
+		hum = char:WaitForChild('Humanoid', 1)
 	end
 	if not hum then
 		return
@@ -572,9 +572,10 @@ rt.bindCharHp = function(char)
 		end
 	end))
 	track(hum.Died:Connect(function()
-		if LocalPlayer:GetAttribute('InDungeon') == true or LocalPlayer:GetAttribute('DungeonRun') == true then
-			runCompleteAt = os.clock()
-		end
+		-- Mid-fight death must NOT set runCompleteAt — that armed Auto replay
+		-- and stalled farm/dodge for seconds. DungeonComplete owns end-of-run.
+		rt.combatHold = 0
+		rt.healWait = false
 	end))
 end
 
@@ -11614,7 +11615,8 @@ local function farmKill(npc)
 			rt.aoeGoal = nil
 			rt.aoeDiscs = false
 			rt.stickyPlant = nil
-			runCompleteAt = runCompleteAt or os.clock()
+			rt.combatHold = 0
+			rt.healWait = false
 			break
 		elseif (on('DLAutoPotion') or on('DLAutoFlee')) and rt.updateHealWait(myPct) then
 			farmLabel = ('heal · %d%% / %d%%'):format(math.floor(myPct + 0.5), rt.healResume())
@@ -13667,10 +13669,10 @@ local function farmLoop()
 			-- Stay in the loop across death so Return-on-stop does not yank home.
 			farmLabel = 'waiting · respawn'
 			rt.farmKillAt = os.clock()
-			if LocalPlayer:GetAttribute('InDungeon') == true then
-				runCompleteAt = runCompleteAt or os.clock()
-			end
-			task.wait(0.45)
+			rt.combatHold = 0
+			rt.healWait = false
+			-- Poll hard — 0.45s waits were the "farm delayed after death" feel.
+			task.wait(0.05)
 		elseif (rt.refillBusy or rt.refillUrgent) and not rt.clearRefillHold() then
 			farmLabel = 'potion refill'
 			rt.farmKillAt = os.clock()
@@ -22943,10 +22945,30 @@ track(LocalPlayer.CharacterAdded:Connect(function(char)
 	if on('DLInvisicam') then
 		pcall(rt.applyOcclusion, true)
 	end
-	if farmBusy then
+	if farmBusy or on('DLAutoFarm') then
+		-- Instant re-engage: clear holds that parked farm/dodge after a death.
+		rt.combatHold = 0
+		rt.healWait = false
+		rt.aoeUntil = 0
+		rt.aoeVolleyUntil = 0
+		rt.aoeGoal = nil
+		rt.aoeDiscs = false
+		rt.stickyPlant = nil
+		rt.farmKillAt = os.clock()
+		noclipOn = true
+		pcall(setCharNoclip, true)
 		task.defer(function()
 			noclipOn = true
 			pcall(setCharNoclip, true)
+			-- Kick dodge immediately if meteors are already painted.
+			if type(rt.avoidFloorAoe) == 'function' then
+				local ok, hit = pcall(rt.avoidFloorAoe)
+				if ok and hit and typeof(rt.aoeGoal) == 'Vector3' then
+					pcall(function()
+						Pin.at(rt.aoeGoal, true)
+					end)
+				end
+			end
 		end)
 	end
 end))
