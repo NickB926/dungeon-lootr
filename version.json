@@ -1,6 +1,6 @@
 {
     "version":  "1.0.83",
-    "message":  "P3 Mage Students: stand pack center to interrupt all heals",
+    "message":  "P3 students: teleport-hop between each to interrupt all heals",
     "files":  [
                   "dungeon-lootr/launch.lua",
                   "dungeon-lootr/DungeonLootr.lua",

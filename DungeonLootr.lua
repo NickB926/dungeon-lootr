@@ -2273,9 +2273,14 @@ local Pin = (function()
 			-- Knockback used to keep velocity after a 1.35 hold, which slid the
 			-- rig while the humanoid stayed Running. Zero it every farm frame.
 			local blown = farmBusy and vel > 12
-			local tight = snapExact or dodging or blown
+			-- Mage Student hop: hard teleport between each caster so heals interrupt.
+			local hopping = rt.studentHopping == true
+			local tight = snapExact or dodging or blown or hopping
 			-- Meteor gaps: hard snap (0.2), not a soft 0.55 hold that never left the disc.
-			local hold = snapExact and 0.18 or (dodging and 0.2 or (farmBusy and 0.55 or 0.55))
+			local hold = snapExact and 0.18
+				or (hopping and 0.15)
+				or (dodging and 0.2)
+				or (farmBusy and 0.55 or 0.55)
 			if farmBusy then
 				myRoot.AssemblyLinearVelocity = Vector3.zero
 				myRoot.AssemblyAngularVelocity = Vector3.zero
@@ -9355,7 +9360,7 @@ local function findMageStudent()
 	return best, bestD
 end
 
--- All live Mage Students — stand in their center so one M1 interrupts every heal.
+-- All live Mage Students.
 local function listMageStudents()
 	local out = {}
 	eachFarmNpc(function(npc)
@@ -9366,27 +9371,62 @@ local function listMageStudents()
 	return out
 end
 
+-- Teleport between every Mage Student in a tight loop so each heal cast is hit.
 local function holdOnStudentPack()
+	rt.studentHopping = true
+	rt.studentHopAt = 0
+	rt.studentHopIdx = 0
 	Pin.follow(function()
-		-- Students cast heals; never yield the center pin to Professor meteors.
 		local list = listMageStudents()
-		local mid = crystalCentroid(list)
-		if not mid then
+		if #list == 0 then
 			return nil
 		end
-		local hover = rt.combatHover()
-		local fy = rt.refreshFarmFloor and rt.refreshFarmFloor(mid) or nil
-		local y = type(fy) == 'number' and (fy + (hover ~= 0 and hover or 3)) or mid.Y
-		local stand = Vector3.new(mid.X, y, mid.Z)
-		rt.farmCrowdAim = mid
-		rt.stickyPlant = nil
-		-- Face the densest side of the student pack so the M1 slab covers them.
-		local me = routeRoot()
-		local aim = mid
-		if type(crowdAimFrom) == 'function' then
-			aim = crowdAimFrom(me and me.Position or mid, list[1]) or mid
+		local now = os.clock()
+		-- ~3–4 hops/sec — short enough that every student eats an M1 before heal.
+		if now - (rt.studentHopAt or 0) >= 0.22 or (rt.studentHopIdx or 0) < 1 then
+			rt.studentHopAt = now
+			rt.studentHopIdx = ((rt.studentHopIdx or 0) % #list) + 1
+			rt.studentHopSwing = true
 		end
-		return stand, aim
+		local idx = rt.studentHopIdx
+		if idx < 1 or idx > #list then
+			idx = 1
+			rt.studentHopIdx = 1
+		end
+		local npc = list[idx]
+		local part = enemyRoot(npc)
+		if not part then
+			return nil
+		end
+		rt.farmFightNpc = npc
+		rt.farmCrowdAim = part.Position
+		rt.stickyPlant = nil
+		local hover = rt.combatHover()
+		local pos = part.Position
+		local fy = rt.refreshFarmFloor and rt.refreshFarmFloor(pos) or nil
+		local y
+		if type(fy) == 'number' then
+			y = fy + (hover ~= 0 and hover or 3)
+		elseif hover < 0 then
+			-- Look-up M1: sit under this student.
+			y = pos.Y + hover
+		else
+			y = pos.Y
+		end
+		-- Negative hover: plant under them. Otherwise stand on their XZ.
+		local stand = Vector3.new(pos.X, y, pos.Z)
+		if hover >= 0 then
+			local me = routeRoot()
+			local flat = me and Vector3.new(me.Position.X - pos.X, 0, me.Position.Z - pos.Z)
+			if flat and flat.Magnitude > 0.4 then
+				stand = pos + flat.Unit * 5
+				stand = Vector3.new(stand.X, y, stand.Z)
+			else
+				stand = Vector3.new(pos.X + 5, y, pos.Z)
+			end
+		end
+		rt.studentHopLabel = ('students · hop %d/%d'):format(idx, #list)
+		return stand, pos
 	end)
 end
 
@@ -11208,7 +11248,7 @@ local function farmKill(npc)
 					farmLabel = ('crystal · %s'):format(crystal.Name)
 					break
 				end
-				farmLabel = ('students · %d'):format(#listMageStudents())
+				farmLabel = rt.studentHopLabel or ('students · %d'):format(#listMageStudents())
 			elseif addPack then
 				-- Crystals still beat adds — break out so pickFarmTarget can swap.
 				local crystal = select(1, nearestCrystal())
@@ -11257,8 +11297,11 @@ local function farmKill(npc)
 			-- Stick to THIS npc until it dies. Mid-fight retarget hopped the stand
 			-- between pack members every ~0.55s (flicker with M1s still landing).
 			-- During meteor volleys: no M1 — position-only dodge.
-			if not volley and now - lastHit >= attackDelay() then
+			-- Student hops: swing every teleport so each caster gets interrupted.
+			local swingDue = studentPack and rt.studentHopSwing == true
+			if not volley and (swingDue or now - lastHit >= (studentPack and 0.12 or attackDelay())) then
 				lastHit = now
+				rt.studentHopSwing = false
 				-- SkillIFrame sticks true on some classes and used to skip every M1.
 				pcall(fireAttack)
 			end
@@ -11320,6 +11363,9 @@ local function farmKill(npc)
 	rt.crystalPack = false
 	rt.addPack = false
 	rt.studentPack = false
+	rt.studentHopping = false
+	rt.studentHopSwing = false
+	rt.studentHopLabel = nil
 	rt.commitStudent = false
 	if not (farmBusy and rt.hoverN() < 0) then
 		rt.setFarmPitchHum(false)
