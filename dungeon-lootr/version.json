@@ -1,6 +1,6 @@
 {
-    "version":  "1.0.85",
-    "message":  "students: solo burn lock; multi hop faster + cast priority + double M1",
+    "version":  "1.0.86",
+    "message":  "P3 spread students: hop all casting heals, sticky only when one caster",
     "files":  [
                   "dungeon-lootr/launch.lua",
                   "dungeon-lootr/DungeonLootr.lua",
