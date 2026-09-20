@@ -1,6 +1,6 @@
 {
-    "version":  "1.0.89",
-    "message":  "P3 students: hop full pack with hit-confirm, no sticky-one",
+    "version":  "1.0.90",
+    "message":  "Meteor dodge: inflate discs + 8stud clearance for overlaps",
     "files":  [
                   "dungeon-lootr/launch.lua",
                   "dungeon-lootr/DungeonLootr.lua",

@@ -141,7 +141,7 @@ Library.ToggleKeybind = { Value = 'Home' }
 Library.Animations = Library.Animations or {}
 Library.Animations.TabSwitch = false
 
-local DL_BUILD = '1.0.89'
+local DL_BUILD = '1.0.90'
 getgenv().DLBuild = DL_BUILD
 -- Do NOT wipe DLShrineSkipKeys on every reload — that re-warps spent altars.
 
@@ -4583,7 +4583,9 @@ rt.avoidFloorAoe = function()
 		if not (namedDanger(part.Name) or folderHit or (hot and flat) or loose) then
 			return
 		end
-		local r = math.max(6, span * 0.5)
+		-- Visual span under-reads the real blast — inflate so overlap edges
+		-- do not leave a "safe" tile that still eats the strike.
+		local r = math.max(6, span * 0.5) + 5
 		circles[#circles + 1] = { x = pos.X, z = pos.Z, r = r }
 	end
 	local function scan(root, cap)
@@ -4720,26 +4722,45 @@ rt.avoidFloorAoe = function()
 		end
 		return false
 	end
-	-- Safe in a gap while discs still exist: HOLD the gap. Old code cleared the
-	-- pin here and replanted under the boss mid-volley.
-	if not covered(me.X, me.Z, 2.5) then
+	-- Studs outside the (already inflated) disc edge. Overlapping circles need
+	-- a real gap, not "barely outside one ring."
+	local SAFE_PAD = 8
+	local function clearance(x, z)
+		local best = 1e9
+		for i = 1, #circles do
+			local c = circles[i]
+			local dx = x - c.x
+			local dz = z - c.z
+			local d = math.sqrt(dx * dx + dz * dz) - c.r
+			if d < best then
+				best = d
+			end
+		end
+		return best
+	end
+	-- Safe in a gap while discs still exist: HOLD only if far from EVERY disc.
+	-- Old pad 2.5 left you on the rim; a second overlapping strike still hit.
+	if clearance(me.X, me.Z) >= SAFE_PAD then
 		rt.aoeUntil = os.clock() + 1.4
 		rt.stickyPlant = nil
-		if typeof(rt.aoeGoal) ~= 'Vector3' or covered(rt.aoeGoal.X, rt.aoeGoal.Z, 2.5) then
+		if typeof(rt.aoeGoal) ~= 'Vector3' or clearance(rt.aoeGoal.X, rt.aoeGoal.Z) < SAFE_PAD then
 			rt.aoeGoal = holdHere()
 		end
 		return true
 	end
-	local best, bestD = nil, nil
+	local best, bestScore = nil, nil
 	local function tryAt(x, z)
-		if covered(x, z, 4) then
+		local clear = clearance(x, z)
+		if clear < SAFE_PAD then
 			return
 		end
 		local dx = x - me.X
 		local dz = z - me.Z
-		local d = dx * dx + dz * dz
-		if not bestD or d < bestD then
-			bestD = d
+		local dist = math.sqrt(dx * dx + dz * dz)
+		-- Prefer roomy gaps nearby — max clearance, then closer.
+		local score = clear * 40 - dist
+		if not bestScore or score > bestScore then
+			bestScore = score
 			local fy = rt.refreshFarmFloor(Vector3.new(x, me.Y, z))
 			best = Vector3.new(x, standY(fy, me.Y), z)
 		end
@@ -4752,36 +4773,36 @@ rt.avoidFloorAoe = function()
 		if mag > 0.4 then
 			ux, uz = fx / mag, fz / mag
 		end
-		-- Push further out — r+8 still sat inside overlapping 23-stud discs.
-		tryAt(c.x + ux * (c.r + 14), c.z + uz * (c.r + 14))
-		tryAt(c.x + ux * (c.r + 22), c.z + uz * (c.r + 22))
+		-- Push well past inflated rim — overlaps need the outer ring.
+		tryAt(c.x + ux * (c.r + SAFE_PAD + 2), c.z + uz * (c.r + SAFE_PAD + 2))
+		tryAt(c.x + ux * (c.r + SAFE_PAD + 12), c.z + uz * (c.r + SAFE_PAD + 12))
+		tryAt(c.x + ux * (c.r + SAFE_PAD + 22), c.z + uz * (c.r + SAFE_PAD + 22))
+		-- Side steps around the rim in case the radial line is covered by another disc.
+		local px, pz = -uz, ux
+		tryAt(c.x + ux * (c.r + SAFE_PAD + 8) + px * 10, c.z + uz * (c.r + SAFE_PAD + 8) + pz * 10)
+		tryAt(c.x + ux * (c.r + SAFE_PAD + 8) - px * 10, c.z + uz * (c.r + SAFE_PAD + 8) - pz * 10)
 	end
-	for i = 0, 15 do
-		local a = i / 16 * math.pi * 2
+	for i = 0, 23 do
+		local a = i / 24 * math.pi * 2
 		local ca, sa = math.cos(a), math.sin(a)
-		tryAt(me.X + ca * 14, me.Z + sa * 14)
-		tryAt(me.X + ca * 22, me.Z + sa * 22)
-		tryAt(me.X + ca * 32, me.Z + sa * 32)
-		tryAt(me.X + ca * 42, me.Z + sa * 42)
+		tryAt(me.X + ca * 18, me.Z + sa * 18)
+		tryAt(me.X + ca * 28, me.Z + sa * 28)
+		tryAt(me.X + ca * 38, me.Z + sa * 38)
+		tryAt(me.X + ca * 50, me.Z + sa * 50)
 	end
 	if not best then
-		-- Nowhere clean: stand on the least-covered candidate.
-		local least, leastN = nil, 1e9
-		for i = 0, 15 do
-			local a = i / 16 * math.pi * 2
-			local x = me.X + math.cos(a) * 24
-			local z = me.Z + math.sin(a) * 24
-			local n = 0
-			for j = 1, #circles do
-				local c = circles[j]
-				local dx, dz = x - c.x, z - c.z
-				if dx * dx + dz * dz < (c.r + 2) * (c.r + 2) then
-					n += 1
+		-- Nowhere fully clean: stand on the point with the most clearance.
+		local least, leastClear = nil, -1e9
+		for i = 0, 23 do
+			local a = i / 24 * math.pi * 2
+			for _, rad in ipairs({ 20, 30, 42, 54 }) do
+				local x = me.X + math.cos(a) * rad
+				local z = me.Z + math.sin(a) * rad
+				local clear = clearance(x, z)
+				if clear > leastClear then
+					leastClear = clear
+					least = Vector3.new(x, standY(rt.refreshFarmFloor(Vector3.new(x, me.Y, z)), me.Y), z)
 				end
-			end
-			if n < leastN then
-				leastN = n
-				least = Vector3.new(x, standY(rt.refreshFarmFloor(Vector3.new(x, me.Y, z)), me.Y), z)
 			end
 		end
 		best = least
@@ -4789,11 +4810,11 @@ rt.avoidFloorAoe = function()
 	if not best then
 		return false
 	end
-	-- Sticky gap: only retarget if the old goal is covered or far from the new best.
-	if typeof(rt.aoeGoal) == 'Vector3' and not covered(rt.aoeGoal.X, rt.aoeGoal.Z, 3) then
+	-- Sticky gap: only keep old goal if it still has full clearance.
+	if typeof(rt.aoeGoal) == 'Vector3' and clearance(rt.aoeGoal.X, rt.aoeGoal.Z) >= SAFE_PAD then
 		local dx = rt.aoeGoal.X - best.X
 		local dz = rt.aoeGoal.Z - best.Z
-		if (dx * dx + dz * dz) < 64 then
+		if (dx * dx + dz * dz) < 100 then
 			best = rt.aoeGoal
 		end
 	end
