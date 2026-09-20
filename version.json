@@ -1,6 +1,6 @@
 {
-    "version":  "1.0.78",
-    "message":  "payload shops raid replay mage students anim parry hover meteor dodge",
+    "version":  "1.0.79",
+    "message":  "meteor volley latch dodge-only then boss; P3 students; P4 crystal center",
     "files":  [
                   "dungeon-lootr/launch.lua",
                   "dungeon-lootr/DungeonLootr.lua",

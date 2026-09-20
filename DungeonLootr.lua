@@ -141,7 +141,7 @@ Library.ToggleKeybind = { Value = 'Home' }
 Library.Animations = Library.Animations or {}
 Library.Animations.TabSwitch = false
 
-local DL_BUILD = '1.0.78'
+local DL_BUILD = '1.0.79'
 getgenv().DLBuild = DL_BUILD
 -- Do NOT wipe DLShrineSkipKeys on every reload — that re-warps spent altars.
 
@@ -2268,12 +2268,14 @@ local Pin = (function()
 				return
 			end
 			local drift = (here - goal).Magnitude
-			local dodging = os.clock() < (rt.aoeUntil or 0)
+			local dodging = (rt.aoeVolleyActive and rt.aoeVolleyActive())
+				or os.clock() < (rt.aoeUntil or 0)
 			-- Knockback used to keep velocity after a 1.35 hold, which slid the
 			-- rig while the humanoid stayed Running. Zero it every farm frame.
 			local blown = farmBusy and vel > 12
 			local tight = snapExact or dodging or blown
-			local hold = snapExact and 0.18 or (dodging and 0.55 or (farmBusy and 0.55 or 0.55))
+			-- Meteor gaps: hard snap (0.2), not a soft 0.55 hold that never left the disc.
+			local hold = snapExact and 0.18 or (dodging and 0.2 or (farmBusy and 0.55 or 0.55))
 			if farmBusy then
 				myRoot.AssemblyLinearVelocity = Vector3.zero
 				myRoot.AssemblyAngularVelocity = Vector3.zero
@@ -4635,22 +4637,49 @@ rt.avoidFloorAoe = function()
 			circles[#circles + 1] = { x = me.X, z = me.Z, r = 10 }
 		end
 	end
+	local hover = rt.combatHover()
+	local function standY(fy, fallback)
+		if type(fy) == 'number' then
+			if hover ~= 0 then
+				return fy + hover
+			end
+			return fy + 3
+		end
+		return fallback
+	end
+	local function holdHere()
+		local fy = rt.refreshFarmFloor(Vector3.new(me.X, me.Y, me.Z))
+		return Vector3.new(me.X, standY(fy, me.Y), me.Z)
+	end
+	-- Volley latch: discs spawn in waves. Clearing the pin the instant you step
+	-- out of one disc walks you back onto the Professor under the next strike.
+	local function markVolley()
+		rt.aoeVolleyUntil = os.clock() + 2.8
+		rt.aoeLastDiscAt = os.clock()
+		rt.aoeDiscs = true
+	end
 	if #circles == 0 then
-		if rt.aoeGoal ~= nil or (rt.aoeUntil or 0) > 0 then
+		if os.clock() < (rt.aoeVolleyUntil or 0) and typeof(rt.aoeGoal) == 'Vector3' then
+			rt.aoeDiscs = true
+			rt.aoeUntil = math.max(tonumber(rt.aoeUntil) or 0, os.clock() + 0.45)
+			return true
+		end
+		if rt.aoeGoal ~= nil or (rt.aoeUntil or 0) > 0 or (rt.aoeVolleyUntil or 0) > 0 then
 			rt.aoeClearAt = os.clock()
 			rt.stickyPlant = nil
 			rt.packDir = nil
 		end
 		rt.aoeUntil = 0
+		rt.aoeVolleyUntil = 0
 		rt.aoeGoal = nil
 		rt.aoeDiscs = false
 		return false
 	end
+	markVolley()
 	-- Only bail if we fell into the void — not for normal negative hover.
 	-- hover -10 under the Professor is ~15 studs; the old >35 check was fine,
 	-- but void yanks + deep sliders disabled all meteor dodging.
 	do
-		local hover = rt.combatHover()
 		local arena = type(rt.farmFloorY) == 'number' and rt.farmFloorY or nil
 		local intendY = type(arena) == 'number' and (arena + hover) or nil
 		if type(intendY) == 'number' and (intendY - me.Y) > 25 then
@@ -4664,6 +4693,7 @@ rt.avoidFloorAoe = function()
 					-- Void only: >55 under the boss HRP (hover -40 is still ~48).
 					if rp and (rp.Position.Y - me.Y) > 55 then
 						rt.aoeUntil = 0
+						rt.aoeVolleyUntil = 0
 						rt.aoeGoal = nil
 						rt.stickyPlant = nil
 						return false
@@ -4685,31 +4715,19 @@ rt.avoidFloorAoe = function()
 		end
 		return false
 	end
-	-- Already clear of discs: do NOT steal the fight pin. Returning true with a
-	-- floor-Y aoeGoal is what yanked negative-hover back onto the pack.
+	-- Safe in a gap while discs still exist: HOLD the gap. Old code cleared the
+	-- pin here and replanted under the boss mid-volley.
 	if not covered(me.X, me.Z, 2.5) then
-		if rt.aoeGoal ~= nil or (rt.aoeUntil or 0) > 0 then
-			rt.aoeClearAt = os.clock()
-			rt.stickyPlant = nil
+		rt.aoeUntil = os.clock() + 1.4
+		rt.stickyPlant = nil
+		if typeof(rt.aoeGoal) ~= 'Vector3' or covered(rt.aoeGoal.X, rt.aoeGoal.Z, 2.5) then
+			rt.aoeGoal = holdHere()
 		end
-		rt.aoeUntil = 0
-		rt.aoeGoal = nil
-		rt.aoeDiscs = false
-		return false
-	end
-	local hover = rt.combatHover()
-	local function standY(fy, fallback)
-		if type(fy) == 'number' then
-			if hover ~= 0 then
-				return fy + hover
-			end
-			return fy + 3
-		end
-		return fallback
+		return true
 	end
 	local best, bestD = nil, nil
 	local function tryAt(x, z)
-		if covered(x, z, 3) then
+		if covered(x, z, 4) then
 			return
 		end
 		local dx = x - me.X
@@ -4729,22 +4747,25 @@ rt.avoidFloorAoe = function()
 		if mag > 0.4 then
 			ux, uz = fx / mag, fz / mag
 		end
-		tryAt(c.x + ux * (c.r + 8), c.z + uz * (c.r + 8))
+		-- Push further out — r+8 still sat inside overlapping 23-stud discs.
+		tryAt(c.x + ux * (c.r + 14), c.z + uz * (c.r + 14))
+		tryAt(c.x + ux * (c.r + 22), c.z + uz * (c.r + 22))
 	end
 	for i = 0, 15 do
 		local a = i / 16 * math.pi * 2
 		local ca, sa = math.cos(a), math.sin(a)
-		tryAt(me.X + ca * 12, me.Z + sa * 12)
-		tryAt(me.X + ca * 20, me.Z + sa * 20)
-		tryAt(me.X + ca * 30, me.Z + sa * 30)
+		tryAt(me.X + ca * 14, me.Z + sa * 14)
+		tryAt(me.X + ca * 22, me.Z + sa * 22)
+		tryAt(me.X + ca * 32, me.Z + sa * 32)
+		tryAt(me.X + ca * 42, me.Z + sa * 42)
 	end
 	if not best then
 		-- Nowhere clean: stand on the least-covered candidate.
 		local least, leastN = nil, 1e9
 		for i = 0, 15 do
 			local a = i / 16 * math.pi * 2
-			local x = me.X + math.cos(a) * 18
-			local z = me.Z + math.sin(a) * 18
+			local x = me.X + math.cos(a) * 24
+			local z = me.Z + math.sin(a) * 24
 			local n = 0
 			for j = 1, #circles do
 				local c = circles[j]
@@ -4755,7 +4776,7 @@ rt.avoidFloorAoe = function()
 			end
 			if n < leastN then
 				leastN = n
-				least = Vector3.new(x, me.Y, z)
+				least = Vector3.new(x, standY(rt.refreshFarmFloor(Vector3.new(x, me.Y, z)), me.Y), z)
 			end
 		end
 		best = least
@@ -4764,10 +4785,10 @@ rt.avoidFloorAoe = function()
 		return false
 	end
 	-- Sticky gap: only retarget if the old goal is covered or far from the new best.
-	if typeof(rt.aoeGoal) == 'Vector3' and not covered(rt.aoeGoal.X, rt.aoeGoal.Z, 2.5) then
+	if typeof(rt.aoeGoal) == 'Vector3' and not covered(rt.aoeGoal.X, rt.aoeGoal.Z, 3) then
 		local dx = rt.aoeGoal.X - best.X
 		local dz = rt.aoeGoal.Z - best.Z
-		if (dx * dx + dz * dz) < 36 then
+		if (dx * dx + dz * dz) < 64 then
 			best = rt.aoeGoal
 		end
 	end
@@ -4777,7 +4798,6 @@ rt.avoidFloorAoe = function()
 		local fight = rt.farmFightNpc
 		local bossPart = fight and (fight:FindFirstChild('HumanoidRootPart') or fight.PrimaryPart)
 		local bossY = bossPart and bossPart.Position.Y
-		local hover = rt.combatHover()
 		local arena = type(rt.farmFloorY) == 'number' and rt.farmFloorY or nil
 		if type(bossY) == 'number' and type(arena) == 'number' and (bossY - arena) <= 35 then
 			local wantY = arena + (hover ~= 0 and hover or 3)
@@ -4789,11 +4809,17 @@ rt.avoidFloorAoe = function()
 		end
 	end
 	rt.aoeGoal = best
-	-- Hold the gap while discs are still up. 0.85s expired mid-volley and
-	-- negative-hover stand-0 replanted under the boss into the next meteor.
-	rt.aoeUntil = os.clock() + 1.6
+	-- Hold the gap through the whole volley, not just one disc's lifetime.
+	rt.aoeUntil = os.clock() + 2.2
 	rt.aoeDiscs = true
 	return true
+end
+
+-- True while Dark Professor floor meteors are up or in the post-volley grace.
+rt.aoeVolleyActive = function()
+	return rt.aoeDiscs == true
+		or os.clock() < (rt.aoeUntil or 0)
+		or os.clock() < (rt.aoeVolleyUntil or 0)
 end
 
 local function parryReady()
@@ -9187,20 +9213,26 @@ end
 
 local function holdOnCrystalPack()
 	Pin.follow(function()
-		if os.clock() - (rt.aoeScanAt or 0) > 0.35 then
+		if os.clock() - (rt.aoeScanAt or 0) > 0.2 then
 			rt.aoeScanAt = os.clock()
 			pcall(rt.avoidFloorAoe)
 		end
-		if typeof(rt.aoeGoal) == 'Vector3' and os.clock() < (rt.aoeUntil or 0) then
-			return rt.aoeGoal
+		if rt.aoeVolleyActive and rt.aoeVolleyActive() and typeof(rt.aoeGoal) == 'Vector3' then
+			return rt.aoeGoal, rt.aoeGoal
 		end
 		local list = listRaidCrystals()
 		local mid = crystalCentroid(list)
 		if not mid then
 			return nil
 		end
-		-- Stand in the middle so one ult / hitbox catches every crystal.
-		return mid, mid
+		-- Dead center of the crystal pack so one M1 / ult catches all of them.
+		local hover = rt.combatHover()
+		local fy = rt.refreshFarmFloor and rt.refreshFarmFloor(mid) or nil
+		local y = type(fy) == 'number' and (fy + (hover ~= 0 and hover or 3)) or mid.Y
+		local stand = Vector3.new(mid.X, y, mid.Z)
+		rt.farmCrowdAim = mid
+		rt.stickyPlant = nil
+		return stand, mid
 	end)
 end
 
@@ -9392,16 +9424,17 @@ end
 
 local function holdOnAddPack(anchor)
 	Pin.follow(function()
-		if os.clock() - (rt.aoeScanAt or 0) > 0.35 then
+		if os.clock() - (rt.aoeScanAt or 0) > 0.2 then
 			rt.aoeScanAt = os.clock()
 			pcall(rt.avoidFloorAoe)
 		end
 		-- Student meteors are harmless — stay on the pack, don't yield to gaps.
 		if not rt.commitStudent
+			and rt.aoeVolleyActive
+			and rt.aoeVolleyActive()
 			and typeof(rt.aoeGoal) == 'Vector3'
-			and os.clock() < (rt.aoeUntil or 0)
 		then
-			return rt.aoeGoal
+			return rt.aoeGoal, rt.aoeGoal
 		end
 		local list = listAddsNearSpecial(anchor)
 		local mid = crystalCentroid(list)
@@ -10661,23 +10694,27 @@ local function holdOnEnemy(npc)
 		if not live then
 			return nil
 		end
-		if os.clock() - (rt.aoeScanAt or 0) > 0.35 then
+		-- Raid meteors: scan hard. 0.35s was enough to die between ticks.
+		local aoeNeed = (isRaidBossNpc(npc) or rt.aoeVolleyActive and rt.aoeVolleyActive()) and 0.08 or 0.35
+		if os.clock() - (rt.aoeScanAt or 0) > aoeNeed then
 			rt.aoeScanAt = os.clock()
 			pcall(rt.avoidFloorAoe)
 		end
 		-- Floor discs win over the boss stand pin — except Mage Students:
 		-- their meteors are harmless and dodging them abandons the kill.
-		if not isMageStudent(npc)
+		local volley = not isMageStudent(npc)
 			and not rt.commitStudent
-			and typeof(rt.aoeGoal) == 'Vector3'
-			and os.clock() < (rt.aoeUntil or 0)
-		then
+			and rt.aoeVolleyActive
+			and rt.aoeVolleyActive()
+		if volley and typeof(rt.aoeGoal) == 'Vector3' then
 			rt.pinAoeN = (rt.pinAoeN or 0) + 1
 			rt.pinGoal = rt.aoeGoal
-			return rt.aoeGoal, cachedAim
+			-- Aim at the gap, not the boss — facing the Professor mid-dodge
+			-- kept the slab planted in the disc.
+			return rt.aoeGoal, rt.aoeGoal
 		end
 		-- Just left a meteor gap — drop sticky plant so we snap back to the boss.
-		if rt.aoeClearAt and os.clock() - rt.aoeClearAt < 0.35 then
+		if rt.aoeClearAt and os.clock() - rt.aoeClearAt < 0.55 then
 			rt.stickyPlant = nil
 			cachedPlant = nil
 		end
@@ -10777,7 +10814,9 @@ local function holdOnEnemy(npc)
 				-- Look-up M1: normally sit under the target (stand 0). While floor
 				-- meteors are up, that plants you in the disc — keep a side offset
 				-- and prefer the aoe gap XZ (returned earlier while aoeUntil).
-				local aoeLive = os.clock() < (rt.aoeUntil or 0) or rt.aoeDiscs == true
+				local aoeLive = (rt.aoeVolleyActive and rt.aoeVolleyActive())
+					or os.clock() < (rt.aoeUntil or 0)
+					or rt.aoeDiscs == true
 				cachedStand = aoeLive and math.max(stand, 10) or 0
 				if enemyRank(npc) < 3 and not aoeLive then
 					local pack, n = packAround(npc, live, 28)
@@ -11066,7 +11105,18 @@ local function farmKill(npc)
 	end
 	while farmActive() and packAlive() and not routeBusy do
 		local now = os.clock()
-		pcall(autoSkillTick)
+		-- Meteor volley: dodge only. Swinging at the Professor mid-gap is what
+		-- walked you back into the next disc and stalled re-engage.
+		local volley = not studentTarget
+			and not crystalPack
+			and rt.aoeVolleyActive
+			and rt.aoeVolleyActive()
+		if not volley then
+			pcall(autoSkillTick)
+		else
+			pcall(rt.avoidFloorAoe)
+			farmLabel = 'meteor dodge'
+		end
 		if rt.refillUrgent or rt.refillBusy then
 			farmLabel = 'potion refill'
 			rt.farmReturnNpc = npc
@@ -11083,6 +11133,12 @@ local function farmKill(npc)
 		pcall(autoPotionTick)
 		if myPct <= 0 then
 			farmLabel = 'waiting · dead'
+			-- Drop dodge latch so the next life re-engages the Professor cleanly.
+			rt.aoeUntil = 0
+			rt.aoeVolleyUntil = 0
+			rt.aoeGoal = nil
+			rt.aoeDiscs = false
+			rt.stickyPlant = nil
 			runCompleteAt = runCompleteAt or os.clock()
 			break
 		elseif (on('DLAutoPotion') or on('DLAutoFlee')) and rt.updateHealWait(myPct) then
@@ -11108,7 +11164,7 @@ local function farmKill(npc)
 				end
 				farmLabel = ('adds · %d'):format(#listAddsNearSpecial(addAnchor))
 			elseif (isRaidBossNpc(npc) or enemyRank(npc) >= 4) and now - (rt.addScanAt or 0) > 0.15 then
-				-- Crystals wipe the raid if they finish. Adds after that. Then the boss.
+				-- P4 crystals → P3 students → boss. Never stay on Professor while either lives.
 				rt.addScanAt = now
 				local crystal = select(1, nearestCrystal())
 				if crystal and crystal ~= npc then
@@ -11146,7 +11202,8 @@ local function farmKill(npc)
 			end
 			-- Stick to THIS npc until it dies. Mid-fight retarget hopped the stand
 			-- between pack members every ~0.55s (flicker with M1s still landing).
-			if now - lastHit >= attackDelay() then
+			-- During meteor volleys: no M1 — position-only dodge.
+			if not volley and now - lastHit >= attackDelay() then
 				lastHit = now
 				-- SkillIFrame sticks true on some classes and used to skip every M1.
 				pcall(fireAttack)
@@ -11156,7 +11213,8 @@ local function farmKill(npc)
 			-- was warping onto nearby fodder mid-phase.
 			-- Dark Professor (no Humanoid) + meteor dodge: Damage_Dealt stalls for
 			-- ~8s and used to farmBan him for 30s → long gap before re-engage.
-			local aoeBusy = os.clock() < (rt.aoeUntil or 0)
+			local aoeBusy = volley
+				or os.clock() < (rt.aoeUntil or 0)
 				or (rt.aoeClearAt and os.clock() - rt.aoeClearAt < 1.25)
 			if aoeBusy or isRaidBossNpc(npc) or enemyRank(npc) >= 4 or studentTarget then
 				lastDrop = now
@@ -11346,13 +11404,19 @@ local function snapToRaidTarget(npc)
 	if not me or not part then
 		return false
 	end
+	-- Never cancel a live meteor dodge to snap onto the boss.
+	if rt.aoeVolleyActive and rt.aoeVolleyActive() then
+		return false
+	end
 	local d = (me.Position - part.Position).Magnitude
 	local dy = math.abs(me.Position.Y - part.Position.Y)
 	if d < 55 and dy < 22 then
 		return false
 	end
 	rt.aoeUntil = 0
+	rt.aoeVolleyUntil = 0
 	rt.aoeGoal = nil
+	rt.aoeDiscs = false
 	rt.stickyPlant = nil
 	rt.farmFloorY = nil
 	local stand = Vector3.new(part.Position.X, part.Position.Y, part.Position.Z)
