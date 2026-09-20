@@ -1,6 +1,6 @@
 {
-    "version":  "1.0.56",
-    "message":  "Go to the floor boss instead of touring empty rooms",
+    "version":  "1.0.78",
+    "message":  "payload shops raid replay mage students anim parry hover meteor dodge",
     "files":  [
                   "dungeon-lootr/launch.lua",
                   "dungeon-lootr/DungeonLootr.lua",

@@ -141,7 +141,7 @@ Library.ToggleKeybind = { Value = 'Home' }
 Library.Animations = Library.Animations or {}
 Library.Animations.TabSwitch = false
 
-local DL_BUILD = '1.0.56'
+local DL_BUILD = '1.0.78'
 getgenv().DLBuild = DL_BUILD
 -- Do NOT wipe DLShrineSkipKeys on every reload — that re-warps spent altars.
 
@@ -1822,6 +1822,24 @@ function rt.refreshFarmFloor(from)
 				return rt.farmFloorY
 			end
 		end
+		-- Raid arena: meteor-gap rays often punch through the floor into void
+		-- geometry 50–200 studs down. Never adopt a floor that far under the boss.
+		do
+			local fight = rt.farmFightNpc
+			local bossPart = fight and (
+				fight:FindFirstChild('HumanoidRootPart')
+				or fight.PrimaryPart
+				or (fight:IsA('Model') and fight:FindFirstChildWhichIsA('BasePart', true))
+			)
+			local bossY = bossPart and bossPart.Position.Y
+			if type(bossY) == 'number' and (bossY - y) > 35 then
+				if type(rt.farmFloorY) == 'number' and (bossY - rt.farmFloorY) <= 35 then
+					return rt.farmFloorY
+				end
+				-- Approximate arena under the boss HRP.
+				return bossY - 8
+			end
+		end
 		rt.farmFloorY = y
 		rt.farmFloorAtPos = Vector3.new(origin.X, 0, origin.Z)
 		return y
@@ -1980,8 +1998,13 @@ function rt.farmHoldCf(pos, aim, keep)
 			local myFy = me and rt.refreshFarmFloor(me.Position) or nil
 			local lastFy = type(rt._lastGoodStandY) == 'number' and (rt._lastGoodStandY - hover) or nil
 			local lowFy = nil
+			local bossY = live.Position.Y
 			for _, cand in ipairs({ fy, myFy, lastFy, rt.farmFloorY }) do
 				if type(cand) == 'number' then
+					-- Drop under-arena void samples (meteor ray punch-through).
+					if (bossY - cand) > 35 then
+						continue
+					end
 					if not lowFy or cand < lowFy then
 						lowFy = cand
 					end
@@ -1993,7 +2016,7 @@ function rt.farmHoldCf(pos, aim, keep)
 				fy = lowFy
 			end
 			-- Boss HRP far above our floor → never adopt the elevated pad.
-			if type(myFy) == 'number' and (live.Position.Y - myFy) > 8 then
+			if type(myFy) == 'number' and (live.Position.Y - myFy) > 8 and (bossY - myFy) <= 35 then
 				fy = myFy
 			end
 		end
@@ -2035,13 +2058,28 @@ function rt.farmHoldCf(pos, aim, keep)
 			-- Raised-pad specials: allow bury well below HRP (under the gate floor).
 			local me = routeRoot()
 			local myFy = me and type(rt.farmFloorY) == 'number' and rt.farmFloorY or nil
-			if hover < 0 and type(myFy) == 'number' and (live.Position.Y - myFy) > 8 then
+			if hover < 0 and type(myFy) == 'number' and (live.Position.Y - myFy) > 8
+				and (live.Position.Y - myFy) <= 35
+			then
 				minY = myFy + hover - 4
 				maxY = myFy + 6
 			end
+			-- Raid / hover: never sink more than the slider under a sane arena floor.
+			if math.abs(hover) >= 0.5 then
+				local arena = type(rt.farmFloorY) == 'number' and (live.Position.Y - rt.farmFloorY) <= 35
+					and rt.farmFloorY or (live.Position.Y - 8)
+				local want = arena + hover
+				minY = math.max(minY, want - 3)
+				maxY = math.min(maxY, want + 6)
+				if newY < want - 3 or newY > want + 8 then
+					newY = want
+				end
+			end
 			if newY < minY then
 				newY = live.Position.Y + math.clamp(hover, -18, 0)
-				if hover < 0 and type(myFy) == 'number' and (live.Position.Y - myFy) > 8 then
+				if hover < 0 and type(myFy) == 'number' and (live.Position.Y - myFy) > 8
+					and (live.Position.Y - myFy) <= 35
+				then
 					newY = myFy + hover
 				end
 			elseif newY > maxY then
@@ -3933,6 +3971,41 @@ rt.bossAnimHitWait = function(len, tpos)
 	return wait, false
 end
 
+-- Fodder clips are short and the hurtbox is late in the play — ~55% marks
+-- impact better than boss's early third. Used when no keyframe/marker fires.
+rt.fodderAnimHitWait = function(len, tpos)
+	len = tonumber(len) or 0
+	tpos = tonumber(tpos) or 0
+	if len <= 0 then
+		return 0.18, false
+	end
+	local hitAt = math.clamp(len * 0.55, 0.14, math.max(0.14, len - 0.06))
+	local wait = hitAt - tpos
+	if wait <= 0.05 then
+		return 0, true
+	end
+	return wait, false
+end
+
+rt.isHitKeyframeName = function(name)
+	name = string.lower(tostring(name or ''))
+	if name == '' or name == 'keyframe' then
+		return false
+	end
+	return name:find('hit', 1, true)
+		or name:find('impact', 1, true)
+		or name:find('damage', 1, true)
+		or name:find('swing', 1, true)
+		or name:find('slash', 1, true)
+		or name:find('attack', 1, true)
+		or name:find('strike', 1, true)
+		or name:find('cast', 1, true)
+		or name:find('shoot', 1, true)
+		or name:find('release', 1, true)
+		or name:find('connect', 1, true)
+		or false
+end
+
 rt.telegraphLit = function(npc)
 	local now = os.clock()
 	rt.telLitAt = rt.telLitAt or {}
@@ -4026,7 +4099,7 @@ function rt.noteHitLagSample(name, lag)
 	if not name or not lag then
 		return
 	end
-	if lag < 0.12 or lag > 2.5 then
+	if lag < 0.18 or lag > 2.5 then
 		return
 	end
 	local list = rt.hitLag[name]
@@ -4570,20 +4643,31 @@ rt.avoidFloorAoe = function()
 		end
 		rt.aoeUntil = 0
 		rt.aoeGoal = nil
+		rt.aoeDiscs = false
 		return false
 	end
-	-- Buried under the raid arena (special bury / void): never park on a floor
-	-- disc gap down here — snap logic elsewhere pulls us back to the boss.
+	-- Only bail if we fell into the void — not for normal negative hover.
+	-- hover -10 under the Professor is ~15 studs; the old >35 check was fine,
+	-- but void yanks + deep sliders disabled all meteor dodging.
 	do
-		local raid = workspace:FindFirstChild('Raid_NPCs')
-		if raid then
-			for _, ch in ipairs(raid:GetChildren()) do
-				local rp = ch:FindFirstChild('HumanoidRootPart') or ch.PrimaryPart
-				if rp and (rp.Position.Y - me.Y) > 35 then
-					rt.aoeUntil = 0
-					rt.aoeGoal = nil
-					rt.stickyPlant = nil
-					return false
+		local hover = rt.combatHover()
+		local arena = type(rt.farmFloorY) == 'number' and rt.farmFloorY or nil
+		local intendY = type(arena) == 'number' and (arena + hover) or nil
+		if type(intendY) == 'number' and (intendY - me.Y) > 25 then
+			-- Recover toward arena hover; still compute a gap so we don't sit in fire.
+			rt.stickyPlant = nil
+		elseif type(intendY) ~= 'number' then
+			local raid = workspace:FindFirstChild('Raid_NPCs')
+			if raid then
+				for _, ch in ipairs(raid:GetChildren()) do
+					local rp = ch:FindFirstChild('HumanoidRootPart') or ch.PrimaryPart
+					-- Void only: >55 under the boss HRP (hover -40 is still ~48).
+					if rp and (rp.Position.Y - me.Y) > 55 then
+						rt.aoeUntil = 0
+						rt.aoeGoal = nil
+						rt.stickyPlant = nil
+						return false
+					end
 				end
 			end
 		end
@@ -4610,6 +4694,7 @@ rt.avoidFloorAoe = function()
 		end
 		rt.aoeUntil = 0
 		rt.aoeGoal = nil
+		rt.aoeDiscs = false
 		return false
 	end
 	local hover = rt.combatHover()
@@ -4686,9 +4771,28 @@ rt.avoidFloorAoe = function()
 			best = rt.aoeGoal
 		end
 	end
+	-- Keep meteor gaps on the arena — void floor samples used to yeet hover
+	-- 100+ studs under Dark Professor.
+	do
+		local fight = rt.farmFightNpc
+		local bossPart = fight and (fight:FindFirstChild('HumanoidRootPart') or fight.PrimaryPart)
+		local bossY = bossPart and bossPart.Position.Y
+		local hover = rt.combatHover()
+		local arena = type(rt.farmFloorY) == 'number' and rt.farmFloorY or nil
+		if type(bossY) == 'number' and type(arena) == 'number' and (bossY - arena) <= 35 then
+			local wantY = arena + (hover ~= 0 and hover or 3)
+			if type(best.Y) ~= 'number' or (arena - best.Y) > 8 then
+				best = Vector3.new(best.X, wantY, best.Z)
+			end
+		elseif type(bossY) == 'number' and (bossY - best.Y) > 35 then
+			best = Vector3.new(best.X, bossY - 8 + (hover ~= 0 and hover or 0), best.Z)
+		end
+	end
 	rt.aoeGoal = best
-	-- Short hold — long windows left us parked in a gap for ~10s after meteors.
-	rt.aoeUntil = os.clock() + 0.85
+	-- Hold the gap while discs are still up. 0.85s expired mid-volley and
+	-- negative-hover stand-0 replanted under the boss into the next meteor.
+	rt.aoeUntil = os.clock() + 1.6
+	rt.aoeDiscs = true
 	return true
 end
 
@@ -5487,13 +5591,10 @@ local function watchEnemy(npc)
 		if rt.parryNotif(npc) then
 			return
 		end
-		-- A mob we have timed is driven by its CanAttack rise alone. Its other cues
-		-- only ever dragged the press off the measured time: the telegraph fade in
-		-- particular trails the hit, so it spent F right as the cooldown returned
-		-- and left the cooldown covering the next swing's press. One wasted press
-		-- desyncs every cycle after it.
-		if rt.learnedLead(npc.Name) then
-			rt.pdbg('ignore %s/%s (timed mob: CanAttack rise only)', npc.Name, tostring(kind))
+		-- Timed CanAttack rise owns the press — block telegraph / State noise only.
+		-- Animation markers and KeyframeReached are allowed to retarget (more accurate).
+		if rt.learnedLead(npc.Name) and kind ~= 'hit' and kind ~= 'anim' and kind ~= 'marker' then
+			rt.pdbg('ignore %s/%s (timed mob: keep CanAttack / anim only)', npc.Name, tostring(kind))
 			return
 		end
 		-- Fodder only: CanAttack is its real attack window, so telegraph flicker /
@@ -5683,50 +5784,76 @@ local function watchEnemy(npc)
 		end
 	end)
 	local function onAttackAnim(track)
+		if not track then
+			return
+		end
 		if rt.parryNotif(npc) then
 			rt.noteFCueAnim(npc, track)
 			return
 		end
-		local isAttack, guessed = isAttackAnim(track, bossy)
+		local isAttack, guessed = isAttackAnim(track, true)
 		if not isAttack then
 			return
 		end
-		-- A guess is just "non-looped clip of plausible length" — these mobs play
-		-- plenty of those with no attack behind them, and that is what fired F at
-		-- nothing. Only trust a guess while the mob is in its attack window.
-		if guessed and npc:GetAttribute('CanAttack') ~= true then
+		-- Guessed unnamed clips need a corroborating attack window. Named attack
+		-- clips and any clip while CanAttack is (or just was) true are trusted.
+		local can = npc:GetAttribute('CanAttack')
+		local recent = rt.recentCanAttack(npc, 0.7)
+		if guessed and can ~= true and not recent then
 			return
 		end
-		if bossy and track.GetMarkerReachedSignal then
-			for _, marker in ipairs({ 'Hit', 'hit', 'Impact', 'Swing', 'Damage' }) do
+		-- Animation markers / named keyframes are the cleanest hit signal.
+		local hooked = false
+		if track.GetMarkerReachedSignal then
+			for _, marker in ipairs({
+				'Hit', 'hit', 'HIT', 'Impact', 'impact', 'Swing', 'swing',
+				'Damage', 'damage', 'Attack', 'attack', 'Slash', 'Cast', 'Shoot',
+				'Release', 'Connect', 'Strike',
+			}) do
 				local ok, sig = pcall(function()
 					return track:GetMarkerReachedSignal(marker)
 				end)
 				if ok and sig then
+					hooked = true
 					bag[#bag + 1] = sig:Connect(function()
-						maybeArm(0.02, 'hit')
+						maybeArm(0.02, 'marker')
 					end)
 				end
 			end
 		end
+		-- Any non-default keyframe name — covers markers we did not hardcode.
+		pcall(function()
+			bag[#bag + 1] = track.KeyframeReached:Connect(function(kfName)
+				if rt.isHitKeyframeName(kfName) then
+					maybeArm(0.02, 'marker')
+				end
+			end)
+			hooked = true
+		end)
 		local tpos, len = 0, 0
 		pcall(function()
 			tpos = track.TimePosition or 0
 			len = track.Length or 0
 		end)
-		if bossy and len > 0.28 then
-			local wait, nowHit = rt.bossAnimHitWait(len, tpos)
+		if len > 0.22 then
+			local wait, nowHit
+			if bossy then
+				wait, nowHit = rt.bossAnimHitWait(len, tpos)
+			else
+				wait, nowHit = rt.fodderAnimHitWait(len, tpos)
+			end
 			if nowHit then
 				maybeArm(0.02, 'hit')
-			else
-				maybeArm(wait, 'anim')
+			elseif wait and wait < 2.4 then
+				-- Prefer clip schedule over CanAttack's coarse 0.30s default.
+				maybeArm(wait, bossy and 'anim' or 'anim')
 			end
 			return
 		end
-		if tpos > 0.18 then
+		if tpos > 0.22 then
 			return
 		end
-		maybeArm(windDelay(), 'anim')
+		maybeArm(bossy and windDelay() or 0.18, 'anim')
 	end
 	local function hookHum(hum)
 		bag[#bag + 1] = hum.AnimationPlayed:Connect(onAttackAnim)
@@ -5826,30 +5953,32 @@ local function watchEnemy(npc)
 				end
 				lastCanArm = now
 				rt.noteCanRise(npc)
-				local lead = rt.learnedLead(npc.Name)
-				if lead then
-					-- Timed off this mob's own measured hit lag.
-					armParry(lead, bossy and 'boss-wind' or nil, npc.Name .. '/can-rise', true)
-				elseif bossy then
-					armParry(windDelay(), 'boss-wind', npc.Name .. '/can-rise')
-				else
-					-- Unlearned fodder: ~0.30s matches live rise→impact lag so the
-					-- hold still covers the hit (0.04 opened and closed too early).
-					armParry(0.30, nil, npc.Name .. '/can-rise')
-				end
-			elseif v == false and prev == true then
-				-- Falling edge ≈ impact. Teach lag from rise→fall (no HP loss needed).
-				if not bossy then
-					local riseAt = rt.canRise[npc]
-					if type(riseAt) == 'number' then
-						rt.noteHitLagSample(tostring(npc.Name), now - riseAt)
+				-- AnimationPlayed often fires in the same frame — give it a tick to
+				-- schedule from clip length / markers before falling back to CanAttack.
+				task.defer(function()
+					if not npc.Parent or not enemyInRange(npc) then
+						return
 					end
-				end
-				-- Retime onto impact if we have not fired yet.
+					-- If an anim already armed a nearer press, leave it alone.
+					if (rt.parryDelay or 0) > os.clock() + 0.04 then
+						return
+					end
+					local lead = rt.learnedLead(npc.Name)
+					if lead then
+						armParry(lead, bossy and 'boss-wind' or nil, npc.Name .. '/can-rise', true)
+					elseif bossy then
+						armParry(windDelay(), 'boss-wind', npc.Name .. '/can-rise')
+					else
+						-- Soft backup only — anim TimePosition is preferred when present.
+						armParry(0.28, nil, npc.Name .. '/can-rise')
+					end
+				end)
+			elseif v == false and prev == true then
+				-- Falling edge = end of the CanAttack pulse (~0.12s), NOT impact.
+				-- Sampling rise→fall as "hit lag" taught 0.12s leads and locked out
+				-- better cues. Learn only from real damage (rt.learnHitLag).
 				if bossy then
 					armParry(0, 'boss-hit', npc.Name .. '/can-fall')
-				else
-					armParry(0, nil, npc.Name .. '/can-fall')
 				end
 			end
 		end)
@@ -6161,8 +6290,8 @@ local function autoParryTick()
 		end
 		return
 	end
-	-- Boss clips often start before we hook AnimationPlayed. Poll remaining
-	-- time so the parry sits just before impact instead of at wind-up start.
+	-- Boss + fodder clips often start before we hook AnimationPlayed. Poll
+	-- remaining time so the parry sits just before impact.
 	if wantParry then
 		rt.bossAnim = rt.bossAnim or {}
 		for npc in pairs(enemyWatches) do
@@ -6172,15 +6301,15 @@ local function autoParryTick()
 			-- One press per red-F appearance. Re-arming while Fire stayed true
 			-- spent the refunded cooldown on a second tap and left the follow-up
 			-- swing uncovered.
-			-- Timed / F-cue mobs are not armed from leftover anim or telegraph poll.
-			if npc.Parent and isBossEnemy(npc) and enemyInRange(npc)
-				and not rt.parryNotif(npc)
-				and not rt.learnedLead(npc.Name)
-			then
+			-- Timed / F-cue mobs are not armed from leftover telegraph poll.
+			local hasF = rt.parryNotif(npc)
+			if npc.Parent and enemyInRange(npc) and not hasF then
 				local an = rt.bossAnim[npc]
 				if not an or an.Parent == nil then
 					local ctrl = npc:FindFirstChildOfClass('AnimationController')
+					local hum = enemyHumanoid(npc)
 					an = (ctrl and ctrl:FindFirstChildOfClass('Animator'))
+						or (hum and hum:FindFirstChildOfClass('Animator'))
 						or npc:FindFirstChildOfClass('Animator')
 					rt.bossAnim[npc] = an
 				end
@@ -6188,33 +6317,44 @@ local function autoParryTick()
 					pcall(function()
 						for _, track in ipairs(an:GetPlayingAnimationTracks()) do
 							local isAttack, guessed = isAttackAnim(track, true)
-							if isAttack then
-								-- Prefer CanAttack-gated timing when the boss exposes it.
-								-- An unnamed clip is only a guess, so it needs CanAttack
-								-- true; a name-matched clip may arm on its own.
-								local can = npc:GetAttribute('CanAttack')
-								if can == false or (guessed and can ~= true) then
-									-- Not in an attack window — skip anim noise.
-								else
-									local len = track.Length or 0
-									local tpos = track.TimePosition or 0
-									if len > 0.28 then
-										local wait, nowHit = rt.bossAnimHitWait(len, tpos)
-										if nowHit then
-											armParry(0, 'boss-hit', npc.Name .. '/poll-anim ' .. tostring(track.Name))
-										elseif wait < 2.2 then
-											armParry(wait, 'boss-wind', npc.Name .. '/poll-anim ' .. tostring(track.Name))
-										end
-									end
+							if not isAttack then
+								continue
+							end
+							local can = npc:GetAttribute('CanAttack')
+							local recent = rt.recentCanAttack(npc, 0.7)
+							if guessed and can ~= true and not recent then
+								continue
+							end
+							if can == false and not recent and not isBossEnemy(npc) then
+								-- Pulse already ended and no recent rise — clip is leftover.
+								continue
+							end
+							local len = track.Length or 0
+							local tpos = track.TimePosition or 0
+							if len <= 0.22 then
+								continue
+							end
+							local wait, nowHit
+							if isBossEnemy(npc) then
+								wait, nowHit = rt.bossAnimHitWait(len, tpos)
+								if nowHit then
+									armParry(0, 'boss-hit', npc.Name .. '/poll-anim')
+								elseif wait and wait < 2.2 and not rt.learnedLead(npc.Name) then
+									armParry(wait, 'boss-wind', npc.Name .. '/poll-anim')
+								end
+							else
+								wait, nowHit = rt.fodderAnimHitWait(len, tpos)
+								if nowHit then
+									armParry(0, nil, npc.Name .. '/poll-anim')
+								elseif wait and wait < 1.6 then
+									armParry(wait, nil, npc.Name .. '/poll-anim')
 								end
 							end
 						end
 					end)
 				end
 				-- Rising edge only — continuous lit telegraphs were false-parrying.
-				-- No CanAttack requirement here: a boss telegraph precedes its attack
-				-- window, so gating on it left bosses unparried entirely.
-				if rt.telegraphRose(npc) then
+				if isBossEnemy(npc) and not rt.learnedLead(npc.Name) and rt.telegraphRose(npc) then
 					local delay = (npc:GetAttribute('IsSpecialBoss') == true) and 0.16 or bossParryDelay()
 					armParry(delay, 'boss-wind', npc.Name .. '/poll-tel')
 				end
@@ -10555,7 +10695,11 @@ local function holdOnEnemy(npc)
 		-- Special offset is the ice-dodge bury. Auto low/high must still apply
 		-- or Scarlet Knight / Dark Professor sit 11.5 under the hurtbox and
 		-- M1s never connect (ult never charges either).
-		if enemyRank(npc) >= 4 and not autoLow and not autoHigh then
+		-- Event raid + user hover: SpecialOff / approach-bury punched through the
+		-- arena into void. Keep floor height; farmHoldCf applies the slider.
+		if isRaidBossNpc(npc) and math.abs(rt.hoverN()) >= 0.5 then
+			y = baseY or live.Position.Y
+		elseif enemyRank(npc) >= 4 and not autoLow and not autoHigh then
 			local off = Options.DLFarmSpecialOff and tonumber(Options.DLFarmSpecialOff.Value) or -11.5
 			y = live.Position.Y + off
 			-- Raised pad / behind-gate specials: SpecialOff from HRP still floats
@@ -10570,15 +10714,19 @@ local function holdOnEnemy(npc)
 				)
 				if myHit then
 					local myFloor = myHit.Position.Y + hip
-					if not approach or myFloor < approach - 2 then
+					-- Ignore void hits far under the boss (raid meteor punch-through).
+					if (live.Position.Y - myHit.Position.Y) <= 40
+						and (not approach or myFloor < approach - 2)
+					then
 						approach = myFloor
 					end
 				end
 			end
 			if type(approach) == 'number' and (live.Position.Y - (approach - hip)) > 8 then
 				-- Sit below the room floor we approached from, not mid-air under HRP.
+				-- Never stack hover here — farmHoldCf owns the slider.
 				if rt.hoverN() < 0 then
-					y = (approach - hip) + rt.hoverN()
+					y = approach - hip
 				else
 					y = math.min(y, approach + off)
 				end
@@ -10626,12 +10774,12 @@ local function holdOnEnemy(npc)
 			cachedStand = stand
 			cachedPlant = live.Position
 			if rt.hoverN() < 0 then
-				-- Look-up M1 only hits what is above you. Do not sit in the
-				-- pack hole / stand-offset: that used horizontal Z-reach.
-				-- NEVER reset dir to +Z — that locked the yellow slab to a
-				-- world axis while mobs sat beside you (stand 0 → no aim delta).
-				cachedStand = 0
-				if enemyRank(npc) < 3 then
+				-- Look-up M1: normally sit under the target (stand 0). While floor
+				-- meteors are up, that plants you in the disc — keep a side offset
+				-- and prefer the aoe gap XZ (returned earlier while aoeUntil).
+				local aoeLive = os.clock() < (rt.aoeUntil or 0) or rt.aoeDiscs == true
+				cachedStand = aoeLive and math.max(stand, 10) or 0
+				if enemyRank(npc) < 3 and not aoeLive then
 					local pack, n = packAround(npc, live, 28)
 					if n >= 2 then
 						cachedPlant = buryUnderPlant(pack, live.Position)
@@ -10646,12 +10794,16 @@ local function holdOnEnemy(npc)
 						rt.farmCrowdAim = mid
 					end
 					cachedAim = rt.farmCrowdAim or mid
-					cachedPlant = cachedPlant or mid
+					if not aoeLive then
+						cachedPlant = cachedPlant or mid
+					end
 				else
 					rt.crowdSolo = true
 					rt.farmCrowdAim = live.Position
 					cachedAim = live.Position
-					cachedPlant = live.Position
+					if not aoeLive then
+						cachedPlant = live.Position
+					end
 				end
 			else
 				-- Frontal slab: stand off the densest clump and face into it.
