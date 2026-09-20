@@ -141,7 +141,7 @@ Library.ToggleKeybind = { Value = 'Home' }
 Library.Animations = Library.Animations or {}
 Library.Animations.TabSwitch = false
 
-local DL_BUILD = '1.0.79'
+local DL_BUILD = '1.0.80'
 getgenv().DLBuild = DL_BUILD
 -- Do NOT wipe DLShrineSkipKeys on every reload — that re-warps spent altars.
 
@@ -16284,7 +16284,7 @@ local Replay = (function()
 		-- Challenge COMPLETED: red REPLAY → ChallengeRunService.RequestReplay.
 		-- Loop specific + difficulty uses the same button (challenge has Easy/etc).
 		-- Skip DungeonQueue CHANGE DUNGEON — that remote is for normal runs only.
-		if inChallengeReplay() or (on('DLLoopSpecific') and findReplayButton()) then
+		if inChallengeReplay() then
 			if requestChallengeReplay() then
 				return true
 			end
@@ -16294,6 +16294,25 @@ local Replay = (function()
 		if type(upgrade) == 'function' and not inChallengeReplay() then
 			local okUpgrade, did = pcall(upgrade, silent)
 			if okUpgrade and did then
+				return true
+			end
+		end
+		-- Loop specific: never RequestReplay while difficulty still mismatches
+		-- (that is how Endless dropdown + Easy restart happened).
+		if on('DLLoopSpecific') and type(rt.dungeonLoopMatches) == 'function' then
+			if not rt.dungeonLoopMatches() then
+				local okForce = false
+				if type(rt.dungeonLoopNow) == 'function' then
+					pcall(function()
+						okForce = rt.dungeonLoopNow(silent) == true
+					end)
+				end
+				if not okForce then
+					if not silent then
+						Library:Notify('Loop specific: waiting for correct difficulty')
+					end
+					return false
+				end
 				return true
 			end
 		end
@@ -16637,13 +16656,80 @@ local DungeonStart = (function()
 		return DIFF_LIST
 	end
 
+	local function normalizeDiff(raw)
+		local s = tostring(raw or ''):gsub('^%s+', ''):gsub('%s+$', '')
+		if s == '' or s == 'nil' then
+			return nil
+		end
+		-- Old Default = 4 was a numeric index into DIFF_LIST (Nightmare).
+		local asNum = tonumber(s)
+		if asNum and DIFF_LIST[asNum] then
+			return DIFF_LIST[asNum]
+		end
+		local low = string.lower(s)
+		for _, name in ipairs(DIFF_LIST) do
+			if string.lower(name) == low then
+				return name
+			end
+		end
+		return nil
+	end
+
+	local function clickPanelDifficulty(p, diff)
+		if not p or not diff then
+			return false
+		end
+		local info = p:FindFirstChild('Contents', true)
+			and p.Contents:FindFirstChild('RightSection')
+			and p.Contents.RightSection:FindFirstChild('Info')
+		if not info then
+			info = p:FindFirstChild('Info', true)
+		end
+		local node = info and info:FindFirstChild(diff)
+		if not node then
+			return false
+		end
+		local btn = node:IsA('GuiButton') and node
+			or node:FindFirstChildWhichIsA('GuiButton', true)
+			or node:FindFirstChild('Button', true)
+			or node
+		-- Raid-style: Activated often binds before MouseButton1Click.
+		if type(firesignal) == 'function' then
+			pcall(firesignal, btn.Activated)
+			pcall(firesignal, btn.MouseButton1Click)
+		end
+		return clickGui(btn)
+	end
+
+	-- Select dungeon + difficulty on the queue service AND the panel buttons.
+	-- RequestSelectDungeon resets the server selection to Easy; if Endless is
+	-- not re-applied before Start/Change, Loop specific boots Easy.
+	local function selectDungeonPair(id, diff)
+		diff = normalizeDiff(diff) or 'Nightmare'
+		local p = ensureOpen()
+		invoke('RequestSelectMode', 'Dungeon')
+		task.wait(0.12)
+		invoke('RequestSelectDungeon', id)
+		task.wait(0.3)
+		-- Difficulty twice: first remote, then UI click (controller sync), then remote again.
+		invoke('RequestSelectDifficulty', diff)
+		task.wait(0.15)
+		if p then
+			clickPanelDifficulty(p, diff)
+			task.wait(0.2)
+		end
+		local okDiff, resDiff = invoke('RequestSelectDifficulty', diff)
+		task.wait(0.25)
+		return okDiff ~= false and resDiff ~= false, diff
+	end
+
 	function api.target()
 		local wantName = Options.DLLoopDungeon and tostring(Options.DLLoopDungeon.Value or '')
-		local wantDiff = Options.DLLoopDifficulty and tostring(Options.DLLoopDifficulty.Value or '')
+		local wantDiff = normalizeDiff(Options.DLLoopDifficulty and Options.DLLoopDifficulty.Value)
 		if wantName == '' or wantName == 'nil' then
 			return nil
 		end
-		if not DIFF_RANK[wantDiff] then
+		if not wantDiff then
 			wantDiff = 'Nightmare'
 		end
 		local ok, data = pcall(require, ReplicatedStorage.GameInfo.DungeonData)
@@ -16686,6 +16772,16 @@ local DungeonStart = (function()
 		rt.runDungeonId, rt.runDifficulty = id, diff
 		Library:Notify(('Loop → %s · %s'):format(tostring(name or id), tostring(diff)))
 		return true
+	end
+
+	-- True when Loop specific's dropdown already matches the live run.
+	function api.loopMatches()
+		local id, diff = api.target()
+		if not id or not diff then
+			return false
+		end
+		local curId, curDiff = currentRun()
+		return tostring(id) == tostring(curId) and tostring(diff) == tostring(curDiff)
 	end
 
 	dungeonMeta = function(data, id)
@@ -16876,14 +16972,10 @@ local DungeonStart = (function()
 	-- RequestDungeonChange(id, diff). Confirm is for party members; solo still
 	-- benefits from a confirm attempt after a successful request.
 	requestDungeonChange = function(id, diff)
+		diff = normalizeDiff(diff) or diff
 		clickChangeDungeon()
 		task.wait(0.35)
-		invoke('RequestSelectMode', 'Dungeon')
-		task.wait(0.15)
-		invoke('RequestSelectDungeon', id)
-		task.wait(0.2)
-		invoke('RequestSelectDifficulty', diff)
-		task.wait(0.25)
+		selectDungeonPair(id, diff)
 		local rf = RunLoops.knitRF('DungeonRunService', 'RequestDungeonChange')
 		if not rf then
 			return false
@@ -16892,7 +16984,15 @@ local DungeonStart = (function()
 			return rf:InvokeServer(id, diff)
 		end)
 		if not (ok and res ~= false) then
-			return false
+			-- One more difficulty press then retry change — Easy sticky after dungeon select.
+			invoke('RequestSelectDifficulty', diff)
+			task.wait(0.2)
+			ok, res = pcall(function()
+				return rf:InvokeServer(id, diff)
+			end)
+			if not (ok and res ~= false) then
+				return false
+			end
 		end
 		local conf = RunLoops.knitRF('DungeonRunService', 'ConfirmDungeonChange')
 		if conf then
@@ -16945,10 +17045,17 @@ local DungeonStart = (function()
 		busy = true
 		task.spawn(function()
 			local id, diff, name
-			if on('DLLoopSpecific') or on('DLHuntSpecial') then
+			local looped = on('DLLoopSpecific') or on('DLHuntSpecial')
+			if looped then
 				id, diff, name = api.target()
-			end
-			if not id or not diff then
+				if not id or not diff then
+					busy = false
+					if not silent then
+						Library:Notify('Loop specific: pick dungeon + difficulty first')
+					end
+					return
+				end
+			else
 				id, diff, name = api.pick()
 			end
 			if not id or not diff then
@@ -16958,6 +17065,7 @@ local DungeonStart = (function()
 				end
 				return
 			end
+			diff = normalizeDiff(diff) or diff
 			local p = ensureOpen()
 			if p then
 				-- Friends Only ON blocks solo starts; turn it off when the title says ON.
@@ -16968,10 +17076,8 @@ local DungeonStart = (function()
 					task.wait(0.2)
 				end
 			end
-			invoke('RequestSelectDungeon', id)
-			task.wait(0.35)
-			invoke('RequestSelectDifficulty', diff)
-			task.wait(0.35)
+			-- Critical: dungeon select resets difficulty to Easy. Always re-apply after.
+			selectDungeonPair(id, diff)
 			local ok, res = invoke('RequestStartSoloRun')
 			if not ok or res == false then
 				ok, res = invoke('RequestEnter')
@@ -16997,6 +17103,9 @@ local DungeonStart = (function()
 	function api.label()
 		return lastLabel
 	end
+
+	rt.dungeonLoopMatches = api.loopMatches
+	rt.dungeonLoopNow = api.loopNow
 
 	function api.tick()
 		if not on('DLAutoDungeon') and not on('DLLoopSpecific') and not on('DLHuntSpecial') then
@@ -21280,7 +21389,7 @@ local loopDungeonDrop = ReplayBox:AddDropdown('DLLoopDungeon', {
 ReplayBox:AddDropdown('DLLoopDifficulty', {
 	Text = 'Difficulty',
 	Values = DungeonStart.listDifficulties(),
-	Default = 4,
+	Default = 'Nightmare',
 	Tooltip = 'Easy / Normal / Hard / Nightmare / Endless. Auto start still caps at Nightmare.',
 })
 ReplayBox:AddButton('Refresh dungeon list', function()

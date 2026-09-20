@@ -1,6 +1,6 @@
 {
-    "version":  "1.0.79",
-    "message":  "meteor volley latch dodge-only then boss; P3 students; P4 crystal center",
+    "version":  "1.0.80",
+    "message":  "loop specific: re-apply Endless after dungeon select resets Easy; block replay until match",
     "files":  [
                   "dungeon-lootr/launch.lua",
                   "dungeon-lootr/DungeonLootr.lua",
