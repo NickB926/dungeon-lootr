@@ -141,7 +141,7 @@ Library.ToggleKeybind = { Value = 'Home' }
 Library.Animations = Library.Animations or {}
 Library.Animations.TabSwitch = false
 
-local DL_BUILD = '1.0.52'
+local DL_BUILD = '1.0.53'
 getgenv().DLBuild = DL_BUILD
 -- Do NOT wipe DLShrineSkipKeys on every reload — that re-warps spent altars.
 
@@ -13336,21 +13336,46 @@ local function findRollRemote()
 	return rollRF
 end
 
-local function getSpinCounts()
+local function getSpinCounts(force)
+	local now = os.clock()
+	-- Cache counts so each roll is one Spin RTT, not Spin+GetSpinCounts.
+	if not force
+		and type(rt.spinCounts) == 'table'
+		and now - (rt.spinCountsAt or 0) < 8
+	then
+		return rt.spinCounts
+	end
 	local rf = summoningRF('GetSpinCounts')
 	if not rf then
-		return { Normal = 0, Lucky = 0 }
+		rt.spinCounts = { Normal = 0, Lucky = 0 }
+		rt.spinCountsAt = now
+		return rt.spinCounts
 	end
 	local ok, res = pcall(function()
 		return rf:InvokeServer()
 	end)
 	if ok and type(res) == 'table' then
-		return {
+		rt.spinCounts = {
 			Normal = tonumber(res.Normal) or 0,
 			Lucky = tonumber(res.Lucky) or 0,
 		}
+	else
+		rt.spinCounts = rt.spinCounts or { Normal = 0, Lucky = 0 }
 	end
-	return { Normal = 0, Lucky = 0 }
+	rt.spinCountsAt = now
+	return rt.spinCounts
+end
+
+local function noteSpinSpent(kind)
+	local c = rt.spinCounts
+	if type(c) ~= 'table' then
+		return
+	end
+	if kind == 'Lucky' then
+		c.Lucky = math.max(0, (tonumber(c.Lucky) or 0) - 1)
+	else
+		c.Normal = math.max(0, (tonumber(c.Normal) or 0) - 1)
+	end
 end
 
 local function pickSpinKind(counts)
@@ -13491,6 +13516,8 @@ local function autoRollTick()
 	lastRollAt = os.clock()
 	task.spawn(function()
 		local fails = 0
+		-- Fresh counts once at start; then decrement locally after each OK spin.
+		getSpinCounts(true)
 		while on('DLAutoRoll') and currentInstance() do
 			if LocalPlayer:GetAttribute('InDungeon') == true then
 				break
@@ -13501,19 +13528,21 @@ local function autoRollTick()
 				stopAutoRoll(rar and ('Hit %s [%s]'):format(cur, rar) or ('Hit ' .. cur))
 				break
 			end
-			local counts = getSpinCounts()
+			local counts = getSpinCounts(false)
 			local kind = pickSpinKind(counts)
+			if not kind then
+				-- Cache may be stale (bought spins / desync) — refresh once.
+				counts = getSpinCounts(true)
+				kind = pickSpinKind(counts)
+			end
 			if not kind then
 				stopAutoRoll(('Out of spins (N=%d L=%d)'):format(counts.Normal, counts.Lucky))
 				break
 			end
 			lastRollAt = os.clock()
 			local ok, result = fireRoll(kind)
-			-- Skip reveal immediately so the next InvokeServer is not blocked by UI.
-			for _ = 1, 4 do
-				skipSpinAnim()
-				task.wait()
-			end
+			-- Hide/skip reveal UI without frame waits (was ~70ms pad per spin).
+			skipSpinAnim()
 			local got = parseRolledClass(result)
 			if classIsWanted(got) or classIsWanted(currentClassName()) then
 				local hit = classIsWanted(got) and got or currentClassName()
@@ -13523,16 +13552,17 @@ local function autoRollTick()
 			end
 			if not ok then
 				fails += 1
+				rt.spinCountsAt = 0 -- force recount next pass
 				if fails >= 3 then
 					stopAutoRoll('Spin failed — try lobby / Summoning UI')
 					break
 				end
-				task.wait(0.15)
+				task.wait(0.05)
 			else
 				fails = 0
+				noteSpinSpent(kind)
 			end
-			-- Yield one frame only — animation is skipped client-side.
-			task.wait()
+			-- No yield between OK spins — next InvokeServer runs immediately.
 		end
 		rollBusy = false
 	end)
@@ -18568,20 +18598,16 @@ local Gear = (function()
 		return swapped
 	end
 
-	-- Junk = roll quality under the keep floor (game Quality %).
-	-- ComputeItemRollQuality returns 1.0 whenever a roll Value exceeds High
-	-- (Elemental set, many Mage Caps). The inventory panel still shows ~70–90%.
-	-- For those overcap pieces we recompute from GetItemRollRanges with a wider
-	-- High (~1.28x) so junk matches what you see. Locked / equipped stay.
+	-- Junk = unlocked Head / Body / Ring that is not (Celestial|Exotic AND ≥95% Quality).
+	-- A Celestial at 68% (e.g. Crimson Kabuto) still sells. Locked / equipped stay.
+	-- Weapons are never sold.
 	local SELL_SLOTS = { Head = true, Body = true, Ring = true }
-	local JUNK_QUALITY = 0.95 -- sell strictly below 95%
-	local OVERCAP_HIGH_MULT = 1.28
-	-- Never sell these ItemIds (Exotic / quest showcase gear).
-	local JUNK_KEEP_IDS = {
-		KingsCrown = true,
-		LivingArmor = true,
-		SupernovaRing = true,
+	local KEEP_RARITY = {
+		Celestial = true,
+		Exotic = true,
 	}
+	local JUNK_QUALITY = 0.95 -- keep only at or above 95%
+	local OVERCAP_HIGH_MULT = 1.28
 
 	local equipDataMod
 	local function equipmentData()
@@ -18648,22 +18674,19 @@ local Gear = (function()
 		if item.Locked == true then
 			return true
 		end
-		local id = tostring(item.ItemId or '')
-		if JUNK_KEEP_IDS[id] then
-			return true
-		end
-		-- DisplayName fallback (UI shows "King's Crown", id is KingsCrown).
-		local dn = string.lower(tostring(item.DisplayName or item.Name or ''))
-		if dn:find("king's crown", 1, true)
-			or dn:find('living armor', 1, true)
-			or dn:find('supernova ring', 1, true)
-		then
-			return true
-		end
 		if not SELL_SLOTS[tostring(item.Slot or '')] then
 			return true
 		end
-		return false
+		local rar = tostring(item.Rarity or '')
+		if not KEEP_RARITY[rar] then
+			return false
+		end
+		local q = rollQuality(item)
+		if type(q) == 'number' then
+			return q >= JUNK_QUALITY
+		end
+		-- Can't read quality — keep rather than risk a good C/E piece.
+		return true
 	end
 
 	function api.junkList()
@@ -18687,10 +18710,7 @@ local Gear = (function()
 				and not wornGuid[item.GUID]
 				and not mustKeep(item)
 			then
-				local q = rollQuality(item)
-				if type(q) == 'number' and q < JUNK_QUALITY then
-					list[#list + 1] = item
-				end
+				list[#list + 1] = item
 			end
 		end
 		table.sort(list, function(a, b)
@@ -18698,6 +18718,11 @@ local Gear = (function()
 			local qb = rollQuality(b) or 0
 			if qa ~= qb then
 				return qa < qb
+			end
+			local ra = rank(a.Rarity)
+			local rb = rank(b.Rarity)
+			if ra ~= rb then
+				return ra < rb
 			end
 			return api.score(a) < api.score(b)
 		end)
@@ -19708,7 +19733,7 @@ RollBox:AddToggle('DLStopExotic', {
 RollBox:AddToggle('DLAutoRoll', {
 	Text = 'Auto roll',
 	Default = false,
-	Tooltip = 'Lobby: SummoningService.Spin as fast as possible, skips the summon animation. Stops on picked classes and Exotic if that toggle is on.',
+	Tooltip = 'Lobby: SummoningService.Spin back-to-back (cached counts, no anim wait). Stops on picked classes and Exotic if that toggle is on.',
 }):OnChanged(function(v)
 	if not v then
 		rollBusy = false
@@ -19736,7 +19761,7 @@ RollBox:AddToggle('DLAutoRoll', {
 		Toggles.DLAutoRoll:SetValue(false)
 		return
 	end
-	Library:Notify('Auto roll on · ' .. tostring(rollRFLabel or rem.Name) .. ' (skip anim)')
+	Library:Notify('Auto roll on · max speed · ' .. tostring(rollRFLabel or rem.Name))
 end)
 RollBox:AddLabel('Lobby · Normal + Lucky · stops on Exotic by default')
 
@@ -20532,7 +20557,7 @@ GearBox:AddDropdown('DLJunkMode', {
 GearBox:AddToggle('DLAutoJunk', {
 	Text = 'Auto clear junk gear',
 	Default = false,
-	Tooltip = 'Sells/deletes unlocked Head, Body, or Ring pieces under 95% Quality (same % as the inventory panel). Never weapons. Keeps Locked and equipped.',
+	Tooltip = 'Sells/deletes unlocked Head, Body, or Ring unless Celestial/Exotic AND ≥95% Quality. Never weapons. Keeps Locked and equipped.',
 }):OnChanged(function(v)
 	Library:Notify(v and 'Auto junk clear on' or 'Auto junk clear off')
 	if v then
@@ -20543,7 +20568,7 @@ end)
 GearBox:AddButton('Clear junk now', function()
 	task.spawn(Gear.sellJunk, false)
 end)
-GearBox:AddLabel('Junk sell: Head / Body / Ring under 95% Quality. Keeps Locked, equipped, King\'s Crown / Living Armor / Supernova Ring. Never weapons.')
+GearBox:AddLabel('Junk sell: keeps Celestial/Exotic at 95%+ Quality only. Sells lower rarities and low-roll C/E (e.g. 68% Kabuto). Locked, equipped, weapons stay.')
 
 GearBox:AddToggle('DLAutoForge', {
 	Text = 'Auto forge upgrade',
