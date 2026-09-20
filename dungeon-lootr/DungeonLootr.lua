@@ -141,7 +141,7 @@ Library.ToggleKeybind = { Value = 'Home' }
 Library.Animations = Library.Animations or {}
 Library.Animations.TabSwitch = false
 
-local DL_BUILD = '1.0.88'
+local DL_BUILD = '1.0.89'
 getgenv().DLBuild = DL_BUILD
 -- Do NOT wipe DLShrineSkipKeys on every reload — that re-warps spent altars.
 
@@ -9680,9 +9680,9 @@ local function closestStudent(list, from)
 	return best
 end
 
--- Wave timer heals the boss if ANY student lives. Kill speed > cast interrupt.
--- Split the pack across party members; each client burns its share to death
--- (no arena hop) so damage is not wasted stacking the same target.
+-- Wave timer: ANY living student heals the boss. Sticky-on-one left the rest
+-- free — hard-tele hop the FULL pack with a short hit-confirm dwell. Party
+-- members start on different indices so they do not always stack the same body.
 local function holdOnStudentPack()
 	rt.studentHopAt = 0
 	rt.studentHopIdx = 0
@@ -9691,53 +9691,95 @@ local function holdOnStudentPack()
 	rt.studentHopNpc = nil
 	rt.studentHopHits0 = 0
 	Pin.follow(function()
-		local list = listMageStudents()
+		local list = sortStudentsStable(listMageStudents())
 		if #list == 0 then
 			rt.studentHopping = false
 			rt.studentSticky = nil
 			rt.studentHopNpc = nil
 			return nil
 		end
-		local me = routeRoot()
-		local mePos = me and me.Position
-		local share, slot, partyN = myStudentShare(list)
-		local target = nil
 
-		-- Finish the current assigned student before retargeting.
-		local cur = rt.studentHopNpc
-		if cur
-			and cur.Parent
-			and enemyAlive(cur)
-			and not farmSkipped(cur)
-		then
-			local stillMine = false
-			for i = 1, #share do
-				if share[i] == cur then
-					stillMine = true
-					break
-				end
+		-- Casters first in the hop order, then everyone else.
+		local order = {}
+		local seen = {}
+		for i = 1, #list do
+			if studentCasting(list[i]) then
+				order[#order + 1] = list[i]
+				seen[list[i]] = true
 			end
-			if stillMine then
-				target = cur
+		end
+		for i = 1, #list do
+			if not seen[list[i]] then
+				order[#order + 1] = list[i]
 			end
 		end
 
-		if not target then
-			target = weakestStudent(share, mePos) or share[1] or list[1]
-			if target and target ~= cur then
+		local peers = studentPartyPeers()
+		local partyN = math.max(1, #peers)
+		local slot = 1
+		for i = 1, #peers do
+			if peers[i] == LocalPlayer then
+				slot = i
+				break
+			end
+		end
+
+		local now = os.clock()
+		local hitsNow = tonumber(LocalPlayer:GetAttribute('Hit_Count')) or 0
+		local cur = rt.studentHopNpc
+		local curIdx = nil
+		for i = 1, #order do
+			if order[i] == cur then
+				curIdx = i
+				break
+			end
+		end
+
+		local alive = cur
+			and cur.Parent
+			and enemyAlive(cur)
+			and not farmSkipped(cur)
+		local dwell = now - (rt.studentHopAt or 0)
+		local hitLanded = hitsNow > (rt.studentHopHits0 or 0)
+		-- Solo target: melt it. Multi: tag each body ~0.18s then hop.
+		local stay = false
+		if #order <= 1 then
+			stay = alive == true
+		elseif alive and curIdx then
+			if dwell < 0.14 then
+				stay = true
+			elseif dwell < 0.22 and not hitLanded then
+				stay = true
+			end
+		end
+
+		local target
+		if stay then
+			target = cur
+		else
+			local idx
+			if curIdx then
+				idx = (curIdx % #order) + 1
+			else
+				-- Stagger first pick by party slot so clients fan out.
+				idx = ((slot - 1) % #order) + 1
+			end
+			target = order[idx]
+			if target ~= cur then
 				rt.studentBurst = true
 			end
 			rt.studentHopNpc = target
-			rt.studentHopAt = os.clock()
+			rt.studentHopIdx = idx
+			rt.studentHopAt = now
+			rt.studentHopHits0 = hitsNow
 		end
 
 		if not target then
 			return nil
 		end
 
-		-- Plant on one body and melt it. Hopping only burns travel time.
-		rt.studentHopping = false
-		rt.studentSticky = target
+		rt.studentHopping = #order > 1
+		rt.studentSticky = nil
 		rt.farmFightNpc = target
 		local stand, aim = studentStandAt(target)
 		if not stand then
@@ -9746,9 +9788,9 @@ local function holdOnStudentPack()
 		rt.farmCrowdAim = aim
 		rt.stickyPlant = nil
 		rt.studentHopSwing = true
-		rt.studentHopLabel = ('students · burn %d/%d · you %d/%d'):format(
-			#share,
-			#list,
+		rt.studentHopLabel = ('students · hop %d/%d · slot %d/%d'):format(
+			rt.studentHopIdx or 1,
+			#order,
 			slot,
 			partyN
 		)

@@ -1,6 +1,6 @@
 {
-    "version":  "1.0.88",
-    "message":  "P3 students: party split burn (timer kill), not interrupt hop",
+    "version":  "1.0.89",
+    "message":  "P3 students: hop full pack with hit-confirm, no sticky-one",
     "files":  [
                   "dungeon-lootr/launch.lua",
                   "dungeon-lootr/DungeonLootr.lua",
