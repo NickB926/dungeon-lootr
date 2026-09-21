@@ -141,7 +141,7 @@ Library.ToggleKeybind = { Value = 'Home' }
 Library.Animations = Library.Animations or {}
 Library.Animations.TabSwitch = false
 
-local DL_BUILD = '1.0.91'
+local DL_BUILD = '1.0.92'
 getgenv().DLBuild = DL_BUILD
 -- Do NOT wipe DLShrineSkipKeys on every reload — that re-warps spent altars.
 
@@ -20304,12 +20304,86 @@ local Gear = (function()
 	end
 
 	-- Locked is deliberately ignored: it protects an item from being sold, not worn.
+	-- Quality gate: never auto-equip a piece we can read as under 95%.
+	local OVERCAP_HIGH_MULT = 1.28
+	local MIN_EQUIP_QUALITY = 0.95
+	local equipDataMod
+	local function equipmentData()
+		if equipDataMod ~= nil then
+			return equipDataMod
+		end
+		local ok, mod = pcall(function()
+			return require(ReplicatedStorage.GameInfo.EquipmentData)
+		end)
+		equipDataMod = (ok and type(mod) == 'table') and mod or false
+		return equipDataMod
+	end
+
+	local function rollQuality(item)
+		local ed = equipmentData()
+		if not ed or type(item) ~= 'table' then
+			return nil
+		end
+		-- Overcap rolls (Value > High): API clamps to 100%, panel does not.
+		if type(ed.GetItemRollRanges) == 'function' then
+			local okR, ranges = pcall(ed.GetItemRollRanges, item)
+			if okR and type(ranges) == 'table' then
+				local sum, n = 0, 0
+				local anyOver = false
+				for _, r in pairs(ranges) do
+					if type(r) == 'table'
+						and type(r.Value) == 'number'
+						and type(r.Low) == 'number'
+						and type(r.High) == 'number'
+					then
+						local hi = r.High
+						if r.Value > r.High then
+							anyOver = true
+							hi = r.High * OVERCAP_HIGH_MULT
+						end
+						local span = hi - r.Low
+						if span <= 0 then
+							sum += 1
+						else
+							sum += math.clamp((r.Value - r.Low) / span, 0, 1)
+						end
+						n += 1
+					end
+				end
+				if anyOver and n > 0 then
+					return sum / n
+				end
+			end
+		end
+		if type(ed.ComputeItemRollQuality) ~= 'function' then
+			return nil
+		end
+		local ok, q = pcall(ed.ComputeItemRollQuality, item)
+		if ok and type(q) == 'number' then
+			if q > 1 then
+				q = q / 100
+			end
+			return q
+		end
+		return nil
+	end
+
+	local function qualityOk(item)
+		local q = rollQuality(item)
+		if type(q) ~= 'number' then
+			-- Can't read quality — still allow equip (junk sell keeps unknowns).
+			return true
+		end
+		return q >= MIN_EQUIP_QUALITY
+	end
+
 	local function usable(item, lvl)
 		return type(item) == 'table'
 			and type(item.GUID) == 'string'
 			and type(item.Slot) == 'string'
 			and item.Identified ~= false
 			and (tonumber(item.LevelReq) or 0) <= lvl
+			and qualityOk(item)
 	end
 
 	-- Slots are discovered from the data instead of a hardcoded Head/Body/Ring list,
@@ -20429,66 +20503,7 @@ local Gear = (function()
 		Celestial = true,
 		Exotic = true,
 	}
-	local JUNK_QUALITY = 0.95 -- keep only at or above 95%
-	local OVERCAP_HIGH_MULT = 1.28
-
-	local equipDataMod
-	local function equipmentData()
-		if equipDataMod ~= nil then
-			return equipDataMod
-		end
-		local ok, mod = pcall(function()
-			return require(ReplicatedStorage.GameInfo.EquipmentData)
-		end)
-		equipDataMod = (ok and type(mod) == 'table') and mod or false
-		return equipDataMod
-	end
-
-	local function rollQuality(item)
-		local ed = equipmentData()
-		if not ed or type(item) ~= 'table' then
-			return nil
-		end
-		-- Overcap rolls (Value > High): API clamps to 100%, panel does not.
-		if type(ed.GetItemRollRanges) == 'function' then
-			local okR, ranges = pcall(ed.GetItemRollRanges, item)
-			if okR and type(ranges) == 'table' then
-				local sum, n = 0, 0
-				local anyOver = false
-				for _, r in pairs(ranges) do
-					if type(r) == 'table'
-						and type(r.Value) == 'number'
-						and type(r.Low) == 'number'
-						and type(r.High) == 'number'
-					then
-						local hi = r.High
-						if r.Value > r.High then
-							anyOver = true
-							hi = r.High * OVERCAP_HIGH_MULT
-						end
-						local span = hi - r.Low
-						if span <= 0 then
-							sum += 1
-						else
-							sum += math.clamp((r.Value - r.Low) / span, 0, 1)
-						end
-						n += 1
-					end
-				end
-				if anyOver and n > 0 then
-					return sum / n
-				end
-			end
-		end
-		if type(ed.ComputeItemRollQuality) ~= 'function' then
-			return nil
-		end
-		local ok, q = pcall(ed.ComputeItemRollQuality, item)
-		if ok and type(q) == 'number' then
-			return q
-		end
-		return nil
-	end
+	local JUNK_QUALITY = MIN_EQUIP_QUALITY -- same 95% floor as auto-equip
 
 	local function mustKeep(item)
 		if type(item) ~= 'table' then
@@ -22662,7 +22677,7 @@ end)
 GearBox:AddToggle('DLAutoGear', {
 	Text = 'Auto equip best gear',
 	Default = false,
-	Tooltip = 'Head/Body/Weapon: rarity then tier. Rings: highest Lifesteal only — never swaps a ring for damage or rarity if LS is not strictly better.',
+	Tooltip = 'Only equips items at ≥95% Quality. Head/Body/Weapon: rarity then tier. Rings: highest Lifesteal only (also ≥95%).',
 }):OnChanged(function(v)
 	Library:Notify(v and 'Auto equip on' or 'Auto equip off')
 	if v then

@@ -1,6 +1,6 @@
 {
-    "version":  "1.0.91",
-    "message":  "Instant farm/dodge resume after death; stop arming replay on die",
+    "version":  "1.0.92",
+    "message":  "Auto equip: skip anything under 95% quality",
     "files":  [
                   "dungeon-lootr/launch.lua",
                   "dungeon-lootr/DungeonLootr.lua",
