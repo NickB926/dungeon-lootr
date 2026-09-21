@@ -141,13 +141,13 @@ Library.ToggleKeybind = { Value = 'Home' }
 Library.Animations = Library.Animations or {}
 Library.Animations.TabSwitch = false
 
-local DL_BUILD = '1.0.92'
+local DL_BUILD = '1.0.93'
 getgenv().DLBuild = DL_BUILD
 -- Do NOT wipe DLShrineSkipKeys on every reload — that re-warps spent altars.
 
 local Window = Library:CreateWindow({
 	Title = 'Dungeon Lootr',
-	Footer = 'Home toggles menu',
+	Footer = '…',
 	Folder = 'dungeon-lootr',
 	Version = DL_BUILD,
 	Size = UDim2.fromOffset(880, 560),
@@ -159,6 +159,39 @@ pcall(function()
 		Library.ScreenGui:SetAttribute('DLDungeonLootr', true)
 	end
 end)
+
+-- Menu header subtitle (class · Lv · aspect) — filled once helpers exist.
+local chromeSubLabel
+local classLevelAspectLine
+pcall(function()
+	local gui = Library.ScreenGui
+	local header = gui and gui:FindFirstChild('Main') and gui.Main:FindFirstChild('Header')
+	if not header then
+		return
+	end
+	local titleLbl = nil
+	for _, c in ipairs(header:GetChildren()) do
+		if c:IsA('TextLabel') then
+			if c.Text == 'Dungeon Lootr' or (c.TextSize and c.TextSize >= 18) then
+				titleLbl = c
+			elseif not chromeSubLabel then
+				chromeSubLabel = c
+			end
+		end
+	end
+	if chromeSubLabel == titleLbl then
+		chromeSubLabel = nil
+	end
+end)
+
+local function refreshChromeSub()
+	if type(classLevelAspectLine) ~= 'function' then
+		return
+	end
+	if chromeSubLabel and chromeSubLabel.Parent then
+		chromeSubLabel.Text = classLevelAspectLine()
+	end
+end
 
 local Toggles = Library.Toggles
 local Options = Library.Options
@@ -678,6 +711,89 @@ rt.mysteryMerchantLine = function()
 	return ('mystery  ·  in  %s'):format(rt.fmtClock(untilArr))
 end
 
+-- Class aspect: Active_Aspect attr, ClassSlots, weapon ClassItemAspects, or Classes UI.
+local function currentAspectName()
+	local a = tostring(LocalPlayer:GetAttribute('Active_Aspect') or '')
+	a = (a:gsub('^%s+', ''):gsub('%s+$', ''))
+	if a ~= '' and string.lower(a) ~= 'none' and string.lower(a) ~= 'nil' then
+		return a
+	end
+	local className = tostring(
+		LocalPlayer:GetAttribute('Current_Class')
+			or LocalPlayer:GetAttribute('Active_Class')
+			or ''
+	)
+	pcall(function()
+		local knitMod = game:GetService('ReplicatedStorage').Packages._Index['sleitnick_knit@1.7.0'].knit
+		local K = require(knitMod)
+		local d = K.Registry and K.Registry._Entries and K.Registry._Entries.PlayerData
+		d = d and d.Data
+		if type(d) ~= 'table' then
+			return
+		end
+		if className ~= '' and type(d.ClassSlots) == 'table' then
+			for _, slot in pairs(d.ClassSlots) do
+				if type(slot) == 'table' and tostring(slot.ClassName or '') == className then
+					local asp = tostring(slot.Aspect or ''):gsub('^%s+', ''):gsub('%s+$', '')
+					if asp ~= '' and string.lower(asp) ~= 'none' then
+						a = asp
+						return
+					end
+				end
+			end
+		end
+		local weapon = tostring(d.EquippedClassItem or '')
+		if weapon ~= '' and type(d.ClassItemAspects) == 'table' then
+			local asp = d.ClassItemAspects[weapon]
+			if type(asp) == 'string' then
+				asp = asp:gsub('^%s+', ''):gsub('%s+$', '')
+				if asp ~= '' and string.lower(asp) ~= 'none' then
+					a = asp
+					return
+				end
+			end
+		end
+	end)
+	if a ~= '' and string.lower(a) ~= 'none' then
+		return a
+	end
+	pcall(function()
+		local lbl = LocalPlayer:FindFirstChild('PlayerGui')
+		lbl = lbl and lbl:FindFirstChild('Main')
+		lbl = lbl and lbl:FindFirstChild('Frames')
+		lbl = lbl and lbl:FindFirstChild('Classes')
+		lbl = lbl and lbl:FindFirstChild('Aspect')
+		if lbl and (lbl:IsA('TextLabel') or lbl:IsA('TextButton')) then
+			local name = tostring(lbl.Text or ''):match('[Aa]spect:%s*(.+)')
+			if type(name) == 'string' then
+				name = name:gsub('^%s+', ''):gsub('%s+$', '')
+				if name ~= '' and string.lower(name) ~= 'none' then
+					a = name
+				end
+			end
+		end
+	end)
+	if a ~= '' and string.lower(a) ~= 'none' and string.lower(a) ~= 'nil' then
+		return a
+	end
+	return nil
+end
+
+classLevelAspectLine = function()
+	local className = tostring(
+		LocalPlayer:GetAttribute('Current_Class')
+			or LocalPlayer:GetAttribute('Active_Class')
+			or '?'
+	)
+	local level = tonumber(LocalPlayer:GetAttribute('PlayerLevel')) or 0
+	local aspect = currentAspectName()
+	if aspect then
+		return ('%s  ·  Lv %s  ·  %s'):format(className, fmtNum(level), aspect)
+	end
+	return ('%s  ·  Lv %s  ·  no aspect'):format(className, fmtNum(level))
+end
+pcall(refreshChromeSub)
+
 local function statsText()
 	local char = character()
 	local hp, maxHp = rt.readHp()
@@ -692,7 +808,7 @@ local function statsText()
 	local iframe = (char and char:GetAttribute('iFrame') == true) or LocalPlayer:GetAttribute('iFrame') == true
 	local parryText = parry and 'PARRY' or (parryCd and 'parry cd') or 'parry ready'
 	local lines = {
-		('%s  ·  Lv %s'):format(className, fmtNum(level)),
+		classLevelAspectLine(),
 		inRun and (dungeon .. (diff ~= '' and ('  ·  ' .. diff) or '')) or 'Lobby',
 		('HP  %s / %s'):format(fmtNum(hp), fmtNum(maxHp)),
 		skillReady(1) .. '    ' .. skillReady(2),
@@ -1177,6 +1293,7 @@ hudBody.Parent = hudFrame
 local function refreshHud()
 	local show = on('DLShowHud')
 	hudGui.Enabled = show == true
+	pcall(refreshChromeSub)
 	if not show then
 		return
 	end
