@@ -1,6 +1,6 @@
 {
-    "version":  "1.0.94",
-    "message":  "Fix aspect HUD (register limit) + show class aspect",
+    "version":  "1.0.95",
+    "message":  "Auto roll: optional stop-on aspect filter with classes",
     "files":  [
                   "dungeon-lootr/launch.lua",
                   "dungeon-lootr/DungeonLootr.lua",

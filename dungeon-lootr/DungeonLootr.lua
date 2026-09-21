@@ -141,7 +141,7 @@ Library.ToggleKeybind = { Value = 'Home' }
 Library.Animations = Library.Animations or {}
 Library.Animations.TabSwitch = false
 
-local DL_BUILD = '1.0.94'
+local DL_BUILD = '1.0.95'
 getgenv().DLBuild = DL_BUILD
 -- Do NOT wipe DLShrineSkipKeys on every reload — that re-warps spent altars.
 
@@ -14260,6 +14260,68 @@ local function listClassNames()
 	return names
 end
 
+local function listAspectNames()
+	local names, seen = {}, {}
+	local function add(name)
+		if type(name) ~= 'string' then
+			return
+		end
+		name = name:gsub('^%s+', ''):gsub('%s+$', '')
+		if name == '' or seen[name] then
+			return
+		end
+		seen[name] = true
+		names[#names + 1] = name
+	end
+	add('None')
+	pcall(function()
+		local mod = require(game:GetService('ReplicatedStorage').GameInfo.MutationData)
+		local t = mod and mod.ClassWeaponAspects
+		if type(t) == 'table' then
+			for k, v in pairs(t) do
+				if type(k) == 'string' then
+					add(k)
+				elseif type(v) == 'string' then
+					add(v)
+				elseif type(v) == 'table' and type(v.Name) == 'string' then
+					add(v.Name)
+				end
+			end
+		end
+		if type(mod.GetClassWeaponAspectNames) == 'function' then
+			local ok, list = pcall(mod.GetClassWeaponAspectNames)
+			if ok and type(list) == 'table' then
+				for _, n in ipairs(list) do
+					add(n)
+				end
+			end
+		end
+	end)
+	pcall(function()
+		local img = require(game:GetService('ReplicatedStorage').GameInfo.Image_Data)
+		local t = img and img.Aspects
+		if type(t) == 'table' then
+			for k, v in pairs(t) do
+				if type(k) == 'string' then
+					add(k)
+				elseif type(v) == 'string' then
+					add(v)
+				end
+			end
+		end
+	end)
+	table.sort(names, function(a, b)
+		if a == 'None' then
+			return true
+		end
+		if b == 'None' then
+			return false
+		end
+		return a < b
+	end)
+	return names
+end
+
 local function currentClassName()
 	return tostring(LocalPlayer:GetAttribute('Current_Class') or LocalPlayer:GetAttribute('Active_Class') or '')
 end
@@ -14279,6 +14341,41 @@ local function wantedRollClasses()
 		map[v] = true
 	end
 	return map
+end
+
+local function wantedRollAspects()
+	local v = Options.DLRollAspects and Options.DLRollAspects.Value
+	local map = {}
+	if type(v) == 'table' then
+		for k, val in pairs(v) do
+			if type(k) == 'string' and val == true then
+				map[k] = true
+			elseif type(val) == 'string' then
+				map[val] = true
+			end
+		end
+	elseif type(v) == 'string' and v ~= '' then
+		map[v] = true
+	end
+	return map
+end
+
+local function normalizeAspectName(name)
+	if type(name) ~= 'string' then
+		return 'None'
+	end
+	name = name:gsub('^%s+', ''):gsub('%s+$', '')
+	if name == '' or string.lower(name) == 'nil' or string.lower(name) == 'none' then
+		return 'None'
+	end
+	return name
+end
+
+local function currentRollAspectName()
+	if type(rt.currentAspectName) == 'function' then
+		return normalizeAspectName(rt.currentAspectName())
+	end
+	return normalizeAspectName(tostring(LocalPlayer:GetAttribute('Active_Aspect') or ''))
 end
 
 local function classDataMod()
@@ -14345,6 +14442,47 @@ local function classIsWanted(name)
 		end
 	end
 	return false
+end
+
+-- Empty aspect filter = any aspect (including None). Otherwise must match.
+local function aspectIsWanted(name)
+	local map = wantedRollAspects()
+	if not next(map) then
+		return true
+	end
+	name = normalizeAspectName(name)
+	if map[name] then
+		return true
+	end
+	local low = string.lower(name)
+	for k in pairs(map) do
+		if string.lower(tostring(k)) == low then
+			return true
+		end
+	end
+	return false
+end
+
+local function rollHitSatisfied(className)
+	if not classIsWanted(className) then
+		return false
+	end
+	return aspectIsWanted(currentRollAspectName())
+end
+
+local function rollHitLabel(className)
+	local rar = classRarity(className)
+	local asp = currentRollAspectName()
+	if rar and asp and asp ~= 'None' then
+		return ('Hit %s [%s] · %s'):format(className, rar, asp)
+	end
+	if rar then
+		return ('Hit %s [%s] · %s'):format(className, rar, asp)
+	end
+	if asp and asp ~= 'None' then
+		return ('Hit %s · %s'):format(className, asp)
+	end
+	return ('Hit %s · %s'):format(className, asp)
 end
 
 local function findKnitServices()
@@ -14485,6 +14623,30 @@ local function parseRolledClass(result)
 	return currentClassName()
 end
 
+local function parseRolledAspect(result)
+	if type(result) ~= 'table' then
+		return nil
+	end
+	for _, key in ipairs({
+		'Aspect', 'aspect', 'AspectName', 'ClassAspect', 'RolledAspect', 'ActiveAspect',
+	}) do
+		if type(result[key]) == 'string' and result[key] ~= '' then
+			return normalizeAspectName(result[key])
+		end
+	end
+	for _, key in ipairs({ 'Class', 'class', 'Result', 'Data' }) do
+		local inner = result[key]
+		if type(inner) == 'table' then
+			for _, k2 in ipairs({ 'Aspect', 'aspect', 'AspectName' }) do
+				if type(inner[k2]) == 'string' and inner[k2] ~= '' then
+					return normalizeAspectName(inner[k2])
+				end
+			end
+		end
+	end
+	return nil
+end
+
 local function skipSpinAnim()
 	local pg = LocalPlayer:FindFirstChild('PlayerGui')
 	local top = pg and pg:FindFirstChild('TopLevel')
@@ -14561,10 +14723,8 @@ local function autoRollTick()
 		stopAutoRoll('Pick stop-on classes first (or enable Stop on Exotic)')
 		return
 	end
-	if classIsWanted(currentClassName()) then
-		local cur = currentClassName()
-		local rar = classRarity(cur)
-		stopAutoRoll(rar and ('Hit %s [%s]'):format(cur, rar) or ('Hit ' .. cur))
+	if rollHitSatisfied(currentClassName()) then
+		stopAutoRoll(rollHitLabel(currentClassName()))
 		return
 	end
 	if not findRollRemote() then
@@ -14581,10 +14741,8 @@ local function autoRollTick()
 			if LocalPlayer:GetAttribute('InDungeon') == true then
 				break
 			end
-			if classIsWanted(currentClassName()) then
-				local cur = currentClassName()
-				local rar = classRarity(cur)
-				stopAutoRoll(rar and ('Hit %s [%s]'):format(cur, rar) or ('Hit ' .. cur))
+			if rollHitSatisfied(currentClassName()) then
+				stopAutoRoll(rollHitLabel(currentClassName()))
 				break
 			end
 			local counts = getSpinCounts(false)
@@ -14603,10 +14761,21 @@ local function autoRollTick()
 			-- Hide/skip reveal UI without frame waits (was ~70ms pad per spin).
 			skipSpinAnim()
 			local got = parseRolledClass(result)
-			if classIsWanted(got) or classIsWanted(currentClassName()) then
-				local hit = classIsWanted(got) and got or currentClassName()
-				local rar = classRarity(hit)
-				stopAutoRoll(rar and ('Hit %s [%s]'):format(hit, rar) or ('Hit ' .. hit))
+			local rolledAsp = parseRolledAspect(result)
+			local aspectFilter = next(wantedRollAspects()) ~= nil
+			if aspectFilter then
+				-- Let Active_Aspect / ClassSlots catch up before judging the hit.
+				task.wait(0.05)
+			end
+			local liveAsp = currentRollAspectName()
+			if rolledAsp and liveAsp == 'None' and classIsWanted(got) then
+				if aspectIsWanted(rolledAsp) then
+					stopAutoRoll(('Hit %s · %s'):format(got, rolledAsp))
+					break
+				end
+			elseif rollHitSatisfied(got) or rollHitSatisfied(currentClassName()) then
+				local hit = rollHitSatisfied(got) and got or currentClassName()
+				stopAutoRoll(rollHitLabel(hit))
 				break
 			end
 			if not ok then
@@ -14884,12 +15053,17 @@ return {
 	trySummonSpecial = trySummonSpecial,
 	confirmSpecialSummon = confirmSpecialSummon,
 	listClassNames = listClassNames,
+	listAspectNames = listAspectNames,
 	redeemAllCodes = redeemAllCodes,
 	knitRF = knitRF,
 	findRollRemote = findRollRemote,
 	wantedRollClasses = wantedRollClasses,
+	wantedRollAspects = wantedRollAspects,
 	currentClassName = currentClassName,
 	classIsWanted = classIsWanted,
+	aspectIsWanted = aspectIsWanted,
+	rollHitSatisfied = rollHitSatisfied,
+	rollHitLabel = rollHitLabel,
 	listRedeemCodes = listRedeemCodes,
 }
 end)()
@@ -21797,28 +21971,39 @@ local classDrop = RollBox:AddDropdown('DLRollClasses', {
 	Multi = true,
 	AllowNull = true,
 })
+local aspectDrop = RollBox:AddDropdown('DLRollAspects', {
+	Text = 'Stop on aspects',
+	Values = RunLoops.listAspectNames(),
+	Multi = true,
+	AllowNull = true,
+	Tooltip = 'Optional. With classes selected, only stop when the class AND aspect match (e.g. Embertide + Aegis). Empty = any aspect. Pick None for no aspect.',
+})
 RollBox:AddDropdown('DLSpinMode', {
 	Text = 'Spin type',
 	Values = { 'Lucky first', 'Normal only', 'Lucky only' },
 	Default = 1,
 	Tooltip = 'Lucky first burns lucky spins then normal. Matches SummoningService.Spin("Lucky"|"Normal").',
 })
-RollBox:AddButton('Refresh classes', function()
+RollBox:AddButton('Refresh classes / aspects', function()
 	local names = RunLoops.listClassNames()
 	if classDrop and classDrop.SetValues then
 		classDrop:SetValues(names)
 	end
-	Library:Notify((#names) .. ' classes')
+	local aspects = RunLoops.listAspectNames()
+	if aspectDrop and aspectDrop.SetValues then
+		aspectDrop:SetValues(aspects)
+	end
+	Library:Notify(('%d classes · %d aspects'):format(#names, #aspects))
 end)
 RollBox:AddToggle('DLStopExotic', {
 	Text = 'Stop on Exotic',
 	Default = true,
-	Tooltip = 'Always stop auto-roll when Class_Data rarity is Exotic (Dragoon, Embertide, etc.), even if that class is not in the dropdown.',
+	Tooltip = 'Always stop auto-roll when Class_Data rarity is Exotic (Dragoon, Embertide, etc.), even if that class is not in the dropdown. Aspect filter still applies if set.',
 })
 RollBox:AddToggle('DLAutoRoll', {
 	Text = 'Auto roll',
 	Default = false,
-	Tooltip = 'Lobby: SummoningService.Spin back-to-back (cached counts, no anim wait). Stops on picked classes and Exotic if that toggle is on.',
+	Tooltip = 'Lobby: SummoningService.Spin. Stops on picked classes (+ optional aspect filter) and Exotic if that toggle is on.',
 }):OnChanged(function(v)
 	if not v then
 		rollBusy = false
@@ -21835,8 +22020,8 @@ RollBox:AddToggle('DLAutoRoll', {
 		return
 	end
 	local curClass = RunLoops.currentClassName()
-	if RunLoops.classIsWanted(curClass) then
-		Library:Notify('Already on ' .. tostring(curClass))
+	if RunLoops.rollHitSatisfied(curClass) then
+		Library:Notify('Already on ' .. tostring(RunLoops.rollHitLabel(curClass)))
 		Toggles.DLAutoRoll:SetValue(false)
 		return
 	end
@@ -21846,9 +22031,11 @@ RollBox:AddToggle('DLAutoRoll', {
 		Toggles.DLAutoRoll:SetValue(false)
 		return
 	end
-	Library:Notify('Auto roll on · max speed · ' .. tostring(rollRFLabel or rem.Name))
+	local aspMap = RunLoops.wantedRollAspects()
+	local aspNote = next(aspMap) and ' · aspect filter' or ''
+	Library:Notify('Auto roll on · max speed · ' .. tostring(rollRFLabel or rem.Name) .. aspNote)
 end)
-RollBox:AddLabel('Lobby · Normal + Lucky · stops on Exotic by default')
+RollBox:AddLabel('Lobby · class + optional aspect filter · Exotic stop on by default')
 
 local FarmBox = RunTab:AddLeftGroupbox('Auto farm')
 FarmBox:AddToggle('DLAutoFarm', {
