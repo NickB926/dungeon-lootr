@@ -141,7 +141,7 @@ Library.ToggleKeybind = { Value = 'Home' }
 Library.Animations = Library.Animations or {}
 Library.Animations.TabSwitch = false
 
-local DL_BUILD = '1.0.96'
+local DL_BUILD = '1.0.97'
 getgenv().DLBuild = DL_BUILD
 -- Do NOT wipe DLShrineSkipKeys on every reload — that re-warps spent altars.
 
@@ -22034,7 +22034,7 @@ local Gear = (function()
 		return successes
 	end
 
-	local SHOP_ALL = { 'Shop', 'PayloadShop', 'RaidShop', 'ItemShop', 'Stars_Shop' }
+	local SHOP_ALL = { 'Shop', 'PayloadShop', 'RaidShop', 'ItemShop', 'Stars_Shop', 'Appraisal' }
 
 	local function uiController()
 		local ps = LocalPlayer:FindFirstChild('PlayerScripts')
@@ -23518,6 +23518,7 @@ shopToggle('DLShopPayload', 'Payload shop', 'PayloadShop')
 shopToggle('DLShopRaid', 'Raid shop', 'RaidShop')
 shopToggle('DLShopItem', 'Item shop', 'ItemShop')
 shopToggle('DLShopStars', 'Stars shop', 'Stars_Shop')
+shopToggle('DLShopAppraisal', 'Appraisal shop', 'Appraisal')
 ShopsBox:AddToggle('DLShopAll', {
 	Text = 'All shops',
 	Default = false,
@@ -23529,7 +23530,9 @@ ShopsBox:AddToggle('DLShopAll', {
 	task.spawn(function()
 		Gear.setAllShopsOpen(v == true, false)
 		rt.shopToggleQuiet = true
-		for _, id in ipairs({ 'DLShopMain', 'DLShopPayload', 'DLShopRaid', 'DLShopItem', 'DLShopStars' }) do
+		for _, id in ipairs({
+			'DLShopMain', 'DLShopPayload', 'DLShopRaid', 'DLShopItem', 'DLShopStars', 'DLShopAppraisal',
+		}) do
 			if Toggles[id] and Toggles[id].SetValue then
 				pcall(function()
 					Toggles[id]:SetValue(v == true)

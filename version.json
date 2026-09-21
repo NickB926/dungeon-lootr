@@ -1,6 +1,6 @@
 {
-    "version":  "1.0.96",
-    "message":  "boss rush loop selectable + auto replay",
+    "version":  "1.0.97",
+    "message":  "add appraisal shop toggle",
     "files":  [
                   "dungeon-lootr/launch.lua",
                   "dungeon-lootr/DungeonLootr.lua",
