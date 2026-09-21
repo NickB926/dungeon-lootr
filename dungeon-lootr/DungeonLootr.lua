@@ -141,7 +141,7 @@ Library.ToggleKeybind = { Value = 'Home' }
 Library.Animations = Library.Animations or {}
 Library.Animations.TabSwitch = false
 
-local DL_BUILD = '1.0.97'
+local DL_BUILD = '1.0.98'
 getgenv().DLBuild = DL_BUILD
 -- Do NOT wipe DLShrineSkipKeys on every reload — that re-warps spent altars.
 
@@ -151,6 +151,38 @@ local Window = Library:CreateWindow({
 	Folder = 'dungeon-lootr',
 	Version = DL_BUILD,
 	Size = UDim2.fromOffset(880, 560),
+	OnUnload = function()
+		if type(getgenv().DLUnload) == 'function' then
+			getgenv().DLUnload()
+		end
+	end,
+	SettingsExtras = function(scriptBox)
+		if not scriptBox or type(scriptBox.AddToggle) ~= 'function' then
+			return
+		end
+		local OFF = 'dungeon-lootr/no_autoload'
+		local hasOff = type(isfile) == 'function' and isfile(OFF) == true
+		scriptBox:AddToggle('DLAutoInject', {
+			Text = 'Auto inject on join',
+			Default = not hasOff,
+			Tooltip = 'When on, Potassium autoexec loads Dungeon Lootr on join / rejoin / place teleport. Off writes dungeon-lootr/no_autoload so autoexec skips.',
+		}):OnChanged(function(v)
+			if v then
+				if type(delfile) == 'function' then
+					pcall(delfile, OFF)
+				end
+				Library:Notify('Auto inject on')
+			else
+				if type(makefolder) == 'function' then
+					pcall(makefolder, 'dungeon-lootr')
+				end
+				if type(writefile) == 'function' then
+					pcall(writefile, OFF, '1')
+				end
+				Library:Notify('Auto inject off')
+			end
+		end)
+	end,
 })
 pcall(function()
 	if Library.ScreenGui then
@@ -22296,7 +22328,6 @@ local MoveTab = Window:AddTab('Move', 'person-standing')
 local PlayersTab = Window:AddTab('Players', 'users')
 local DataTab = Window:AddTab('Data', 'scroll')
 local ShopsTab = Window:AddTab('Shops', 'store')
-local MenuTab = Window:AddTab('Menu', 'settings')
 
 local RunBox = RunTab:AddLeftGroupbox('ESP')
 local HudBox = RunTab:AddRightGroupbox('HUD')
@@ -23687,53 +23718,7 @@ StatBox:AddToggle('DLAutoStat', {
 end)
 StatBox:AddLabel('Reset is Inventory → Stat Upgrades → RESET. Auto spend will reallocate after a reset.')
 
-local MenuBox = MenuTab:AddLeftGroupbox('Script')
-MenuBox:AddLabel('Home hides/shows this window (same as PlayerTools).')
-do
-	local OFF = 'dungeon-lootr/no_autoload'
-	local hasOff = type(isfile) == 'function' and isfile(OFF) == true
-	MenuBox:AddToggle('DLAutoInject', {
-		Text = 'Auto inject on join',
-		Default = not hasOff,
-		Tooltip = 'When on, Potassium autoexec loads Dungeon Lootr on join / rejoin / place teleport. Off writes dungeon-lootr/no_autoload so autoexec skips.',
-	}):OnChanged(function(v)
-		if v then
-			if type(delfile) == 'function' then
-				pcall(delfile, OFF)
-			end
-			Library:Notify('Auto inject on')
-		else
-			if type(makefolder) == 'function' then
-				pcall(makefolder, 'dungeon-lootr')
-			end
-			if type(writefile) == 'function' then
-				pcall(writefile, OFF, '1')
-			end
-			Library:Notify('Auto inject off')
-		end
-	end)
-end
-if type(Library.AddNotifyToggle) == 'function' then
-	Library:AddNotifyToggle(MenuBox)
-end
-MenuBox:AddButton('Hide menu', function()
-	Library:Toggle(false)
-end)
-MenuBox:AddButton('Unload', function()
-	if type(getgenv().DLUnload) == 'function' then
-		getgenv().DLUnload()
-	end
-end)
-MenuBox:AddButton('Save current profile now', function()
-	Library:Notify(Config.saveNow() and 'Profile saved' or 'Profile save failed')
-end)
-MenuBox:AddButton('Reset settings to defaults', function()
-	Config.reset()
-	Library:Notify('Settings reset to defaults')
-end)
-
-local ProfileBox = MenuTab:AddRightGroupbox('Profiles')
-Library.Config.Build(ProfileBox)
+-- Script / Profiles / Theme live on the library Settings tab (CreateWindow default).
 
 end
 buildMenu()
