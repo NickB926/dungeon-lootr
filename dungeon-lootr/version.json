@@ -1,6 +1,6 @@
 {
-    "version":  "1.0.95",
-    "message":  "Auto roll: optional stop-on aspect filter with classes",
+    "version":  "1.0.96",
+    "message":  "boss rush loop selectable + auto replay",
     "files":  [
                   "dungeon-lootr/launch.lua",
                   "dungeon-lootr/DungeonLootr.lua",

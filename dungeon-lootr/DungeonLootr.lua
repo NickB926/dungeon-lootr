@@ -141,7 +141,7 @@ Library.ToggleKeybind = { Value = 'Home' }
 Library.Animations = Library.Animations or {}
 Library.Animations.TabSwitch = false
 
-local DL_BUILD = '1.0.95'
+local DL_BUILD = '1.0.96'
 getgenv().DLBuild = DL_BUILD
 -- Do NOT wipe DLShrineSkipKeys on every reload — that re-warps spent altars.
 
@@ -872,6 +872,14 @@ local function statsText()
 				map, (diff ~= '' and diff ~= 'nil') and diff or '?')
 		else
 			lines[#lines + 1] = 'payload loop on'
+		end
+	end
+	if on('DLBossRushLoop') then
+		local boss = Options.DLBossRushBoss and tostring(Options.DLBossRushBoss.Value or '') or ''
+		if boss ~= '' and boss ~= 'nil' then
+			lines[#lines + 1] = ('boss rush loop  ·  ' .. boss)
+		else
+			lines[#lines + 1] = 'boss rush loop on'
 		end
 	end
 	if on('DLHuntSpecial') then
@@ -17199,6 +17207,10 @@ local Replay = (function()
 			-- PayloadLoop.tick owns enter + RequestReturn (no RequestReplay).
 			return
 		end
+		if on('DLBossRushLoop') then
+			-- BossRushLoop.tick owns enter + RequestReplay.
+			return
+		end
 		if not wantReplay and not rushContinue then
 			runCompleteAt = nil
 			replayArmedAt = nil
@@ -17926,7 +17938,7 @@ local DungeonStart = (function()
 			return
 		end
 		-- Event raid / Challenge / Payload loops own lobby starts — do not pick Bandits Den.
-		if on('DLRaidLoop') or on('DLChallengeLoop') or on('DLPayloadLoop') then
+		if on('DLRaidLoop') or on('DLChallengeLoop') or on('DLPayloadLoop') or on('DLBossRushLoop') then
 			armedAt = 0
 			return
 		end
@@ -18832,6 +18844,502 @@ rt.ChallengeLoop = (function()
 								ret:InvokeServer()
 							end)
 						end
+						local deadline = os.clock() + 14
+						while os.clock() < deadline and not inLobby() do
+							task.wait(0.4)
+						end
+						api.onLobby()
+					end
+				end)
+			end
+			return
+		end
+		if not inLobby() then
+			armedAt = 0
+			return
+		end
+		if busy or os.clock() < nextCheck then
+			return
+		end
+		if os.clock() - lastStart < 8 then
+			return
+		end
+		if armedAt == 0 then
+			armedAt = os.clock()
+			return
+		end
+		local delay = Options.DLDungeonDelay and tonumber(Options.DLDungeonDelay.Value) or 2
+		if os.clock() - armedAt < delay then
+			return
+		end
+		nextCheck = os.clock() + 5
+		api.enter(true)
+	end
+
+	return api
+end)()
+
+-- Boss Rush loop: pick final boss → ENTER → farm → RequestReplay on clear/fail.
+-- BossRushService owns replay/return; DungeonQueueService selects mode + final boss.
+rt.BossRushLoop = (function()
+	local ReplicatedStorage = game:GetService('ReplicatedStorage')
+	local api = {}
+	local nextCheck, lastStart, busy, armedAt = 0, 0, false, 0
+	local lastLabel = ''
+	local FALLBACK = {
+		'Cursed King',
+		'Satori',
+		'Anti Mage',
+		'Great Mage',
+		'Wisteria Swordsman',
+	}
+
+	local function bossRushData()
+		local ok, bd = pcall(require, ReplicatedStorage.GameInfo.BossRushData)
+		if ok and type(bd) == 'table' then
+			return bd
+		end
+		return nil
+	end
+
+	local function listBosses()
+		local names = {}
+		local seen = {}
+		local function add(id)
+			if type(id) ~= 'string' then
+				return
+			end
+			id = id:gsub('^%s+', ''):gsub('%s+$', '')
+			if id == '' or seen[id] then
+				return
+			end
+			seen[id] = true
+			names[#names + 1] = id
+		end
+		local bd = bossRushData()
+		if bd and type(bd.FINAL_BOSS_ORDER) == 'table' then
+			for _, id in ipairs(bd.FINAL_BOSS_ORDER) do
+				add(tostring(id))
+			end
+		end
+		if bd and type(bd.FINAL_BOSSES) == 'table' then
+			for id in pairs(bd.FINAL_BOSSES) do
+				add(tostring(id))
+			end
+		end
+		pcall(function()
+			local rf = RunLoops.knitRF('BossRushService', 'GetFinalBossOptions')
+			if not rf then
+				return
+			end
+			local ok, opts = pcall(function()
+				return rf:InvokeServer()
+			end)
+			if ok and type(opts) == 'table' then
+				if type(opts.Order) == 'table' then
+					for _, id in ipairs(opts.Order) do
+						add(tostring(id))
+					end
+				end
+				if type(opts.Options) == 'table' then
+					for id in pairs(opts.Options) do
+						add(tostring(id))
+					end
+				end
+			end
+		end)
+		if #names == 0 then
+			for _, id in ipairs(FALLBACK) do
+				add(id)
+			end
+		end
+		return names
+	end
+
+	local function inLobby()
+		return LocalPlayer:GetAttribute('InDungeon') ~= true
+			and LocalPlayer:GetAttribute('DungeonRun') ~= true
+			and workspace:FindFirstChild('BossRush_NPCs') == nil
+	end
+
+	local function inRushNow()
+		if workspace:FindFirstChild('BossRush_NPCs') then
+			return true
+		end
+		if type(inBossRushFarm) == 'function' and inBossRushFarm() then
+			return true
+		end
+		local d = string.lower(tostring(
+			LocalPlayer:GetAttribute('CurrentDungeon') or rt.runDungeonId or ''
+		))
+		if d:find('bossrush', 1, true) or d:find('boss_rush', 1, true) or d:find('boss rush', 1, true) then
+			return true
+		end
+		local rf = RunLoops.knitRF('BossRushService', 'GetSessionState')
+		if rf then
+			local ok, st = pcall(function()
+				return rf:InvokeServer()
+			end)
+			if ok and type(st) == 'table' and st.Phase ~= nil then
+				local phase = string.lower(tostring(st.Phase or ''))
+				if phase ~= '' and phase ~= 'none' and phase ~= 'nil' then
+					return true
+				end
+			end
+		end
+		return false
+	end
+
+	local function invokeQueue(name, ...)
+		local rem = RunLoops.knitRF('DungeonQueueService', name)
+		if not rem then
+			return false, nil
+		end
+		local args = table.pack(...)
+		local ok, res = pcall(function()
+			return rem:InvokeServer(table.unpack(args, 1, args.n))
+		end)
+		return ok, res
+	end
+
+	local function invokeRush(name, ...)
+		local rem = RunLoops.knitRF('BossRushService', name)
+		if not rem then
+			return false, nil
+		end
+		local args = table.pack(...)
+		local ok, res = pcall(function()
+			return rem:InvokeServer(table.unpack(args, 1, args.n))
+		end)
+		return ok, res
+	end
+
+	local function clickGui(btn)
+		if not btn then
+			return false
+		end
+		local function fire(sig)
+			if not sig then
+				return false
+			end
+			local ok, conns = pcall(getconnections, sig)
+			if not ok or type(conns) ~= 'table' or #conns == 0 then
+				return false
+			end
+			if type(firesignal) == 'function' then
+				pcall(firesignal, sig)
+				return true
+			end
+			local fired = false
+			for _, c in ipairs(conns) do
+				if c.Function then
+					task.spawn(c.Function)
+					fired = true
+				end
+			end
+			return fired
+		end
+		return fire(btn.Activated) or fire(btn.MouseButton1Click) or fire(btn.MouseButton1Down)
+	end
+
+	local function rushPanel()
+		local pg = LocalPlayer:FindFirstChild('PlayerGui')
+		local main = pg and pg:FindFirstChild('Main')
+		local frames = main and main:FindFirstChild('Frames')
+		return frames and frames:FindFirstChild('BossRush') or nil
+	end
+
+	local function openRushViaUIController()
+		local ps = LocalPlayer:FindFirstChild('PlayerScripts')
+		local client = ps and ps:FindFirstChild('Client')
+		local ctrls = client and client:FindFirstChild('Controllers')
+		local mod = ctrls and ctrls:FindFirstChild('UIController')
+		if not mod then
+			return false
+		end
+		local ok, UI = pcall(require, mod)
+		if not ok or type(UI) ~= 'table' or type(UI.names) ~= 'table' then
+			return false
+		end
+		local rush = UI.names.BossRush
+		if type(rush) == 'table' and type(rush.open) == 'function' then
+			return pcall(function()
+				rush:open()
+			end)
+		end
+		return false
+	end
+
+	local function ensureRushOpen()
+		local p = rushPanel()
+		if p and p.Visible then
+			return p
+		end
+		openRushViaUIController()
+		task.wait(0.35)
+		p = rushPanel()
+		if p and not p.Visible then
+			pcall(function()
+				p.Visible = true
+				p.Position = UDim2.new(0.5, 0, 0.5, 0)
+				p.AnchorPoint = Vector2.new(0.5, 0.5)
+			end)
+		end
+		return rushPanel()
+	end
+
+	local function displayBossName(panel)
+		if not panel then
+			return ''
+		end
+		local left = panel:FindFirstChild('Content')
+		left = left and left:FindFirstChild('LeftFrame')
+		local display = left and left:FindFirstChild('Display')
+		local lbl = display and display:FindFirstChild('BossName')
+		return tostring(lbl and lbl.Text or '')
+	end
+
+	local function bossMatches(label, wantId)
+		local a = string.lower(tostring(label or ''))
+		local b = string.lower(tostring(wantId or ''))
+		if a == '' or b == '' then
+			return false
+		end
+		return a == b or a:find(b, 1, true) ~= nil or b:find(a, 1, true) ~= nil
+	end
+
+	local function cycleToBoss(panel, bossId)
+		if not panel or not bossId or bossId == '' then
+			return false
+		end
+		if bossMatches(displayBossName(panel), bossId) then
+			return true
+		end
+		local left = panel:FindFirstChild('Content')
+		left = left and left:FindFirstChild('LeftFrame')
+		local fwd = left and (left:FindFirstChild('CycleForward') or left:FindFirstChild('CycleNext'))
+		local back = left and (left:FindFirstChild('CycleBack') or left:FindFirstChild('CyclePrev'))
+		local fwdBtn = fwd and (fwd:IsA('GuiButton') and fwd or fwd:FindFirstChildWhichIsA('GuiButton', true))
+		local backBtn = back and (back:IsA('GuiButton') and back or back:FindFirstChildWhichIsA('GuiButton', true))
+		for _ = 1, 12 do
+			if bossMatches(displayBossName(panel), bossId) then
+				return true
+			end
+			if not clickGui(fwdBtn) then
+				break
+			end
+			task.wait(0.12)
+		end
+		for _ = 1, 12 do
+			if bossMatches(displayBossName(panel), bossId) then
+				return true
+			end
+			if not clickGui(backBtn) then
+				break
+			end
+			task.wait(0.12)
+		end
+		return bossMatches(displayBossName(panel), bossId)
+	end
+
+	local function clickEnter(panel)
+		if not panel then
+			return false
+		end
+		local btns = panel:FindFirstChild('Content')
+		btns = btns and btns:FindFirstChild('Buttons')
+		local enter = btns and btns:FindFirstChild('Enter')
+		if enter then
+			local btn = enter:IsA('GuiButton') and enter or enter:FindFirstChildWhichIsA('GuiButton', true)
+			if clickGui(btn) then
+				return true
+			end
+		end
+		for _, d in ipairs(panel:GetDescendants()) do
+			if d:IsA('GuiButton') then
+				local lab = d:FindFirstChildWhichIsA('TextLabel', true)
+				local t = string.upper(tostring(lab and lab.Text or d.Name or ''))
+				if t == 'ENTER' or t:find('ENTER', 1, true) then
+					if clickGui(d) then
+						return true
+					end
+				end
+			end
+		end
+		return false
+	end
+
+	function api.target()
+		local want = Options.DLBossRushBoss and tostring(Options.DLBossRushBoss.Value or '') or ''
+		if want == '' or want == 'nil' then
+			local bosses = listBosses()
+			want = bosses[1] or 'Cursed King'
+		end
+		return want
+	end
+
+	function api.enter(silent)
+		if inRushNow() then
+			if not silent then
+				Library:Notify('Already in Boss Rush')
+			end
+			return false
+		end
+		if not inLobby() then
+			if not silent then
+				Library:Notify('Leave the dungeon before starting Boss Rush')
+			end
+			return false
+		end
+		local boss = api.target()
+		busy = true
+		task.spawn(function()
+			local ok = false
+			invokeQueue('RequestSelectMode', 'BossRush')
+			task.wait(0.12)
+			invokeQueue('RequestSelectMode', 'Boss Rush')
+			task.wait(0.12)
+			invokeQueue('RequestSelectFinalBoss', boss)
+			task.wait(0.12)
+			invokeRush('SelectFinalBoss', boss)
+			task.wait(0.15)
+			local panel = ensureRushOpen()
+			if panel then
+				cycleToBoss(panel, boss)
+				task.wait(0.2)
+				invokeQueue('RequestSelectFinalBoss', boss)
+				invokeRush('SelectFinalBoss', boss)
+				task.wait(0.12)
+			end
+			local okRf, res = invokeQueue('RequestStartPodQueue')
+			ok = okRf and res ~= false
+			if not ok then
+				okRf, res = invokeQueue('RequestStartSoloRun')
+				ok = okRf and res ~= false
+			end
+			if not ok then
+				okRf, res = invokeQueue('RequestEnter')
+				ok = okRf and res ~= false
+			end
+			if not ok and panel then
+				ok = clickEnter(panel)
+			end
+			lastStart = os.clock()
+			lastLabel = boss
+			busy = false
+			if not silent then
+				Library:Notify(('Boss Rush start: %s%s'):format(
+					boss, ok and '' or ' (ENTER / queue failed)'))
+			end
+		end)
+		return true
+	end
+
+	function api.replay(silent)
+		local rf = RunLoops.knitRF('BossRushService', 'RequestReplay')
+		if rf then
+			local ok, res = pcall(function()
+				return rf:InvokeServer()
+			end)
+			if ok and res ~= false then
+				if not silent then
+					Library:Notify('Boss Rush replay')
+				end
+				return true
+			end
+		end
+		pcall(function()
+			local pg = LocalPlayer:FindFirstChild('PlayerGui')
+			local main = pg and pg:FindFirstChild('Main')
+			if not main then
+				return
+			end
+			for _, d in ipairs(main:GetDescendants()) do
+				if d:IsA('GuiButton') and d.Visible ~= false then
+					local lab = d:FindFirstChildWhichIsA('TextLabel', true)
+					local t = string.upper(tostring(lab and lab.Text or d.Name or ''))
+					if t:find('REPLAY', 1, true) then
+						clickGui(d)
+						return
+					end
+				end
+			end
+		end)
+		return false
+	end
+
+	function api.onLobby()
+		armedAt = os.clock()
+	end
+
+	function api.label()
+		return lastLabel
+	end
+
+	function api.inRush()
+		return inRushNow()
+	end
+
+	function api.listBosses()
+		return listBosses()
+	end
+
+	local function sessionDone()
+		local rf = RunLoops.knitRF('BossRushService', 'GetSessionState')
+		if rf then
+			local ok, st = pcall(function()
+				return rf:InvokeServer()
+			end)
+			if ok and type(st) == 'table' then
+				local phase = string.lower(tostring(st.Phase or st.State or st.Status or ''))
+				if phase:find('complete', 1, true)
+					or phase:find('victory', 1, true)
+					or phase:find('defeat', 1, true)
+					or phase:find('fail', 1, true)
+					or phase:find('extract', 1, true)
+					or st.Complete == true
+					or st.Finished == true
+				then
+					return true
+				end
+			end
+		end
+		local found = false
+		pcall(function()
+			local pg = LocalPlayer:FindFirstChild('PlayerGui')
+			local main = pg and pg:FindFirstChild('Main')
+			if not main then
+				return
+			end
+			for _, d in ipairs(main:GetDescendants()) do
+				if d:IsA('GuiButton') and d.Visible ~= false then
+					local lab = d:FindFirstChildWhichIsA('TextLabel', true)
+					local t = string.upper(tostring(lab and lab.Text or d.Name or ''))
+					if t:find('REPLAY', 1, true) then
+						local as = d.AbsoluteSize
+						if as and as.X > 20 and as.Y > 10 then
+							found = true
+							return
+						end
+					end
+				end
+			end
+		end)
+		return found
+	end
+
+	function api.tick()
+		if not on('DLBossRushLoop') then
+			armedAt = 0
+			return
+		end
+		if inRushNow() then
+			armedAt = 0
+			if sessionDone() and os.clock() - (rt.bossRushReplayAt or 0) > 2.5 then
+				rt.bossRushReplayAt = os.clock()
+				task.spawn(function()
+					if not api.replay(true) then
+						invokeRush('RequestReturn')
 						local deadline = os.clock() + 14
 						while os.clock() < deadline and not inLobby() do
 							task.wait(0.4)
@@ -22354,6 +22862,9 @@ ReplayBox:AddToggle('DLRaidLoop', {
 		if Toggles.DLPayloadLoop then
 			Toggles.DLPayloadLoop:SetValue(false)
 		end
+		if Toggles.DLBossRushLoop then
+			Toggles.DLBossRushLoop:SetValue(false)
+		end
 		if Toggles.DLAutoReplay then
 			Toggles.DLAutoReplay:SetValue(false)
 		end
@@ -22459,6 +22970,9 @@ ReplayBox:AddToggle('DLChallengeLoop', {
 		if Toggles.DLPayloadLoop then
 			Toggles.DLPayloadLoop:SetValue(false)
 		end
+		if Toggles.DLBossRushLoop then
+			Toggles.DLBossRushLoop:SetValue(false)
+		end
 		if Toggles.DLAutoReplay then
 			Toggles.DLAutoReplay:SetValue(false)
 		end
@@ -22525,6 +23039,100 @@ ReplayBox:AddButton('Enter Challenge now', function()
 end)
 ReplayBox:AddLabel('Challenge loop: Mode Challenge → featured dungeon → difficulty → boss preview → RequestStartPodQueue / ENTER.')
 
+ReplayBox:AddToggle('DLBossRushLoop', {
+	Text = 'Boss Rush loop',
+	Default = false,
+	Tooltip = 'Loops Boss Rush: selects final boss, ENTER from lobby, then RequestReplay on complete/fail. Turns Auto farm on when you enter. Disables dungeon/raid/challenge/payload loops.',
+}):OnChanged(function(v)
+	if not v then
+		Library:Notify('Boss Rush loop off')
+		return
+	end
+	pcall(function()
+		if Options.DLBossRushBoss and Options.DLBossRushBoss.SetValue then
+			local cur = tostring(Options.DLBossRushBoss.Value or '')
+			if cur == '' or cur == 'nil' then
+				local bosses = (rt.BossRushLoop and rt.BossRushLoop.listBosses()) or {}
+				Options.DLBossRushBoss:SetValue(bosses[1] or 'Cursed King')
+			end
+		end
+		if Toggles.DLLoopSpecific then
+			Toggles.DLLoopSpecific:SetValue(false)
+		end
+		if Toggles.DLAutoDungeon then
+			Toggles.DLAutoDungeon:SetValue(false)
+		end
+		if Toggles.DLHuntSpecial then
+			Toggles.DLHuntSpecial:SetValue(false)
+		end
+		if Toggles.DLRaidLoop then
+			Toggles.DLRaidLoop:SetValue(false)
+		end
+		if Toggles.DLChallengeLoop then
+			Toggles.DLChallengeLoop:SetValue(false)
+		end
+		if Toggles.DLPayloadLoop then
+			Toggles.DLPayloadLoop:SetValue(false)
+		end
+		if Toggles.DLAutoReplay then
+			Toggles.DLAutoReplay:SetValue(false)
+		end
+	end)
+	if rt.BossRushLoop then
+		rt.BossRushLoop.onLobby()
+		local boss = rt.BossRushLoop.target()
+		Library:Notify(('Boss Rush loop · %s'):format(boss))
+		task.spawn(function()
+			task.wait(0.35)
+			if rt.BossRushLoop then
+				rt.BossRushLoop.enter(false)
+			end
+			local deadline = os.clock() + 25
+			while os.clock() < deadline do
+				local inRush = workspace:FindFirstChild('BossRush_NPCs') ~= nil
+				if not inRush and rt.BossRushLoop and rt.BossRushLoop.inRush then
+					inRush = rt.BossRushLoop.inRush()
+				end
+				if inRush then
+					if Toggles.DLAutoFarm then
+						Toggles.DLAutoFarm:SetValue(true)
+					end
+					break
+				end
+				task.wait(0.4)
+			end
+		end)
+	end
+end)
+ReplayBox:AddDropdown('DLBossRushBoss', {
+	Text = 'Boss Rush final boss',
+	Values = (rt.BossRushLoop and rt.BossRushLoop.listBosses())
+		or { 'Cursed King', 'Satori', 'Anti Mage', 'Great Mage', 'Wisteria Swordsman' },
+	Default = 1,
+	Tooltip = 'Final boss carousel on the Boss Rush panel (Cursed King, Satori, Anti Mage, Great Mage, Wisteria Swordsman).',
+})
+ReplayBox:AddButton('Refresh Boss Rush bosses', function()
+	local names = rt.BossRushLoop and rt.BossRushLoop.listBosses() or {}
+	if Options.DLBossRushBoss and Options.DLBossRushBoss.SetValues then
+		Options.DLBossRushBoss:SetValues(names)
+	end
+	Library:Notify((#names) .. ' Boss Rush bosses')
+end)
+ReplayBox:AddButton('Enter Boss Rush now', function()
+	task.spawn(function()
+		local B = rt.BossRushLoop
+		if not B then
+			return
+		end
+		if B.inRush() then
+			B.replay(false)
+			return
+		end
+		B.enter(false)
+	end)
+end)
+ReplayBox:AddLabel('Boss Rush: Mode BossRush → cycle final boss → ENTER / pod queue → RequestReplay on clear.')
+
 ReplayBox:AddToggle('DLPayloadLoop', {
 	Text = 'Payload loop',
 	Default = false,
@@ -22562,6 +23170,9 @@ ReplayBox:AddToggle('DLPayloadLoop', {
 		end
 		if Toggles.DLChallengeLoop then
 			Toggles.DLChallengeLoop:SetValue(false)
+		end
+		if Toggles.DLBossRushLoop then
+			Toggles.DLBossRushLoop:SetValue(false)
 		end
 		if Toggles.DLAutoReplay then
 			Toggles.DLAutoReplay:SetValue(false)
@@ -23356,6 +23967,11 @@ hbEspConn = track(RunService.Heartbeat:Connect(function(dt)
 	pcall(function()
 		if rt.ChallengeLoop then
 			rt.ChallengeLoop.tick()
+		end
+	end)
+	pcall(function()
+		if rt.BossRushLoop then
+			rt.BossRushLoop.tick()
 		end
 	end)
 	pcall(function()
