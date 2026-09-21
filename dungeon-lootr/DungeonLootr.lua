@@ -141,7 +141,7 @@ Library.ToggleKeybind = { Value = 'Home' }
 Library.Animations = Library.Animations or {}
 Library.Animations.TabSwitch = false
 
-local DL_BUILD = '1.0.93'
+local DL_BUILD = '1.0.94'
 getgenv().DLBuild = DL_BUILD
 -- Do NOT wipe DLShrineSkipKeys on every reload — that re-warps spent altars.
 
@@ -159,39 +159,6 @@ pcall(function()
 		Library.ScreenGui:SetAttribute('DLDungeonLootr', true)
 	end
 end)
-
--- Menu header subtitle (class · Lv · aspect) — filled once helpers exist.
-local chromeSubLabel
-local classLevelAspectLine
-pcall(function()
-	local gui = Library.ScreenGui
-	local header = gui and gui:FindFirstChild('Main') and gui.Main:FindFirstChild('Header')
-	if not header then
-		return
-	end
-	local titleLbl = nil
-	for _, c in ipairs(header:GetChildren()) do
-		if c:IsA('TextLabel') then
-			if c.Text == 'Dungeon Lootr' or (c.TextSize and c.TextSize >= 18) then
-				titleLbl = c
-			elseif not chromeSubLabel then
-				chromeSubLabel = c
-			end
-		end
-	end
-	if chromeSubLabel == titleLbl then
-		chromeSubLabel = nil
-	end
-end)
-
-local function refreshChromeSub()
-	if type(classLevelAspectLine) ~= 'function' then
-		return
-	end
-	if chromeSubLabel and chromeSubLabel.Parent then
-		chromeSubLabel.Text = classLevelAspectLine()
-	end
-end
 
 local Toggles = Library.Toggles
 local Options = Library.Options
@@ -281,6 +248,27 @@ local rt = {
 	softlockN = 0,
 	chestSkip = {},
 }
+-- Menu header subtitle (class · Lv · aspect).
+pcall(function()
+	local gui = Library.ScreenGui
+	local header = gui and gui:FindFirstChild('Main') and gui.Main:FindFirstChild('Header')
+	if not header then
+		return
+	end
+	for _, c in ipairs(header:GetChildren()) do
+		if c:IsA('TextLabel') and c.Text ~= 'Dungeon Lootr' and (not c.TextSize or c.TextSize <= 16) then
+			rt.chromeSubLabel = c
+			break
+		end
+	end
+end)
+rt.refreshChromeSub = function()
+	local fn = rt.classLevelAspectLine
+	local lbl = rt.chromeSubLabel
+	if type(fn) == 'function' and lbl and lbl.Parent then
+		lbl.Text = fn()
+	end
+end
 local enemyWatches = {}
 local enemyCache = {}
 local enemyCacheAt = 0
@@ -712,7 +700,7 @@ rt.mysteryMerchantLine = function()
 end
 
 -- Class aspect: Active_Aspect attr, ClassSlots, weapon ClassItemAspects, or Classes UI.
-local function currentAspectName()
+rt.currentAspectName = function()
 	local a = tostring(LocalPlayer:GetAttribute('Active_Aspect') or '')
 	a = (a:gsub('^%s+', ''):gsub('%s+$', ''))
 	if a ~= '' and string.lower(a) ~= 'none' and string.lower(a) ~= 'nil' then
@@ -779,20 +767,20 @@ local function currentAspectName()
 	return nil
 end
 
-classLevelAspectLine = function()
+rt.classLevelAspectLine = function()
 	local className = tostring(
 		LocalPlayer:GetAttribute('Current_Class')
 			or LocalPlayer:GetAttribute('Active_Class')
 			or '?'
 	)
 	local level = tonumber(LocalPlayer:GetAttribute('PlayerLevel')) or 0
-	local aspect = currentAspectName()
+	local aspect = rt.currentAspectName()
 	if aspect then
 		return ('%s  ·  Lv %s  ·  %s'):format(className, fmtNum(level), aspect)
 	end
 	return ('%s  ·  Lv %s  ·  no aspect'):format(className, fmtNum(level))
 end
-pcall(refreshChromeSub)
+pcall(rt.refreshChromeSub)
 
 local function statsText()
 	local char = character()
@@ -808,7 +796,7 @@ local function statsText()
 	local iframe = (char and char:GetAttribute('iFrame') == true) or LocalPlayer:GetAttribute('iFrame') == true
 	local parryText = parry and 'PARRY' or (parryCd and 'parry cd') or 'parry ready'
 	local lines = {
-		classLevelAspectLine(),
+		rt.classLevelAspectLine(),
 		inRun and (dungeon .. (diff ~= '' and ('  ·  ' .. diff) or '')) or 'Lobby',
 		('HP  %s / %s'):format(fmtNum(hp), fmtNum(maxHp)),
 		skillReady(1) .. '    ' .. skillReady(2),
@@ -1293,7 +1281,7 @@ hudBody.Parent = hudFrame
 local function refreshHud()
 	local show = on('DLShowHud')
 	hudGui.Enabled = show == true
-	pcall(refreshChromeSub)
+	pcall(rt.refreshChromeSub)
 	if not show then
 		return
 	end
