@@ -141,7 +141,7 @@ Library.ToggleKeybind = { Value = 'Home' }
 Library.Animations = Library.Animations or {}
 Library.Animations.TabSwitch = false
 
-local DL_BUILD = '1.0.100'
+local DL_BUILD = '1.0.101'
 getgenv().DLBuild = DL_BUILD
 -- Do NOT wipe DLShrineSkipKeys on every reload — that re-warps spent altars.
 
@@ -10424,36 +10424,122 @@ end
 
 -- Challenge wave chests despawn in ~60s; Payload checkpoint UI dies in ~3s.
 -- Grab any open world chest under the mode map without waiting for a room clear.
+local function challengeWaveLiving()
+	local folder = workspace:FindFirstChild('Challenge_NPCs')
+	if not folder then
+		return false
+	end
+	for _, child in ipairs(folder:GetChildren()) do
+		if child:GetAttribute('DungeonChest') == true
+			or (type(child.Name) == 'string' and child.Name:sub(1, 13) == 'DungeonChest')
+		then
+			continue
+		end
+		local st = string.lower(tostring(child:GetAttribute('State') or ''))
+		if st == 'dead' or st == 'died' or st == 'dying' then
+			continue
+		end
+		if enemyAlive(child) then
+			return true
+		end
+	end
+	return false
+end
+
+-- Challenge only: loot every open DungeonChest under Challenge_NPCs (between waves).
+function rt.lootChallengeChests()
+	if not rt.inChallengeFarm() then
+		return 0
+	end
+	if challengeWaveLiving() then
+		return 0
+	end
+	if routeBusy or rt.chestLooting then
+		return 0
+	end
+	local folder = workspace:FindFirstChild('Challenge_NPCs')
+	if not folder then
+		return 0
+	end
+	local queue = {}
+	for _, child in ipairs(folder:GetChildren()) do
+		if child:GetAttribute('DungeonChest') == true
+			or (type(child.Name) == 'string' and child.Name:sub(1, 13) == 'DungeonChest')
+		then
+			if not chestIsClaimed(child) then
+				queue[#queue + 1] = child
+			end
+		end
+	end
+	if #queue == 0 then
+		return 0
+	end
+	rt.chestLooting = true
+	rt.chestForceClaim = true
+	local got = 0
+	local ok, err = pcall(function()
+		noclipOn = true
+		pcall(setCharNoclip, true)
+		for _, model in ipairs(queue) do
+			if not model or not model.Parent then
+				continue
+			end
+			if challengeWaveLiving() then
+				break
+			end
+			local pos = chestStandPos(model) or chestAnchor(model)
+			if typeof(pos) == 'Vector3' then
+				Pin.at(pos, true)
+				pcall(function()
+					if type(rt.snapRoot) == 'function' then
+						rt.snapRoot(pos)
+					end
+				end)
+				task.wait(0.12)
+			end
+			local prompt = chestPrompt(model)
+			-- Prompt often enables only after you stand on it.
+			local deadline = os.clock() + 1.2
+			while os.clock() < deadline do
+				prompt = chestPrompt(model)
+				if prompt and prompt.Enabled == true then
+					break
+				end
+				task.wait(0.08)
+			end
+			if prompt and prompt.Enabled == true then
+				pcall(function()
+					prompt.MaxActivationDistance = math.max(tonumber(prompt.MaxActivationDistance) or 8, 24)
+				end)
+				chestFiredAt[prompt] = nil
+				fireChestPrompt(prompt)
+				local hold = tonumber(prompt.HoldDuration) or 0
+				task.wait(math.max(0.2, hold + 0.15))
+				got += 1
+				markChestDone(model)
+			end
+		end
+	end)
+	rt.chestLooting = false
+	rt.chestForceClaim = false
+	if not ok then
+		warn('[DL] lootChallengeChests', err)
+	end
+	return got
+end
+
 function rt.grabModeChests()
 	if not rt.inModeArenaFarm() then
 		return 0
+	end
+	if rt.inChallengeFarm() then
+		return rt.lootChallengeChests()
 	end
 	if not on('DLChestAnywhere') then
 		return 0
 	end
 	if routeBusy or rt.chestLooting then
 		return 0
-	end
-	-- Challenge: chests share Challenge_NPCs with the wave. Warping to them
-	-- mid-pack looked like "standing on random spots" instead of hopping mobs.
-	if rt.inChallengeFarm() then
-		local folder = workspace:FindFirstChild('Challenge_NPCs')
-		if folder then
-			for _, child in ipairs(folder:GetChildren()) do
-				if child:GetAttribute('DungeonChest') == true
-					or (type(child.Name) == 'string' and child.Name:sub(1, 13) == 'DungeonChest')
-				then
-					continue
-				end
-				local st = string.lower(tostring(child:GetAttribute('State') or ''))
-				if st == 'dead' or st == 'died' or st == 'dying' then
-					continue
-				end
-				if enemyAlive(child) then
-					return 0
-				end
-			end
-		end
 	end
 	local got = 0
 	local list = openDungeonChests()
@@ -11143,8 +11229,12 @@ local function crowdPartsNear(npc)
 			return
 		end
 		local sameRoom = (not room) or other == npc or Rooms.indexOf(other) == room
-		local nearMe = mePos and (p.Position - mePos).Magnitude <= 32
-		if not sameRoom and not nearMe then
+		-- Challenge waves: RoomIndex is a wave id; always pull the whole live pack.
+		local nearR = rt.inChallengeFarm() and 120 or 32
+		local nearMe = mePos and (p.Position - mePos).Magnitude <= nearR
+		if rt.inChallengeFarm() then
+			-- include every living challenge fodder
+		elseif not sameRoom and not nearMe then
 			return
 		end
 		parts[#parts + 1] = p.Position
@@ -11558,8 +11648,14 @@ local function holdOnEnemy(npc)
 							end
 						end
 						local avgR = nR > 0 and (rad / nR) or 0
-						if avgR > 12 then
+						-- Challenge: stay IN the pile. Inflating stand to avgR left you
+						-- on empty floor while the pack sat 10–20 studs away.
+						if not rt.inChallengeFarm() and avgR > 12 then
 							cachedStand = math.max(cachedStand, avgR - 2)
+						end
+						if rt.inChallengeFarm() then
+							cachedStand = 0
+							cachedPlant = mid
 						end
 						dir = bestPackFacing(pack, mid, cachedStand, dir)
 						cachedAim = mid
@@ -12046,7 +12142,10 @@ local function farmKill(npc)
 	end
 	-- Stay put after a kill. Do not re-pin onto the pack after a heal break —
 	-- that yanked flee back into the boss.
-	if not rt.healWait then
+	-- Challenge: never freeze on the corpse — next pickFarmTarget must snap onto a live mob.
+	if rt.inChallengeFarm() and not rt.healWait then
+		Pin.release()
+	elseif not rt.healWait then
 		local more = rt.farmRoomFilter and rt.roomHasLiving(rt.farmRoomFilter)
 		if more then
 			-- Keep the hover stand so the next pack snap does not start from the floor.
@@ -13984,14 +14083,20 @@ local function farmLoop()
 					farmLabel = ('%s · %s'):format(tag, target.Name)
 					farmKillNpc(target)
 				else
-					-- Between waves only — never interrupt a live pack for chests.
-					pcall(function()
-						if type(rt.grabModeChests) == 'function' then
-							rt.grabModeChests()
+					-- Mobs first always. Chests only when the wave has no living targets.
+					local looted = 0
+					if rt.inChallengeFarm() and type(rt.lootChallengeChests) == 'function' then
+						local okL, nL = pcall(rt.lootChallengeChests)
+						if okL then
+							looted = tonumber(nL) or 0
 						end
-					end)
-					farmLabel = rt.inChallengeFarm() and 'challenge · chests' or 'payload · waiting'
-					task.wait(rt.inChallengeFarm() and 0.05 or 0.15)
+					elseif type(rt.grabModeChests) == 'function' then
+						pcall(rt.grabModeChests)
+					end
+					farmLabel = (rt.inChallengeFarm() and looted > 0)
+						and ('challenge · looted %d'):format(looted)
+						or (rt.inChallengeFarm() and 'challenge · chests' or 'payload · waiting')
+					task.wait(rt.inChallengeFarm() and 0.08 or 0.15)
 				end
 			else
 				-- Event raid owns the farm while Raid_NPCs has living targets.
@@ -22468,7 +22573,14 @@ ChestBox:AddToggle('DLOpenGates', {
 	Library:Notify(v and 'Open locked gates on' or 'Open locked gates off')
 end)
 ChestBox:AddButton('Collect all chests', function()
-	collectChestRoute(false, nil, true)
+	task.spawn(function()
+		if rt.inChallengeFarm() and type(rt.lootChallengeChests) == 'function' then
+			local n = rt.lootChallengeChests()
+			Library:Notify(n > 0 and ('Challenge chests: %d'):format(n) or 'No challenge chests')
+			return
+		end
+		collectChestRoute(false, nil, true)
+	end)
 end)
 ChestBox:AddSlider('DLChestEvery', {
 	Text = 'Route every (s)',

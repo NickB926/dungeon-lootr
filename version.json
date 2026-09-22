@@ -1,6 +1,6 @@
 {
-    "version":  "1.0.100",
-    "message":  "challenge stand in pack; chests only between waves",
+    "version":  "1.0.101",
+    "message":  "challenge pack center + between-wave chest loot",
     "files":  [
                   "dungeon-lootr/launch.lua",
                   "dungeon-lootr/DungeonLootr.lua",
