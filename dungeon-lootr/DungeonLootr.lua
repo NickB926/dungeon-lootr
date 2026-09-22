@@ -141,7 +141,7 @@ Library.ToggleKeybind = { Value = 'Home' }
 Library.Animations = Library.Animations or {}
 Library.Animations.TabSwitch = false
 
-local DL_BUILD = '1.0.99'
+local DL_BUILD = '1.0.100'
 getgenv().DLBuild = DL_BUILD
 -- Do NOT wipe DLShrineSkipKeys on every reload — that re-warps spent altars.
 
@@ -9182,6 +9182,15 @@ local function eachFarmNpc(fn)
 		if not npc or not npc.Parent or seen[npc] or not isWorldEnemy(npc) then
 			return
 		end
+		local st = string.lower(tostring(npc:GetAttribute('State') or ''))
+		if st == 'dead' or st == 'died' or st == 'dying' then
+			return
+		end
+		if npc:GetAttribute('DungeonChest') == true
+			or (type(npc.Name) == 'string' and npc.Name:sub(1, 13) == 'DungeonChest')
+		then
+			return
+		end
 		if npc:IsA('BasePart') then
 			local id = string.lower(tostring(npc:GetAttribute('ItemId') or npc.Name or ''))
 			if npc:GetAttribute('IsCrystal') ~= true and not id:find('crystal', 1, true) then
@@ -10425,6 +10434,27 @@ function rt.grabModeChests()
 	if routeBusy or rt.chestLooting then
 		return 0
 	end
+	-- Challenge: chests share Challenge_NPCs with the wave. Warping to them
+	-- mid-pack looked like "standing on random spots" instead of hopping mobs.
+	if rt.inChallengeFarm() then
+		local folder = workspace:FindFirstChild('Challenge_NPCs')
+		if folder then
+			for _, child in ipairs(folder:GetChildren()) do
+				if child:GetAttribute('DungeonChest') == true
+					or (type(child.Name) == 'string' and child.Name:sub(1, 13) == 'DungeonChest')
+				then
+					continue
+				end
+				local st = string.lower(tostring(child:GetAttribute('State') or ''))
+				if st == 'dead' or st == 'died' or st == 'dying' then
+					continue
+				end
+				if enemyAlive(child) then
+					return 0
+				end
+			end
+		end
+	end
 	local got = 0
 	local list = openDungeonChests()
 	if #list == 0 then
@@ -11508,13 +11538,16 @@ local function holdOnEnemy(npc)
 				end
 			else
 				-- Frontal slab: stand off the densest clump and face into it.
-				cachedStand = math.max(stand, 4)
+				-- Challenge waves: stand IN the pack (AoE) — stand-off looked like
+				-- pinning empty floor while the pile sat a few studs away.
+				cachedStand = rt.inChallengeFarm() and 0 or math.max(stand, 4)
 				local pack = crowdPartsNear(npc)
 				local mid, tn = densestCentroid(pack, 16)
 				if mid and tn >= 2 then
 					rt.crowdSolo = false
 					-- Pack math is O(n^2); refresh a few times a second.
-					if now - (rt.crowdAimAt or 0) > 0.55 or not rt.farmCrowdAim then
+					local refresh = rt.inChallengeFarm() and 0.2 or 0.55
+					if now - (rt.crowdAimAt or 0) > refresh or not rt.farmCrowdAim then
 						rt.crowdAimAt = now
 						cachedPlant = mid
 						local rad, nR = 0, 0
@@ -11776,6 +11809,16 @@ local function farmKill(npc)
 	end
 	while farmActive() and packAlive() and not routeBusy do
 		local now = os.clock()
+		-- Challenge corpses often keep Humanoid.Health > 0 with State=Dead.
+		if not crystalPack and not studentPack and not addPack and rt.inChallengeFarm() then
+			local st = string.lower(tostring(npc:GetAttribute('State') or ''))
+			if st == 'dead' or st == 'died' or st == 'dying' or not enemyAlive(npc) then
+				farmLock = nil
+				rt.farmFightNpc = nil
+				rt.farmFighting = false
+				break
+			end
+		end
 		-- Meteor volley: dodge only. Swinging at the Professor mid-gap is what
 		-- walked you back into the next disc and stalled re-engage.
 		-- Student pack: keep swinging — their heals matter more than gaps.
@@ -13935,19 +13978,20 @@ local function farmLoop()
 				-- Challenge also sets InDungeon=true — still arena waves (Payload already
 				-- returns false while InDungeon, so Frostpire is safe).
 				step('mode')
-				pcall(function()
-					if type(rt.grabModeChests) == 'function' then
-						rt.grabModeChests()
-					end
-				end)
 				local target = pickFarmTarget()
 				if target then
 					local tag = rt.inChallengeFarm() and 'challenge' or 'payload'
 					farmLabel = ('%s · %s'):format(tag, target.Name)
 					farmKillNpc(target)
 				else
-					farmLabel = rt.inChallengeFarm() and 'challenge · waiting' or 'payload · waiting'
-					task.wait(rt.inChallengeFarm() and 0.03 or 0.15)
+					-- Between waves only — never interrupt a live pack for chests.
+					pcall(function()
+						if type(rt.grabModeChests) == 'function' then
+							rt.grabModeChests()
+						end
+					end)
+					farmLabel = rt.inChallengeFarm() and 'challenge · chests' or 'payload · waiting'
+					task.wait(rt.inChallengeFarm() and 0.05 or 0.15)
 				end
 			else
 				-- Event raid owns the farm while Raid_NPCs has living targets.

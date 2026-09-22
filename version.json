@@ -1,6 +1,6 @@
 {
-    "version":  "1.0.99",
-    "message":  "Challenge_NPCs farm+chests; faster wave retarget",
+    "version":  "1.0.100",
+    "message":  "challenge stand in pack; chests only between waves",
     "files":  [
                   "dungeon-lootr/launch.lua",
                   "dungeon-lootr/DungeonLootr.lua",
