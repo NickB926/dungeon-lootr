@@ -1,6 +1,6 @@
 {
-    "version":  "1.0.101",
-    "message":  "challenge pack center + between-wave chest loot",
+    "version":  "1.0.102",
+    "message":  "dedicated Challenge pack combat then chests",
     "files":  [
                   "dungeon-lootr/launch.lua",
                   "dungeon-lootr/DungeonLootr.lua",

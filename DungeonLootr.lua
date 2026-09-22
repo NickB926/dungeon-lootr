@@ -136,12 +136,13 @@ end
 getgenv().Library = nil
 local Library = libraryFn()
 assert(Library and Library.CreateWindow, 'Ataraxia failed')
+getgenv().Library = Library
 
 Library.ToggleKeybind = { Value = 'Home' }
 Library.Animations = Library.Animations or {}
 Library.Animations.TabSwitch = false
 
-local DL_BUILD = '1.0.101'
+local DL_BUILD = '1.0.102'
 getgenv().DLBuild = DL_BUILD
 -- Do NOT wipe DLShrineSkipKeys on every reload — that re-warps spent altars.
 
@@ -355,6 +356,11 @@ local function farmSkipped(npc)
 	local untilAt = farmFinished[npc]
 	if untilAt ~= nil and os.clock() < untilAt then
 		return true
+	end
+	-- Challenge RoomIndex is a wave id / nil — corridor tests false-positive and
+	-- farmSkipped every live mob, so the farm idled on chests instead.
+	if rt.inChallengeFarm and rt.inChallengeFarm() then
+		return false
 	end
 	return type(rt.npcInCorridor) == 'function' and rt.npcInCorridor(npc) == true
 end
@@ -10439,7 +10445,10 @@ local function challengeWaveLiving()
 		if st == 'dead' or st == 'died' or st == 'dying' then
 			continue
 		end
-		if enemyAlive(child) then
+		-- Bypass farmSkipped — corridor false-positives made this return false mid-wave.
+		if child.Parent and (enemyRoot(child) or child:FindFirstChildOfClass('Humanoid')
+			or child:FindFirstChildOfClass('AnimationController'))
+		then
 			return true
 		end
 	end
@@ -10519,6 +10528,9 @@ function rt.lootChallengeChests()
 				markChestDone(model)
 			end
 		end
+	end)
+	pcall(function()
+		Pin.release()
 	end)
 	rt.chestLooting = false
 	rt.chestForceClaim = false
@@ -11475,6 +11487,15 @@ local function holdOnEnemy(npc)
 		local live = enemyRoot(npc)
 		if not live then
 			return nil
+		end
+		-- Challenge: hard plant ON this mob (no pack/stand/chest drift).
+		if rt.inChallengeFarm() then
+			local st = string.lower(tostring(npc:GetAttribute('State') or ''))
+			if st == 'dead' or st == 'died' or st == 'dying' or not npc.Parent then
+				return nil
+			end
+			rt.pinGoal = live.Position
+			return live.Position, live.Position
 		end
 		-- Raid meteors: scan hard. 0.35s was enough to die between ticks.
 		local aoeNeed = (isRaidBossNpc(npc) or rt.aoeVolleyActive and rt.aoeVolleyActive()) and 0.08 or 0.35
@@ -14078,12 +14099,38 @@ local function farmLoop()
 				-- returns false while InDungeon, so Frostpire is safe).
 				step('mode')
 				local target = pickFarmTarget()
+				if not target and rt.inChallengeFarm() then
+					local folder = workspace:FindFirstChild('Challenge_NPCs')
+					local me = routeRoot()
+					local best, bestD = nil, 9e9
+					if folder and me then
+						for _, child in ipairs(folder:GetChildren()) do
+							if child:GetAttribute('DungeonChest') == true
+								or (type(child.Name) == 'string' and child.Name:sub(1, 13) == 'DungeonChest')
+							then
+								continue
+							end
+							local st = string.lower(tostring(child:GetAttribute('State') or ''))
+							if st == 'dead' or st == 'died' or st == 'dying' then
+								continue
+							end
+							local part = enemyRoot(child)
+							if not part then
+								continue
+							end
+							local d = (part.Position - me.Position).Magnitude
+							if d < bestD then
+								best, bestD = child, d
+							end
+						end
+					end
+					target = best
+				end
 				if target then
 					local tag = rt.inChallengeFarm() and 'challenge' or 'payload'
 					farmLabel = ('%s · %s'):format(tag, target.Name)
 					farmKillNpc(target)
 				else
-					-- Mobs first always. Chests only when the wave has no living targets.
 					local looted = 0
 					if rt.inChallengeFarm() and type(rt.lootChallengeChests) == 'function' then
 						local okL, nL = pcall(rt.lootChallengeChests)
