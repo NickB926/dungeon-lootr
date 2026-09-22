@@ -141,7 +141,7 @@ Library.ToggleKeybind = { Value = 'Home' }
 Library.Animations = Library.Animations or {}
 Library.Animations.TabSwitch = false
 
-local DL_BUILD = '1.0.98'
+local DL_BUILD = '1.0.99'
 getgenv().DLBuild = DL_BUILD
 -- Do NOT wipe DLShrineSkipKeys on every reload — that re-warps spent altars.
 
@@ -3256,12 +3256,15 @@ local function collectChestRoute(silent, roomOnly, force)
 		if roomOnly and tonumber(model:GetAttribute('RoomIndex')) ~= roomOnly then
 			return
 		end
-		if type(rt.chestInBossRoom) == 'function' and rt.chestInBossRoom(model) then
-			return
-		end
-		local idx = tonumber(model:GetAttribute('RoomIndex'))
-		if idx and rt.roomHasLiving(idx) then
-			return
+		-- Challenge wave chests use RoomIndex as a wave id — not a Generated_ boss room.
+		if not rt.inChallengeFarm() then
+			if type(rt.chestInBossRoom) == 'function' and rt.chestInBossRoom(model) then
+				return
+			end
+			local idx = tonumber(model:GetAttribute('RoomIndex'))
+			if idx and rt.roomHasLiving(idx) then
+				return
+			end
 		end
 		-- Disabled prompts after a wipe still need a stand-in. Skip rooms that
 		-- still have a living pack.
@@ -3284,6 +3287,12 @@ local function collectChestRoute(silent, roomOnly, force)
 				end
 			elseif (gen.Name == 'Challenge_Dungeons' or gen.Name == 'Payload_Maps') then
 				for _, child in ipairs(gen:GetDescendants()) do
+					if child:GetAttribute('DungeonChest') == true or child.Name:sub(1, 13) == 'DungeonChest' then
+						consider(child)
+					end
+				end
+			elseif gen.Name == 'Challenge_NPCs' then
+				for _, child in ipairs(gen:GetChildren()) do
 					if child:GetAttribute('DungeonChest') == true or child.Name:sub(1, 13) == 'DungeonChest' then
 						consider(child)
 					end
@@ -5152,6 +5161,20 @@ local function enemyAlive(npc)
 	if npc.Parent and npc.Parent.Name == 'Raid_NPCs' then
 		return enemyRoot(npc) ~= nil
 	end
+	-- Challenge waves live in Challenge_NPCs (same pattern as Raid_NPCs).
+	if npc.Parent and npc.Parent.Name == 'Challenge_NPCs' then
+		local state = string.lower(tostring(npc:GetAttribute('State') or ''))
+		if state == 'dead' or state == 'died' or state == 'dying' then
+			return false
+		end
+		-- Chests are also parented here — never treat them as enemies.
+		if npc:GetAttribute('DungeonChest') == true
+			or (type(npc.Name) == 'string' and npc.Name:sub(1, 13) == 'DungeonChest')
+		then
+			return false
+		end
+		return enemyRoot(npc) ~= nil
+	end
 	-- Payload waves: PayloadCombat_*/PayloadEnemies_* (AnimationController, no Humanoid).
 	local p = npc.Parent
 	if p and type(p.Name) == 'string' and p.Name:sub(1, 15) == 'PayloadEnemies_' then
@@ -6272,8 +6295,20 @@ local function rebuildEnemyCache()
 			consider(npc)
 		end
 	end
-	-- Challenge / Payload helpers are declared later — gate on attrs/folders here.
+	-- Challenge combat + wave chests share workspace.Challenge_NPCs.
 	if LocalPlayer:GetAttribute('InChallenge') == true then
+		local challNpcs = workspace:FindFirstChild('Challenge_NPCs')
+		if challNpcs then
+			for _, npc in ipairs(challNpcs:GetChildren()) do
+				if npc:GetAttribute('DungeonChest') == true
+					or (type(npc.Name) == 'string' and npc.Name:sub(1, 13) == 'DungeonChest')
+				then
+					-- skip chests in enemy cache
+				else
+					consider(npc)
+				end
+			end
+		end
 		local chall = workspace:FindFirstChild('Challenge_Dungeons')
 		if chall then
 			for _, room in ipairs(chall:GetChildren()) do
@@ -9193,6 +9228,17 @@ local function eachFarmNpc(fn)
 	end
 	local chall = workspace:FindFirstChild('Challenge_Dungeons')
 	if chall and rt.inChallengeFarm() then
+		-- Live wave combat is under workspace.Challenge_NPCs (not room/NPCs).
+		local challNpcs = workspace:FindFirstChild('Challenge_NPCs')
+		if challNpcs then
+			for _, npc in ipairs(challNpcs:GetChildren()) do
+				if not (npc:GetAttribute('DungeonChest') == true
+					or (type(npc.Name) == 'string' and npc.Name:sub(1, 13) == 'DungeonChest'))
+				then
+					take(npc)
+				end
+			end
+		end
 		for _, room in ipairs(chall:GetChildren()) do
 			local npcs = room:FindFirstChild('NPCs')
 			if npcs then
@@ -10351,6 +10397,11 @@ local function openDungeonChests()
 					takeChest(child)
 				end
 			end
+		elseif gen.Name == 'Challenge_NPCs' and rt.inChallengeFarm() then
+			-- Wave chests spawn here as DungeonChest_<uid>, not under the map folder.
+			for _, child in ipairs(gen:GetChildren()) do
+				takeChest(child)
+			end
 		elseif gen.Name == 'Payload_Maps' and rt.inPayloadFarm() then
 			for _, child in ipairs(gen:GetDescendants()) do
 				if child:IsA('Model') or child:IsA('BasePart') then
@@ -10380,6 +10431,7 @@ function rt.grabModeChests()
 		-- Also fire any enabled ChestPrompt under the mode folder.
 		local roots = {}
 		if rt.inChallengeFarm() then
+			roots[#roots + 1] = workspace:FindFirstChild('Challenge_NPCs')
 			roots[#roots + 1] = workspace:FindFirstChild('Challenge_Dungeons')
 		end
 		if rt.inPayloadFarm() then
@@ -11840,6 +11892,7 @@ local function farmKill(npc)
 			local studentBurn = studentPack == true
 			local gap = studentBurn and math.min(0.12, attackDelay() * 0.85)
 				or (crystalPack and 0.12)
+				or (rt.inChallengeFarm() and math.min(0.12, attackDelay() * 0.7))
 				or attackDelay()
 			if not volley and (swingDue or now - lastHit >= gap) then
 				lastHit = now
@@ -11984,10 +12037,17 @@ local function farmKill(npc)
 		if farmLock == npc then
 			farmLock = nil
 		end
+		rt.farmFightNpc = nil
+		rt.farmFighting = false
 		if rt.farmReturnNpc == npc then
 			rt.farmReturnNpc = nil
 		end
-		farmFinished[npc] = os.clock() + FARM_FINISHED_COOLDOWN
+		-- Challenge waves: allow immediate retarget (no finished cooldown).
+		if rt.inChallengeFarm() then
+			farmFinished[npc] = nil
+		else
+			farmFinished[npc] = os.clock() + FARM_FINISHED_COOLDOWN
+		end
 		if on('DLHuntSpecial') and isHuntTarget(npc) and type(rt.requestHuntReturn) == 'function' then
 			pcall(rt.requestHuntReturn)
 		end
@@ -13100,7 +13160,7 @@ local function tourFarmRooms(dungeon)
 			farmKillNpc(target)
 		else
 			farmLabel = rt.inChallengeFarm() and 'challenge · waiting' or 'payload · waiting'
-			task.wait(0.2)
+			task.wait(rt.inChallengeFarm() and 0.03 or 0.2)
 		end
 		return
 	end
@@ -13870,9 +13930,10 @@ local function farmLoop()
 				step('return')
 				rt.farmReturnNpc = nil
 				farmKillNpc(back)
-			elseif rt.inModeArenaFarm() and LocalPlayer:GetAttribute('InDungeon') ~= true then
+			elseif rt.inModeArenaFarm() then
 				-- Challenge / Payload: no Room_N tour. Kill waves + grab timed chests now.
-				-- Guard InDungeon: Payload_Maps junk in workspace must not steal Frostpire.
+				-- Challenge also sets InDungeon=true — still arena waves (Payload already
+				-- returns false while InDungeon, so Frostpire is safe).
 				step('mode')
 				pcall(function()
 					if type(rt.grabModeChests) == 'function' then
@@ -13886,7 +13947,7 @@ local function farmLoop()
 					farmKillNpc(target)
 				else
 					farmLabel = rt.inChallengeFarm() and 'challenge · waiting' or 'payload · waiting'
-					task.wait(0.15)
+					task.wait(rt.inChallengeFarm() and 0.03 or 0.15)
 				end
 			else
 				-- Event raid owns the farm while Raid_NPCs has living targets.

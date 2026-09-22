@@ -1,6 +1,6 @@
 {
-    "version":  "1.0.98",
-    "message":  "library Settings tab + themes; Menu uses shared chrome",
+    "version":  "1.0.99",
+    "message":  "Challenge_NPCs farm+chests; faster wave retarget",
     "files":  [
                   "dungeon-lootr/launch.lua",
                   "dungeon-lootr/DungeonLootr.lua",
