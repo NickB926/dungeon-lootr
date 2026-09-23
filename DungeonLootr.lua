@@ -142,7 +142,7 @@ Library.ToggleKeybind = { Value = 'Home' }
 Library.Animations = Library.Animations or {}
 Library.Animations.TabSwitch = false
 
-local DL_BUILD = '1.0.102'
+local DL_BUILD = '1.0.103'
 getgenv().DLBuild = DL_BUILD
 -- Do NOT wipe DLShrineSkipKeys on every reload — that re-warps spent altars.
 
@@ -690,16 +690,26 @@ rt.refreshMysteryMerchant = function(force)
 				local knit = pack:FindFirstChild('knit')
 				local services = knit and knit:FindFirstChild('Services')
 				local svc = services and services:FindFirstChild('MysteryMerchantService')
-				local found = svc and svc:FindFirstChild('RF') and svc.RF:FindFirstChild('GetShopInfo')
+				local folder = svc and svc:FindFirstChild('RF')
+				local found = folder and folder:FindFirstChild('GetShopInfo')
 				if found and found:IsA('RemoteFunction') then
 					rf = found
 					rt.mmRF = found
+					local buy = folder:FindFirstChild('BuyItem')
+					if buy and buy:IsA('RemoteFunction') then
+						rt.mmBuyRF = buy
+					end
 					break
 				end
 			end
 		end
 	end
 	if not rf then
+		local localInfo = rt.mysteryMerchantWindow and rt.mysteryMerchantWindow()
+		if type(localInfo) == 'table' then
+			rt.mmInfo = localInfo
+			rt.mmAt = os.clock()
+		end
 		return rt.mmInfo
 	end
 	rt.mmBusy = true
@@ -711,10 +721,185 @@ rt.refreshMysteryMerchant = function(force)
 		if ok and type(info) == 'table' then
 			rt.mmInfo = info
 			rt.mmAt = os.clock()
+		else
+			local localInfo = rt.mysteryMerchantWindow and rt.mysteryMerchantWindow()
+			if type(localInfo) == 'table' then
+				rt.mmInfo = localInfo
+				rt.mmAt = os.clock()
+			end
 		end
 		rt.mmBusy = nil
 	end)
 	return rt.mmInfo
+end
+
+rt.mysteryMerchantNow = function()
+	local now = os.time()
+	pcall(function()
+		now = math.floor(workspace:GetServerTimeNow())
+	end)
+	return now
+end
+
+rt.mysteryMerchantData = function()
+	if type(rt.mmData) == 'table' then
+		return rt.mmData
+	end
+	local gi = game:GetService('ReplicatedStorage'):FindFirstChild('GameInfo')
+	local mod = gi and gi:FindFirstChild('MysteryMerchantData')
+	if not (mod and mod:IsA('ModuleScript')) then
+		return nil
+	end
+	local ok, data = pcall(require, mod)
+	if ok and type(data) == 'table' then
+		rt.mmData = data
+		return data
+	end
+	return nil
+end
+
+rt.mysteryMerchantWindow = function()
+	local MM = rt.mysteryMerchantData()
+	if not MM then
+		return rt.mmInfo
+	end
+	local now = rt.mysteryMerchantNow()
+	local ok, win = pcall(function()
+		if type(MM.GetClientWindow) == 'function' then
+			return MM.GetClientWindow(now)
+		end
+		return MM.GetWindow(now)
+	end)
+	if ok and type(win) == 'table' then
+		return win
+	end
+	return rt.mmInfo
+end
+
+rt.mysteryShopLive = function()
+	local now = os.clock()
+	if type(rt.mmLive) == 'table' and now - (rt.mmLiveAt or 0) < 0.3 then
+		return rt.mmLive
+	end
+	local rf = rt.mmRF
+	if not (rf and rf.Parent) then
+		rt.refreshMysteryMerchant(true)
+		rf = rt.mmRF
+	end
+	if rf and rf.Parent then
+		local ok, info = pcall(function()
+			return rf:InvokeServer()
+		end)
+		if ok and type(info) == 'table' then
+			rt.mmLive = info
+			rt.mmLiveAt = os.clock()
+			rt.mmInfo = info
+			rt.mmAt = os.clock()
+			return info
+		end
+	end
+	return rt.mmLive or rt.mysteryMerchantWindow()
+end
+
+rt.mysteryMerchantStock = function()
+	local live = rt.mysteryShopLive()
+	if type(live) == 'table' and type(live.Items) == 'table' then
+		local out = {}
+		for i, row in ipairs(live.Items) do
+			out[i] = row
+		end
+		if #out > 0 then
+			return out
+		end
+		for _, row in pairs(live.Items) do
+			if type(row) == 'table' and row.Id then
+				out[#out + 1] = row
+			end
+		end
+		if #out > 0 then
+			return out
+		end
+	end
+	local MM = rt.mysteryMerchantData()
+	if not MM or type(MM.GetStock) ~= 'function' then
+		return {}
+	end
+	local ok, stock = pcall(function()
+		return MM.GetStock(rt.mysteryMerchantNow())
+	end)
+	if ok and type(stock) == 'table' then
+		return stock
+	end
+	return {}
+end
+
+rt.mysteryItemName = function(item)
+	if type(item) ~= 'table' then
+		return ''
+	end
+	local raw = tostring(item.GrantId or item.Id or '')
+	if raw == '' then
+		return ''
+	end
+	if not raw:find(' ') then
+		raw = raw:gsub('(%l)(%u)', '%1 %2')
+		raw = raw:gsub('%s+', ' '):gsub('^%s+', ''):gsub('%s+$', '')
+	end
+	return raw
+end
+
+rt.normMysteryKey = function(s)
+	return (tostring(s or ''):lower():gsub('[^%w]+', ''))
+end
+
+rt.mysteryMerchantPool = function()
+	if type(rt.mmPoolNames) == 'table' and #rt.mmPoolNames > 0 then
+		return rt.mmPoolNames, rt.mmPoolByName, rt.mmPoolById
+	end
+	local names, byName, byId = {}, {}, {}
+	local MM = rt.mysteryMerchantData()
+	local catalog = MM and MM.Catalog
+	if type(catalog) ~= 'table' then
+		catalog = {
+			{ Id = 'AspectGem', GrantId = 'Aspect Gem', Cost = 1000, PurchaseLimit = 5 },
+			{ Id = 'ExoticOre', GrantId = 'Exotic Ore', Cost = 100, PurchaseLimit = 50 },
+			{ Id = 'ExoticEssence', GrantId = 'Exotic Essence', Cost = 100, PurchaseLimit = 20 },
+			{ Id = 'ReforgeStone', GrantId = 'Reforge Stone', Cost = 75, PurchaseLimit = 15 },
+			{ Id = 'ProtectionScroll', GrantId = 'Protection Scroll', Cost = 100, PurchaseLimit = 10 },
+			{ Id = 'ProjectionReel', GrantId = 'Projection Reel', Cost = 15000, PurchaseLimit = 1 },
+			{ Id = 'LuckySpin', GrantId = 'Lucky Spin', Cost = 200, PurchaseLimit = 10 },
+			{ Id = 'PurityStone', GrantId = 'Purity Stone', Cost = 75, PurchaseLimit = 25 },
+			{ Id = 'LuckPotionT1', GrantId = 'LuckPotionT1', Cost = 200, PurchaseLimit = 5 },
+			{ Id = 'LuckPotionT2', GrantId = 'LuckPotionT2', Cost = 500, PurchaseLimit = 5 },
+			{ Id = 'LuckPotionT3', GrantId = 'LuckPotionT3', Cost = 850, PurchaseLimit = 5 },
+			{ Id = 'CrimsonNinja', GrantId = 'Crimson Ninja', Cost = 7000, PurchaseLimit = 1 },
+			{ Id = 'ForgeArchonAltBlack', GrantId = 'Forge Archon Alt Black', Cost = 10000, PurchaseLimit = 1 },
+			{ Id = 'ShadowKnight', GrantId = 'Shadow Knight', Cost = 10000, PurchaseLimit = 1 },
+			{ Id = 'Restricted', GrantId = 'Restricted', Cost = 10000, PurchaseLimit = 1 },
+			{ Id = 'VoidKatana', GrantId = 'Void Katana', Cost = 300000, PurchaseLimit = 1 },
+			{ Id = 'InfinityCore', GrantId = 'Infinity Core', Cost = 50000, PurchaseLimit = 1 },
+			{ Id = 'CursedShrine', GrantId = 'Cursed Shrine', Cost = 50000, PurchaseLimit = 1 },
+			{ Id = 'FirelordCap', GrantId = 'FirelordCap', Cost = 10000, PurchaseLimit = 1 },
+			{ Id = 'LivingArmor', GrantId = 'LivingArmor', Cost = 10000, PurchaseLimit = 1 },
+			{ Id = 'SupernovaRing', GrantId = 'SupernovaRing', Cost = 10000, PurchaseLimit = 1 },
+			{ Id = 'RandomGMBlessing', GrantId = 'RandomGMBlessing', Cost = 5500, PurchaseLimit = 1 },
+		}
+	end
+	for _, item in ipairs(catalog) do
+		if type(item) == 'table' and item.Id then
+			local name = rt.mysteryItemName(item)
+			if name ~= '' and not byName[name] then
+				names[#names + 1] = name
+				byName[name] = item
+				byId[tostring(item.Id)] = item
+			end
+		end
+	end
+	table.sort(names)
+	rt.mmPoolNames = names
+	rt.mmPoolByName = byName
+	rt.mmPoolById = byId
+	return names, byName, byId
 end
 
 rt.mysteryMerchantLine = function()
@@ -722,7 +907,7 @@ rt.mysteryMerchantLine = function()
 	if type(info) ~= 'table' then
 		return 'mystery  ·  …'
 	end
-	local now = os.time()
+	local now = rt.mysteryMerchantNow()
 	if info.Active == true then
 		local left = (tonumber(info.LeavesAt) or 0) - now
 		if left < 0 then
@@ -900,6 +1085,17 @@ local function statsText()
 				boss, (diff ~= '' and diff ~= 'nil') and diff or '?')
 		else
 			lines[#lines + 1] = 'challenge loop on'
+		end
+	end
+	if rt.inChallengeFarm and rt.inChallengeFarm() then
+		local wave = type(rt.challengeWaveNumber) == 'function' and rt.challengeWaveNumber() or nil
+		local stopAt = Options.DLChallengeStopWave and tonumber(Options.DLChallengeStopWave.Value) or 0
+		if wave then
+			if stopAt and stopAt > 0 then
+				lines[#lines + 1] = ('challenge wave  ·  %d / stop %d'):format(wave, stopAt)
+			else
+				lines[#lines + 1] = ('challenge wave  ·  %d'):format(wave)
+			end
 		end
 	end
 	if on('DLPayloadLoop') then
@@ -2129,10 +2325,15 @@ function rt.farmHoldCf(pos, aim, keep)
 	rt.farmFace = flat
 	-- combatHover: 0 during chest/loot so Pin.at / snapRoot stay at prompt height.
 	local hover = rt.combatHover()
-	-- Apply bury / fight height whenever farm owns the pin — not only while
-	-- farmFighting is true. The false gap between kills left goal Y on the
-	-- floor and farmHoldCf skipped the rewrite, so you popped up mid-pack.
-	if farmBusy and not routeBusy and not rt.chestLooting
+	-- Challenge / Payload HRPs sit above the ray floor; floor bury left flat=0 / dy=-19.
+	if rt.inModeArenaFarm and rt.inModeArenaFarm() and farmBusy and not rt.chestLooting then
+		local fight = rt.farmFightNpc or rt.farmReturnNpc
+		local live = fight and (rt.enemyRoot and rt.enemyRoot(fight) or nil)
+		if live then
+			pos = Vector3.new(pos.X, live.Position.Y, pos.Z)
+		end
+		-- Skip floor/hover rewrite below.
+	elseif farmBusy and not routeBusy and not rt.chestLooting
 		and not (rt.bossPadUntil and os.clock() < rt.bossPadUntil)
 		and (math.abs(hover) >= 0.5 or rt.farmFighting or rt.farmFightNpc)
 	then
@@ -2426,7 +2627,10 @@ local Pin = (function()
 			-- rig while the humanoid stayed Running. Zero it every farm frame.
 			local blown = farmBusy and vel > 12
 			-- Mage Student / crystal hop: hard teleport between each target.
-			local hopping = rt.studentHopping == true or rt.crystalHopping == true
+			-- City-of-Mages student circles: hard snap back onto the pack after the dash.
+			local hopping = rt.studentHopping == true
+				or rt.crystalHopping == true
+				or os.clock() < (rt.aoeSnapMob or 0)
 			local tight = snapExact or dodging or blown or hopping
 			-- Meteor gaps: hard snap (0.2), not a soft 0.55 hold that never left the disc.
 			local hold = snapExact and 0.18
@@ -4642,11 +4846,41 @@ end
 -- Those discs often spawn as short-named workspace Parts (e.g. Workspace.R),
 -- not under SpellTelegraphs.
 rt.avoidFloorAoe = function()
+	if rt.inChallengeFarm and rt.inChallengeFarm() then
+		rt.aoeGoal = nil
+		rt.aoeUntil = 0
+		rt.aoeDiscs = false
+		return false
+	end
 	local myRoot = routeRoot()
 	local char = character()
 	if not myRoot or not char then
 		return false
 	end
+	-- City of Mages (and other dungeon) Mage Students paint short buff circles.
+	-- Raid meteor timings (2.8s volley latch) parked you in the gap after the
+	-- dash. Those circles are one-and-done — snap out, then snap straight back.
+	local function cityStudentCircles()
+		local npc = rt.farmFightNpc
+		if npc then
+			local id = string.lower(tostring(npc:GetAttribute('ItemId') or ''))
+			local name = string.lower(tostring(npc.Name or ''))
+			local student = id:find('mage student', 1, true) ~= nil
+				or name:find('mage student', 1, true) ~= nil
+			local raid = npc.Parent and npc.Parent.Name == 'Raid_NPCs'
+			if student and not raid then
+				return true
+			end
+		end
+		local d = string.lower(tostring(
+			LocalPlayer:GetAttribute('CurrentDungeon')
+				or LocalPlayer:GetAttribute('DungeonName')
+				or ''
+		))
+		return d:find('city of mages', 1, true) ~= nil
+			or d:find('mage city', 1, true) ~= nil
+	end
+	local studentCircle = cityStudentCircles()
 	local me = myRoot.Position
 	local circles = {}
 	local function namedDanger(n)
@@ -4821,13 +5055,17 @@ rt.avoidFloorAoe = function()
 	end
 	-- Volley latch: discs spawn in waves. Clearing the pin the instant you step
 	-- out of one disc walks you back onto the Professor under the next strike.
+	-- Student buff circles do not come in overlapping volleys — do not latch.
 	local function markVolley()
-		rt.aoeVolleyUntil = os.clock() + 2.8
+		rt.aoeVolleyUntil = os.clock() + (studentCircle and 0.12 or 2.8)
 		rt.aoeLastDiscAt = os.clock()
 		rt.aoeDiscs = true
 	end
 	if #circles == 0 then
-		if os.clock() < (rt.aoeVolleyUntil or 0) and typeof(rt.aoeGoal) == 'Vector3' then
+		if not studentCircle
+			and os.clock() < (rt.aoeVolleyUntil or 0)
+			and typeof(rt.aoeGoal) == 'Vector3'
+		then
 			rt.aoeDiscs = true
 			rt.aoeUntil = math.max(tonumber(rt.aoeUntil) or 0, os.clock() + 0.45)
 			return true
@@ -4836,6 +5074,9 @@ rt.avoidFloorAoe = function()
 			rt.aoeClearAt = os.clock()
 			rt.stickyPlant = nil
 			rt.packDir = nil
+			if studentCircle then
+				rt.aoeSnapMob = os.clock() + 0.45
+			end
 		end
 		rt.aoeUntil = 0
 		rt.aoeVolleyUntil = 0
@@ -4902,7 +5143,7 @@ rt.avoidFloorAoe = function()
 	-- Safe in a gap while discs still exist: HOLD only if far from EVERY disc.
 	-- Old pad 2.5 left you on the rim; a second overlapping strike still hit.
 	if clearance(me.X, me.Z) >= SAFE_PAD then
-		rt.aoeUntil = os.clock() + 1.4
+		rt.aoeUntil = os.clock() + (studentCircle and 0.18 or 1.4)
 		rt.stickyPlant = nil
 		if typeof(rt.aoeGoal) ~= 'Vector3' or clearance(rt.aoeGoal.X, rt.aoeGoal.Z) < SAFE_PAD then
 			rt.aoeGoal = holdHere()
@@ -4997,7 +5238,8 @@ rt.avoidFloorAoe = function()
 	end
 	rt.aoeGoal = best
 	-- Hold the gap through the whole volley, not just one disc's lifetime.
-	rt.aoeUntil = os.clock() + 2.2
+	-- Student circles: only long enough to finish the dash, then re-pin the pack.
+	rt.aoeUntil = os.clock() + (studentCircle and 0.28 or 2.2)
 	rt.aoeDiscs = true
 	return true
 end
@@ -6977,11 +7219,40 @@ end
 -- trap the farm on "payload · waiting" (Frostpire / Snow Endless).
 do
 	function rt.inChallengeFarm()
-		return LocalPlayer:GetAttribute('InChallenge') == true
+		if LocalPlayer:GetAttribute('InChallenge') == true then
+			return true
+		end
+		-- Attr can clear mid-run while Challenge_NPCs is still the live arena.
+		local npcs = workspace:FindFirstChild('Challenge_NPCs')
+		if npcs then
+			for _, child in ipairs(npcs:GetChildren()) do
+				if child:GetAttribute('DungeonChest') == true then
+					continue
+				end
+				if type(child.Name) == 'string' and child.Name:sub(1, 13) == 'DungeonChest' then
+					continue
+				end
+				return true
+			end
+		end
+		return false
 	end
 	function rt.inPayloadFarm()
 		if LocalPlayer:GetAttribute('InPayload') == true then
 			return true
+		end
+		-- Live PayloadCombat_* wins even when InDungeon is also set (probe: hover
+		-- bury + side plant while shamans sat 50 studs away).
+		for _, root in ipairs(workspace:GetChildren()) do
+			local name = root.Name
+			if type(name) == 'string' and name:sub(1, 14) == 'PayloadCombat_' then
+				for _, folder in ipairs(root:GetChildren()) do
+					local fn = folder.Name
+					if type(fn) == 'string' and fn:sub(1, 15) == 'PayloadEnemies_' and #folder:GetChildren() > 0 then
+						return true
+					end
+				end
+			end
 		end
 		-- Generated_ / Challenge runs win even if Payload_Maps junk is in workspace.
 		if LocalPlayer:GetAttribute('InDungeon') == true
@@ -9145,6 +9416,25 @@ local function isRangedEnemy(npc)
 		or id:find('ranged', 1, true)
 end
 
+-- WardBarrier pack-healers (Enemy_Data): kill these before fodder or the pack stays shielded.
+local function isShieldMage(npc)
+	if not npc then
+		return false
+	end
+	local id = string.lower(tostring(npc:GetAttribute('ItemId') or npc.Name or ''))
+	if id == 'dark acolyte' or id:find('dark acolyte', 1, true) then
+		return true
+	end
+	if id == 'orc shaman' or id == 'goblin shaman' or id:find('shaman', 1, true) then
+		return true
+	end
+	if id == 'mage student 2' or id:find('mage student 2', 1, true) then
+		return true
+	end
+	return false
+end
+rt.isShieldMage = isShieldMage
+
 -- Floor boss only. Room specials / minibosses are cleared with the rest of the map.
 local function isFinalBoss(npc)
 	if not npc then
@@ -9336,6 +9626,28 @@ local function eachFarmNpc(fn)
 			end
 		end
 	end
+end
+
+local function findShieldMage()
+	local root = routeRoot()
+	if not root then
+		return nil, nil
+	end
+	local best, bestD = nil, 9e9
+	eachFarmNpc(function(npc)
+		if not isShieldMage(npc) or not enemyAlive(npc) or farmSkipped(npc) then
+			return
+		end
+		local part = enemyRoot(npc)
+		if not part then
+			return
+		end
+		local d = (part.Position - root.Position).Magnitude
+		if d < bestD then
+			best, bestD = npc, d
+		end
+	end)
+	return best, bestD
 end
 
 local function countFarmSides()
@@ -9597,6 +9909,17 @@ local function isMageStudent(npc)
 		or name:find('mage student', 1, true) ~= nil
 end
 
+-- Dark Professor summons only. City of Mages (and other maps) reuse the same
+-- Mage Student mob as normal fodder — those get buffed floor circles that MUST
+-- be dodged, and must not enter the raid student hop/densest cycle.
+local function isRaidMageStudent(npc)
+	if not isMageStudent(npc) then
+		return false
+	end
+	local p = npc.Parent
+	return p ~= nil and p.Name == 'Raid_NPCs'
+end
+
 local function isAwakeAdd(npc)
 	if not npc or not enemyAlive(npc) or farmSkipped(npc) then
 		return false
@@ -9605,7 +9928,7 @@ local function isAwakeAdd(npc)
 		return false
 	end
 	-- Dark Professor summons — always treat as killable adds even if tagged weird.
-	if isMageStudent(npc) then
+	if isRaidMageStudent(npc) then
 		return enemyRoot(npc) ~= nil
 	end
 	if enemyRank(npc) >= 4 or isFinalBoss(npc) then
@@ -9614,12 +9937,12 @@ local function isAwakeAdd(npc)
 	return enemyRoot(npc) ~= nil
 end
 
--- Nearest live Mage Student anywhere in Raid_NPCs (no ADD_NEAR clamp).
+-- Nearest live Mage Student in Raid_NPCs (no ADD_NEAR clamp).
 local function findMageStudent()
 	local me = routeRoot()
 	local best, bestD = nil, nil
 	eachFarmNpc(function(npc)
-		if not isMageStudent(npc) or not enemyAlive(npc) or farmSkipped(npc) then
+		if not isRaidMageStudent(npc) or not enemyAlive(npc) or farmSkipped(npc) then
 			return
 		end
 		local part = enemyRoot(npc)
@@ -9634,11 +9957,11 @@ local function findMageStudent()
 	return best, bestD
 end
 
--- All live Mage Students.
+-- All live Raid Mage Students (Professor wave).
 local function listMageStudents()
 	local out = {}
 	eachFarmNpc(function(npc)
-		if isMageStudent(npc) and enemyAlive(npc) and not farmSkipped(npc) and enemyRoot(npc) then
+		if isRaidMageStudent(npc) and enemyAlive(npc) and not farmSkipped(npc) and enemyRoot(npc) then
 			out[#out + 1] = npc
 		end
 	end)
@@ -9872,26 +10195,117 @@ local function furthestCaster(casters)
 	return best or (casters and casters[1]) or nil
 end
 
+local function studentStandY(pos)
+	local hover = rt.combatHover()
+	local fy = rt.refreshFarmFloor and rt.refreshFarmFloor(pos) or nil
+	if type(fy) == 'number' then
+		return fy + (hover ~= 0 and hover or 3)
+	end
+	if hover < 0 then
+		return pos.Y + hover
+	end
+	return pos.Y
+end
+
 local function studentStandAt(npc)
 	local part = enemyRoot(npc)
 	if not part then
 		return nil, nil
 	end
-	local hover = rt.combatHover()
 	local pos = part.Position
-	local fy = rt.refreshFarmFloor and rt.refreshFarmFloor(pos) or nil
-	local y
-	if type(fy) == 'number' then
-		y = fy + (hover ~= 0 and hover or 3)
-	elseif hover < 0 then
-		y = pos.Y + hover
-	else
-		y = pos.Y
-	end
 	-- Sit ON them (look-up bury or tight stand) — spread arena + offset stand
 	-- was missing interrupts.
-	local stand = Vector3.new(pos.X, y, pos.Z)
+	local stand = Vector3.new(pos.X, studentStandY(pos), pos.Z)
 	return stand, pos
+end
+
+local function densestStudentCluster(list, radius)
+	local entries = {}
+	for i = 1, #(list or {}) do
+		local part = enemyRoot(list[i])
+		if part then
+			entries[#entries + 1] = { npc = list[i], pos = part.Position }
+		end
+	end
+	if #entries == 0 then
+		return nil, nil, 0
+	end
+	if #entries == 1 then
+		return entries[1].pos, entries[1].npc, 1
+	end
+	radius = radius or 18
+	local r2 = radius * radius
+	local bestN, bestMid, bestFocus = 0, entries[1].pos, entries[1].npc
+	for _, a in ipairs(entries) do
+		local sx, sy, sz, n = 0, 0, 0, 0
+		for _, b in ipairs(entries) do
+			local dx = b.pos.X - a.pos.X
+			local dz = b.pos.Z - a.pos.Z
+			if dx * dx + dz * dz <= r2 then
+				sx += b.pos.X
+				sy += b.pos.Y
+				sz += b.pos.Z
+				n += 1
+			end
+		end
+		if n > bestN then
+			bestN = n
+			bestMid = Vector3.new(sx / n, sy / n, sz / n)
+			local focus, focusD = a.npc, 9e9
+			for _, b in ipairs(entries) do
+				local dx = b.pos.X - a.pos.X
+				local dz = b.pos.Z - a.pos.Z
+				if dx * dx + dz * dz <= r2 then
+					local d = (b.pos - bestMid).Magnitude
+					if d < focusD then
+						focus, focusD = b.npc, d
+					end
+				end
+			end
+			bestFocus = focus
+		end
+	end
+	return bestMid, bestFocus, bestN
+end
+
+local function denserStudentDir(fromPos, list)
+	local bestDir, bestN = Vector3.new(0, 0, -1), -1
+	for i = 0, 15 do
+		local dir = Vector3.new(math.cos(i * math.pi / 8), 0, math.sin(i * math.pi / 8))
+		local n = 0
+		for j = 1, #(list or {}) do
+			local part = enemyRoot(list[j])
+			if part then
+				local rel = Vector3.new(part.Position.X - fromPos.X, 0, part.Position.Z - fromPos.Z)
+				if rel.Magnitude > 0.35 and rel.Magnitude <= 45 and rel:Dot(dir) > 0 then
+					n += 1
+				end
+			end
+		end
+		if n > bestN then
+			bestDir, bestN = dir, n
+		end
+	end
+	return bestDir
+end
+
+-- Solo + positive hover: stand facing the densest clump so the frontal M1
+-- slab covers the pack (under-hover already multi-hits; parry ult needs +hover).
+local function studentStandDensest(list, aimNpc)
+	local mid, focus, n = densestStudentCluster(list, 18)
+	if not mid then
+		return studentStandAt(aimNpc or (list and list[1]))
+	end
+	aimNpc = aimNpc or focus or (list and list[1])
+	local aimPart = aimNpc and enemyRoot(aimNpc)
+	local aimPos = (aimPart and aimPart.Position) or mid
+	local y = studentStandY(mid)
+	local dir = denserStudentDir(mid, list)
+	-- Step slightly back from the clump center so the forward hitbox eats the pile.
+	local stand = Vector3.new(mid.X - dir.X * 5, y, mid.Z - dir.Z * 5)
+	rt.farmFaceDir = dir
+	rt.farmCrowdAim = mid
+	return stand, aimPos, n or 1, aimNpc
 end
 
 local function closestStudent(list, from)
@@ -9908,9 +10322,9 @@ local function closestStudent(list, from)
 	return best
 end
 
--- Wave timer: ANY living student heals the boss. Sticky-on-one left the rest
--- free — hard-tele hop the FULL pack with a short hit-confirm dwell. Party
--- members start on different indices so they do not always stack the same body.
+-- Wave timer: ANY living student heals the boss.
+-- Duo+: hard-tele hop (parallel burns). Solo + positive hover: plant on densest
+-- clump so a slow frontal weapon still tags the group (parry ult needs +hover).
 local function holdOnStudentPack()
 	rt.studentHopAt = 0
 	rt.studentHopIdx = 0
@@ -9952,6 +10366,36 @@ local function holdOnStudentPack()
 			end
 		end
 
+		local hover = rt.combatHover()
+		-- Solo + look-ahead (hover >= 0): densest-clump plant, not body-hop.
+		if partyN <= 1 and #list >= 2 and hover >= 0 then
+			local mid = select(1, densestStudentCluster(list, 18))
+			local aimNpc = nil
+			-- Prefer a caster still near the densest pile.
+			for i = 1, #order do
+				if studentCasting(order[i]) then
+					local part = enemyRoot(order[i])
+					if part and mid and (part.Position - mid).Magnitude <= 24 then
+						aimNpc = order[i]
+						break
+					end
+				end
+			end
+			aimNpc = aimNpc or order[1]
+			rt.studentHopping = false
+			rt.studentSticky = nil
+			rt.studentHopNpc = aimNpc
+			rt.farmFightNpc = aimNpc
+			local stand, aim, n = studentStandDensest(list, aimNpc)
+			if not stand then
+				return nil
+			end
+			rt.stickyPlant = nil
+			rt.studentHopSwing = true
+			rt.studentHopLabel = ('students · densest x%d / %d'):format(n or 1, #list)
+			return stand, aim
+		end
+
 		local now = os.clock()
 		local hitsNow = tonumber(LocalPlayer:GetAttribute('Hit_Count')) or 0
 		local cur = rt.studentHopNpc
@@ -9969,7 +10413,7 @@ local function holdOnStudentPack()
 			and not farmSkipped(cur)
 		local dwell = now - (rt.studentHopAt or 0)
 		local hitLanded = hitsNow > (rt.studentHopHits0 or 0)
-		-- Solo target: melt it. Multi: tag each body ~0.18s then hop.
+		-- Solo target: melt it. Multi (duo+ or under-hover): tag then hop.
 		local stay = false
 		if #order <= 1 then
 			stay = alive == true
@@ -10167,11 +10611,19 @@ local function pickFarmTarget()
 	-- Raid boss / special still yields to crystals + summoned adds (Mage Students).
 	local held = rt.farmFightNpc
 	if held and rt.farmFighting and enemyAlive(held) and enemyRoot(held) and not farmSkipped(held) then
-		-- Never stay glued to the Professor while a Mage Student is alive.
+		-- Never stay glued to the Professor while a Raid Mage Student is alive.
 		local student, studentD = findMageStudent()
-		if student and not isMageStudent(held) then
+		if student and not isRaidMageStudent(held) then
 			farmLock = nil
 			return student, studentD
+		end
+		-- WardBarrier acolytes / shamans before any held fodder.
+		if on('DLFarmPriorityShield') ~= false and not isShieldMage(held) then
+			local shield, shieldD = findShieldMage()
+			if shield then
+				farmLock = nil
+				return shield, shieldD
+			end
 		end
 		if isRaidBossNpc(held) or enemyRank(held) >= 4 then
 			local crystal, crystalD = nearestCrystal()
@@ -10190,6 +10642,7 @@ local function pickFarmTarget()
 	end
 	local preferBoss = on('DLFarmBoss')
 	local preferRanged = on('DLFarmRanged')
+	local preferShield = on('DLFarmPriorityShield') ~= false
 	local trash, bosses = countFarmSides()
 	local skipFinal = trash > 0
 	-- Boss Rush is a 1v1 arena. Do not skip the rush boss as a "floor boss"
@@ -10218,6 +10671,13 @@ local function pickFarmTarget()
 	if student then
 		farmLock = nil
 		return student, studentD
+	end
+	if preferShield then
+		local shield, shieldD = findShieldMage()
+		if shield then
+			farmLock = nil
+			return shield, shieldD
+		end
 	end
 	if on('DLHuntSpecial') then
 		local hunt, huntD = findHuntTarget()
@@ -10430,6 +10890,91 @@ end
 
 -- Challenge wave chests despawn in ~60s; Payload checkpoint UI dies in ~3s.
 -- Grab any open world chest under the mode map without waiting for a room clear.
+function rt.challengeWaveNumber()
+	-- HUD: Dungeon_Container.Info.Wave.TextLabel "Wave: 257"
+	-- also Challenge_Canvas title "WAVE 257"; chests use RoomIndex as wave id.
+	local best = nil
+	pcall(function()
+		local pg = LocalPlayer:FindFirstChild('PlayerGui')
+		local main = pg and pg:FindFirstChild('Main')
+		local hud = main and main:FindFirstChild('HUD')
+		local container = hud and hud:FindFirstChild('Dungeon_Container')
+		local info = container and container:FindFirstChild('Info')
+		local waveFrame = info and info:FindFirstChild('Wave')
+		local label = waveFrame and waveFrame:FindFirstChild('TextLabel')
+		local t = label and tostring(label.Text or '') or ''
+		local n = tonumber(t:match('(%d+)'))
+		if n then
+			best = n
+		end
+		if not best then
+			local canvas = container and container:FindFirstChild('Challenge_Canvas')
+			local title = canvas and canvas:FindFirstChild('Frame') and canvas.Frame:FindFirstChild('Title')
+			local tt = title and tostring(title.Text or '') or ''
+			n = tonumber(tt:match('(%d+)'))
+			if n then
+				best = n
+			end
+		end
+	end)
+	if not best then
+		local folder = workspace:FindFirstChild('Challenge_NPCs')
+		if folder then
+			for _, child in ipairs(folder:GetChildren()) do
+				local ri = tonumber(child:GetAttribute('RoomIndex'))
+				if ri and (not best or ri > best) then
+					best = ri
+				end
+			end
+		end
+	end
+	return best
+end
+
+function rt.checkChallengeWaveStop()
+	if not (rt.inChallengeFarm and rt.inChallengeFarm()) then
+		rt._challengeWaveStopped = nil
+		return false
+	end
+	local stopAt = Options.DLChallengeStopWave and tonumber(Options.DLChallengeStopWave.Value) or 0
+	if not stopAt or stopAt <= 0 then
+		return false
+	end
+	local wave = rt.challengeWaveNumber()
+	if not wave or wave < stopAt then
+		return false
+	end
+	if rt._challengeWaveStopped then
+		return true
+	end
+	rt._challengeWaveStopped = true
+	farmLabel = ('challenge stop · wave %d'):format(wave)
+	pcall(function()
+		Library:Notify(('Challenge stop · wave %d (limit %d)'):format(wave, stopAt), 6)
+	end)
+	pcall(function()
+		if Toggles.DLChallengeLoop then
+			Toggles.DLChallengeLoop:SetValue(false)
+		end
+	end)
+	pcall(function()
+		if Toggles.DLAutoFarm then
+			Toggles.DLAutoFarm:SetValue(false)
+		end
+	end)
+	pcall(function()
+		if type(RunLoops) == 'table' and type(RunLoops.stopFarm) == 'function' then
+			RunLoops.stopFarm(true)
+		end
+	end)
+	pcall(function()
+		if type(rt.forceReturnLobby) == 'function' then
+			rt.forceReturnLobby(false)
+		end
+	end)
+	return true
+end
+
 local function challengeWaveLiving()
 	local folder = workspace:FindFirstChild('Challenge_NPCs')
 	if not folder then
@@ -11497,15 +12042,22 @@ local function holdOnEnemy(npc)
 			rt.pinGoal = live.Position
 			return live.Position, live.Position
 		end
-		-- Raid meteors: scan hard. 0.35s was enough to die between ticks.
-		local aoeNeed = (isRaidBossNpc(npc) or rt.aoeVolleyActive and rt.aoeVolleyActive()) and 0.08 or 0.35
+		-- Raid meteors / City-of-Mages student buff circles: scan hard.
+		-- 0.35s was enough to die between ticks on disc spam.
+		local aoeNeed = (
+			isRaidBossNpc(npc)
+			or isMageStudent(npc)
+			or (rt.aoeVolleyActive and rt.aoeVolleyActive())
+		) and 0.08 or 0.35
 		if os.clock() - (rt.aoeScanAt or 0) > aoeNeed then
 			rt.aoeScanAt = os.clock()
 			pcall(rt.avoidFloorAoe)
 		end
-		-- Floor discs win over the boss stand pin — except Mage Students:
-		-- their meteors are harmless and dodging them abandons the kill.
-		local volley = not isMageStudent(npc)
+		-- Floor discs win over the boss stand pin — except Dark Professor's
+		-- Raid Mage Students (harmless meteors; dodging abandons the heal race).
+		-- City of Mages / dungeon Mage Students cast real buff circles — dodge those.
+		local volley = not rt.inChallengeFarm()
+			and not isRaidMageStudent(npc)
 			and not rt.commitStudent
 			and rt.aoeVolleyActive
 			and rt.aoeVolleyActive()
@@ -11516,10 +12068,12 @@ local function holdOnEnemy(npc)
 			-- kept the slab planted in the disc.
 			return rt.aoeGoal, rt.aoeGoal
 		end
-		-- Just left a meteor gap — drop sticky plant so we snap back to the boss.
+		-- Just left a meteor / student-circle gap — drop sticky plant so we
+		-- snap back onto the pack instead of sitting in the dodge hole.
 		if rt.aoeClearAt and os.clock() - rt.aoeClearAt < 0.55 then
 			rt.stickyPlant = nil
 			cachedPlant = nil
+			cachedAt = 0
 		end
 		local now = os.clock()
 		if now - cachedAt > 0.2 then
@@ -11620,31 +12174,43 @@ local function holdOnEnemy(npc)
 				local aoeLive = (rt.aoeVolleyActive and rt.aoeVolleyActive())
 					or os.clock() < (rt.aoeUntil or 0)
 					or rt.aoeDiscs == true
-				cachedStand = aoeLive and math.max(stand, 10) or 0
-				if enemyRank(npc) < 3 and not aoeLive then
-					local pack, n = packAround(npc, live, 28)
-					if n >= 2 then
-						cachedPlant = buryUnderPlant(pack, live.Position)
-					end
-				end
-				local pack = crowdPartsNear(npc)
-				local mid, tn = densestCentroid(pack, 16)
-				if mid and tn and tn >= 2 then
-					rt.crowdSolo = false
-					if now - (rt.crowdAimAt or 0) > 0.55 or not rt.farmCrowdAim then
-						rt.crowdAimAt = now
-						rt.farmCrowdAim = mid
-					end
-					cachedAim = rt.farmCrowdAim or mid
-					if not aoeLive then
-						cachedPlant = cachedPlant or mid
-					end
-				else
+				local arena = rt.inModeArenaFarm and rt.inModeArenaFarm()
+				local shieldPri = isShieldMage(npc)
+				-- Arena / shield mages: never side-stand or pack-centroid plant (probe:
+				-- flat 50 studs off Orc Shaman with hover -16).
+				if arena or shieldPri then
+					cachedStand = 0
+					cachedPlant = live.Position
 					rt.crowdSolo = true
 					rt.farmCrowdAim = live.Position
 					cachedAim = live.Position
-					if not aoeLive then
-						cachedPlant = live.Position
+				else
+					cachedStand = aoeLive and math.max(stand, 10) or 0
+					if enemyRank(npc) < 3 and not aoeLive then
+						local pack, n = packAround(npc, live, 28)
+						if n >= 2 then
+							cachedPlant = buryUnderPlant(pack, live.Position)
+						end
+					end
+					local pack = crowdPartsNear(npc)
+					local mid, tn = densestCentroid(pack, 16)
+					if mid and tn and tn >= 2 then
+						rt.crowdSolo = false
+						if now - (rt.crowdAimAt or 0) > 0.55 or not rt.farmCrowdAim then
+							rt.crowdAimAt = now
+							rt.farmCrowdAim = mid
+						end
+						cachedAim = rt.farmCrowdAim or mid
+						if not aoeLive then
+							cachedPlant = cachedPlant or mid
+						end
+					else
+						rt.crowdSolo = true
+						rt.farmCrowdAim = live.Position
+						cachedAim = live.Position
+						if not aoeLive then
+							cachedPlant = live.Position
+						end
 					end
 				end
 			else
@@ -11845,11 +12411,12 @@ local function farmKill(npc)
 	local addAnchor = nil
 	local addPack = false
 	local studentPack = false
-	local studentTarget = isMageStudent(npc)
+	local studentTarget = isRaidMageStudent(npc)
 	if studentTarget then
 		-- Commit hard: clear gap pin and never stall-ban these.
 		-- Stand in the CENTER of every Mage Student so one slab interrupts heals
 		-- on all of them — never tunnel one while the others cast.
+		-- Raid_NPCs only (Dark Professor). City of Mages students are normal fodder.
 		rt.commitStudent = true
 		rt.aoeGoal = nil
 		rt.aoeUntil = 0
@@ -13971,6 +14538,188 @@ local function tourFarmRooms(dungeon)
 	end
 end
 
+
+-- Challenge-only combat: pin to live pack centroid, ignore AOE/chests/corpses.
+local function listChallengeLive()
+	local out = {}
+	local folder = workspace:FindFirstChild('Challenge_NPCs')
+	if not folder then
+		return out
+	end
+	for _, child in ipairs(folder:GetChildren()) do
+		if child:GetAttribute('DungeonChest') == true
+			or (type(child.Name) == 'string' and child.Name:sub(1, 13) == 'DungeonChest')
+		then
+			continue
+		end
+		local st = string.lower(tostring(child:GetAttribute('State') or ''))
+		if st == 'dead' or st == 'died' or st == 'dying' then
+			continue
+		end
+		if not enemyAlive(child) then
+			continue
+		end
+		local part = enemyRoot(child)
+		if not part then
+			continue
+		end
+		out[#out + 1] = { npc = child, part = part, pos = part.Position }
+	end
+	return out
+end
+
+local function challengePackMid(lives)
+	if #lives == 0 then
+		return nil
+	end
+	local sx, sy, sz = 0, 0, 0
+	for _, e in ipairs(lives) do
+		sx += e.pos.X
+		sy += e.pos.Y
+		sz += e.pos.Z
+	end
+	local n = #lives
+	return Vector3.new(sx / n, sy / n, sz / n)
+end
+
+local function challengeNearest(lives, from)
+	local best, bestD = nil, 9e9
+	local shield, shieldD = nil, 9e9
+	for _, e in ipairs(lives) do
+		local d = (e.pos - from).Magnitude
+		if d < bestD then
+			best, bestD = e, d
+		end
+		if isShieldMage(e.npc) and d < shieldD then
+			shield, shieldD = e, d
+		end
+	end
+	if shield and on('DLFarmPriorityShield') ~= false then
+		return shield, shieldD
+	end
+	return best, bestD
+end
+
+function rt.runChallengeCombat()
+	if not rt.inChallengeFarm() then
+		return false
+	end
+	-- One locked target for both the loop and Pin.follow (split picks left us
+	-- 14-20 studs off). Hard-hop like crystals so Pin does not soft-lerp.
+	local function clearAoe()
+		rt.aoeGoal = nil
+		rt.aoeUntil = 0
+		rt.aoeDiscs = false
+		rt.aoeVolleyUntil = 0
+	end
+	local function standOn(npcPos, aimPos)
+		-- Live probe: floor snap buried us ~19 studs under Challenge HRPs (flat=0).
+		-- Always match the target root height.
+		return Vector3.new(npcPos.X, npcPos.Y, npcPos.Z), aimPos or npcPos
+	end
+	local function liveOf(npc)
+		if not npc or not npc.Parent or not enemyAlive(npc) then
+			return nil
+		end
+		local part = enemyRoot(npc)
+		if not part then
+			return nil
+		end
+		return { npc = npc, part = part, pos = part.Position }
+	end
+	rt.crystalHopping = true
+	local function bindFollow()
+		Pin.follow(function()
+			if not rt.inChallengeFarm() or not farmActive() then
+				return nil
+			end
+			clearAoe()
+			local target = liveOf(rt.farmFightNpc)
+			if not target then
+				return nil
+			end
+			rt.farmFighting = true
+			rt.farmCrowdAim = target.pos
+			local stand, aim = standOn(target.pos, target.pos)
+			return stand, aim
+		end)
+	end
+	farmLabel = 'challenge pack'
+	local lastHit = 0
+	local hopAt = 0
+	bindFollow()
+	while farmActive() and rt.inChallengeFarm() do
+		if type(rt.checkChallengeWaveStop) == 'function' and rt.checkChallengeWaveStop() then
+			break
+		end
+		local lives = listChallengeLive()
+		if #lives == 0 then
+			break
+		end
+		local me = routeRoot()
+		if not me then
+			task.wait(0.05)
+			continue
+		end
+		clearAoe()
+		rt.farmFighting = true
+		rt.crystalHopping = true
+		local now = os.clock()
+		local target = liveOf(rt.farmFightNpc)
+		if not target or now - hopAt >= 0.55 then
+			local pick = select(1, challengeNearest(lives, me.Position))
+			if pick then
+				target = pick
+				rt.farmFightNpc = pick.npc
+				hopAt = now
+			end
+		end
+		if not target then
+			task.wait(0.05)
+			continue
+		end
+		local stand, aim = standOn(target.pos, target.pos)
+		local flat = Vector3.new(me.Position.X - stand.X, 0, me.Position.Z - stand.Z).Magnitude
+		if flat > 2.5 or math.abs(me.Position.Y - stand.Y) > 2.5 then
+			pcall(function()
+				if type(rt.setFarmPitchHum) == 'function' then
+					rt.setFarmPitchHum(false)
+				end
+			end)
+			pcall(function()
+				me.CFrame = CFrame.new(stand)
+				me.AssemblyLinearVelocity = Vector3.zero
+				me.AssemblyAngularVelocity = Vector3.zero
+			end)
+			-- Exact station so Heartbeat hard-snaps instead of 0.55 soft hold.
+			Pin.at(stand, true)
+			rt.farmFightNpc = target.npc
+			rt.farmCrowdAim = target.pos
+			bindFollow()
+		end
+		farmLabel = ('challenge %s x%d'):format(target.npc.Name, #lives)
+		if now - lastHit >= 0.08 then
+			lastHit = now
+			pcall(fireAttack)
+			pcall(autoSkillTick)
+		end
+		task.wait(0.05)
+	end
+	rt.crystalHopping = false
+	rt.farmFighting = false
+	rt.farmFightNpc = nil
+	Pin.release()
+	if type(rt.lootChallengeChests) == 'function' then
+		local ok, n = pcall(rt.lootChallengeChests)
+		if ok and type(n) == 'number' and n > 0 then
+			farmLabel = ('challenge looted %d'):format(n)
+		else
+			farmLabel = 'challenge waiting'
+		end
+	end
+	return true
+end
+
 local function farmLoop()
 	local root = routeRoot()
 	farmHome = root and root.CFrame or nil
@@ -14093,58 +14842,30 @@ local function farmLoop()
 				step('return')
 				rt.farmReturnNpc = nil
 				farmKillNpc(back)
+			elseif rt.inChallengeFarm() then
+				-- Live probe: old path sat 20-70 studs off pack / nearer chests.
+				if type(rt.checkChallengeWaveStop) == 'function' and rt.checkChallengeWaveStop() then
+					task.wait(0.25)
+				else
+					step('challenge')
+					pcall(rt.runChallengeCombat)
+					task.wait(0.05)
+				end
 			elseif rt.inModeArenaFarm() then
-				-- Challenge / Payload: no Room_N tour. Kill waves + grab timed chests now.
-				-- Challenge also sets InDungeon=true — still arena waves (Payload already
-				-- returns false while InDungeon, so Frostpire is safe).
+				-- Payload arena: kill then grab timed chests.
 				step('mode')
 				local target = pickFarmTarget()
-				if not target and rt.inChallengeFarm() then
-					local folder = workspace:FindFirstChild('Challenge_NPCs')
-					local me = routeRoot()
-					local best, bestD = nil, 9e9
-					if folder and me then
-						for _, child in ipairs(folder:GetChildren()) do
-							if child:GetAttribute('DungeonChest') == true
-								or (type(child.Name) == 'string' and child.Name:sub(1, 13) == 'DungeonChest')
-							then
-								continue
-							end
-							local st = string.lower(tostring(child:GetAttribute('State') or ''))
-							if st == 'dead' or st == 'died' or st == 'dying' then
-								continue
-							end
-							local part = enemyRoot(child)
-							if not part then
-								continue
-							end
-							local d = (part.Position - me.Position).Magnitude
-							if d < bestD then
-								best, bestD = child, d
-							end
-						end
-					end
-					target = best
-				end
 				if target then
-					local tag = rt.inChallengeFarm() and 'challenge' or 'payload'
-					farmLabel = ('%s · %s'):format(tag, target.Name)
+					farmLabel = ('payload %s'):format(target.Name)
 					farmKillNpc(target)
 				else
-					local looted = 0
-					if rt.inChallengeFarm() and type(rt.lootChallengeChests) == 'function' then
-						local okL, nL = pcall(rt.lootChallengeChests)
-						if okL then
-							looted = tonumber(nL) or 0
-						end
-					elseif type(rt.grabModeChests) == 'function' then
+					if type(rt.grabModeChests) == 'function' then
 						pcall(rt.grabModeChests)
 					end
-					farmLabel = (rt.inChallengeFarm() and looted > 0)
-						and ('challenge · looted %d'):format(looted)
-						or (rt.inChallengeFarm() and 'challenge · chests' or 'payload · waiting')
-					task.wait(rt.inChallengeFarm() and 0.08 or 0.15)
+					farmLabel = 'payload waiting'
+					task.wait(0.15)
 				end
+
 			else
 				-- Event raid owns the farm while Raid_NPCs has living targets.
 				-- Dark Professor is IsBoss (not IsSpecial) and used to lose to
@@ -14153,7 +14874,7 @@ local function farmLoop()
 				if raidNpc then
 					step('raid')
 					farmLabel = ('raid · %s'):format(raidNpc.Name)
-					if isMageStudent(raidNpc) then
+					if isRaidMageStudent(raidNpc) then
 						rt.commitStudent = true
 						rt.aoeGoal = nil
 						rt.aoeUntil = 0
@@ -17753,7 +18474,14 @@ local DungeonStart = (function()
 
 	function api.listDungeons()
 		local names = {}
-		local ok, data = pcall(require, ReplicatedStorage.GameInfo.DungeonData)
+		local ok, data = pcall(function()
+			local gi = ReplicatedStorage:FindFirstChild('GameInfo')
+			local mod = gi and gi:FindFirstChild('DungeonData')
+			if not mod then
+				return nil
+			end
+			return require(mod)
+		end)
 		if not ok or type(data) ~= 'table' or type(data.DisplayOrder) ~= 'table' then
 			return names
 		end
@@ -19084,6 +19812,9 @@ rt.ChallengeLoop = (function()
 		end
 		if inChallengeNow() then
 			armedAt = 0
+			if type(rt.checkChallengeWaveStop) == 'function' and rt.checkChallengeWaveStop() then
+				return
+			end
 			local rf = RunLoops.knitRF('ChallengeRunService', 'GetSessionState')
 			local done = false
 			if rf then
@@ -21912,16 +22643,23 @@ local Gear = (function()
 		end
 	end
 
-	function api.pinGameInv()
-		local obj = gameInvObj()
-		if obj and obj.isOpen ~= true and type(obj.open) == 'function' then
-			pcall(function()
-				obj:open()
-			end)
-		end
+	function api.pinGameInv(forceGrid)
 		local inv, main = gameInvFrame()
 		if not inv then
 			return false
+		end
+		-- Already open and on-screen: do not call UIController:open() or rewrite
+		-- Position — that reset the item grid and fought Stat Upgrade / other tabs
+		-- every Gear.tick while rt.invOpen stayed true after Open inventory.
+		local onScreen = inv.Visible == true and inv.AbsolutePosition.Y > -40
+		if forceGrid ~= true and onScreen then
+			return true
+		end
+		local obj = gameInvObj()
+		if (not onScreen) and obj and type(obj.open) == 'function' then
+			pcall(function()
+				obj:open()
+			end)
 		end
 		inv.Visible = true
 		inv.Active = true
@@ -21939,7 +22677,10 @@ local Gear = (function()
 		if inv.AbsolutePosition.Y < -40 then
 			inv.Position = UDim2.new(0.5, 0, 0.5, 0)
 		end
-		showItemGrid(inv)
+		-- Only snap to the item grid on a fresh open.
+		if forceGrid == true then
+			showItemGrid(inv)
+		end
 		hideDungeonLootOverlay(main)
 		local btn = hudInvButton(main)
 		if btn then
@@ -22066,15 +22807,17 @@ local Gear = (function()
 		end
 		rt.invOpen = want == true
 		if rt.invOpen then
+			rt.invOpenedAt = os.clock()
 			if obj and type(obj.open) == 'function' then
 				pcall(function()
 					obj:open()
 				end)
 			end
-			api.pinGameInv()
+			api.pinGameInv(true)
 			pcall(api.refreshDrop)
 			Library:Notify('Inventory open')
 		else
+			rt.invOpenedAt = nil
 			if obj and type(obj.close) == 'function' then
 				pcall(function()
 					obj:close()
@@ -22112,8 +22855,25 @@ local Gear = (function()
 			end
 			pcall(api.refreshDrop)
 		end
-		if rt.invOpen or on('DLInvPin') then
+		-- Keep-open only with DLInvPin. One-shot Open inventory must not re-open
+		-- every tick (probe: Visible false→true + parked off-screen while tabs stuck).
+		if on('DLInvPin') then
 			pcall(api.pinGameInv)
+		elseif rt.invOpen then
+			local inv = select(1, gameInvFrame())
+			local closed = inv and inv.Visible ~= true
+			local parked = inv and inv.AbsolutePosition.Y < -40
+			if closed and not parked then
+				-- User closed / switched away — stop owning the panel.
+				rt.invOpen = false
+				rt.invOpenedAt = nil
+			elseif parked and os.clock() - (rt.invOpenedAt or 0) < 1.5 then
+				-- Brief park fight right after our open only.
+				pcall(api.pinGameInv)
+			elseif parked and os.clock() - (rt.invOpenedAt or 0) >= 1.5 then
+				rt.invOpen = false
+				rt.invOpenedAt = nil
+			end
 		end
 		if rt.forgeOpen then
 			pcall(api.pinGameForge)
@@ -22347,6 +23107,44 @@ local Gear = (function()
 		return frames and frames:FindFirstChild(name) or nil
 	end
 
+	-- ItemShop is created lazily by the Left HUD (not in UIController.names until then).
+	local function ensureItemShopController()
+		local UI = uiController()
+		if not UI then
+			return nil
+		end
+		local obj = type(UI.names) == 'table' and UI.names.ItemShop
+		if obj then
+			return obj, UI
+		end
+		local frame = shopFrame('ItemShop')
+		if not frame or type(UI.new) ~= 'function' then
+			return nil, UI
+		end
+		local ok, created = pcall(function()
+			return UI.new(frame)
+		end)
+		if ok and type(created) == 'table' then
+			return created, UI
+		end
+		return type(UI.names) == 'table' and UI.names.ItemShop or nil, UI
+	end
+
+	local function itemShopModule()
+		local ps = LocalPlayer:FindFirstChild('PlayerScripts')
+		local client = ps and ps:FindFirstChild('Client')
+		local ui = client and client:FindFirstChild('UI')
+		local mod = ui and ui:FindFirstChild('ItemShop')
+		if not mod then
+			return nil
+		end
+		local ok, M = pcall(require, mod)
+		if not ok or type(M) ~= 'table' then
+			return nil
+		end
+		return M
+	end
+
 	local function shopObj(name)
 		local UI = uiController()
 		return UI and type(UI.names) == 'table' and UI.names[name] or nil
@@ -22387,6 +23185,9 @@ local Gear = (function()
 		name = tostring(name or '')
 		if name == '' then
 			return false
+		end
+		if name == 'ItemShop' then
+			ensureItemShopController()
 		end
 		local obj = shopObj(name)
 		local frame = shopFrame(name)
@@ -22435,6 +23236,58 @@ local Gear = (function()
 		return api.setShopOpen(name, false, silent)
 	end
 
+	-- Mystery Merchant is ItemShop in SetMode('MysteryMerchant') — same path DialogueController
+	-- OpenManagedWindow('ItemShop', 'MysteryMerchant') uses (NPC prompt / Left HUD).
+	function api.isMysteryShopOpen()
+		if not api.isShopOpen('ItemShop') then
+			return false
+		end
+		local M = itemShopModule()
+		if not M or type(M.GetMode) ~= 'function' then
+			return false
+		end
+		local ok, mode = pcall(function()
+			return M.GetMode()
+		end)
+		return ok and mode == 'MysteryMerchant'
+	end
+
+	function api.setMysteryShopOpen(want, silent)
+		local M = itemShopModule()
+		if want then
+			ensureItemShopController()
+			local ok = api.setShopOpen('ItemShop', true, true)
+			if M and type(M.SetMode) == 'function' then
+				pcall(function()
+					M.SetMode('MysteryMerchant')
+				end)
+			end
+			pinShopFrame('ItemShop', shopObj('ItemShop'))
+			if not silent then
+				Library:Notify(ok and 'Mystery shop open' or 'Mystery shop missing')
+			end
+			return ok
+		end
+		if M and type(M.SetMode) == 'function' then
+			pcall(function()
+				M.SetMode('Buy')
+			end)
+		end
+		return api.setShopOpen('ItemShop', false, silent)
+	end
+
+	function api.openMysteryShop(silent)
+		return api.setMysteryShopOpen(true, silent)
+	end
+
+	function api.closeMysteryShop(silent)
+		return api.setMysteryShopOpen(false, silent)
+	end
+
+	function api.toggleMysteryShop(silent)
+		return api.setMysteryShopOpen(not api.isMysteryShopOpen(), silent)
+	end
+
 	function api.setAllShopsOpen(want, silent)
 		local n = 0
 		for _, name in ipairs(SHOP_ALL) do
@@ -22466,6 +23319,467 @@ local Gear = (function()
 
 	return api
 end)()
+
+rt.playerDataTable = function()
+	local data
+	pcall(function()
+		local Knit = require(game:GetService('ReplicatedStorage').Packages.Knit)
+		local entry = Knit.Registry and Knit.Registry._Entries and Knit.Registry._Entries.PlayerData
+		data = entry and entry.Data
+	end)
+	if type(data) ~= 'table' then
+		pcall(function()
+			local knitMod = game:GetService('ReplicatedStorage').Packages._Index['sleitnick_knit@1.7.0'].knit
+			local K = require(knitMod)
+			local entry = K.Registry and K.Registry._Entries and K.Registry._Entries.PlayerData
+			data = entry and entry.Data
+		end)
+	end
+	return type(data) == 'table' and data or nil
+end
+
+rt.mysteryPurchasedCount = function(itemId, rotation)
+	itemId = tostring(itemId or '')
+	local localN = (rt.mmBought and rt.mmBought[itemId]) or 0
+	local data = rt.playerDataTable()
+	local bag = data and data.MysteryMerchantPurchases
+	if type(bag) ~= 'table' then
+		return localN
+	end
+	local v = bag[itemId]
+	if type(v) == 'number' then
+		return math.max(localN, v)
+	end
+	if type(v) == 'table' then
+		local n = tonumber(v.Count or v.Amount or v[itemId]) or 0
+		return math.max(localN, n)
+	end
+	if rotation ~= nil and type(bag[rotation]) == 'table' then
+		local n = tonumber(bag[rotation][itemId]) or 0
+		return math.max(localN, n)
+	end
+	local rotKey = tostring(rotation or '')
+	if rotKey ~= '' and type(bag[rotKey]) == 'table' then
+		local n = tonumber(bag[rotKey][itemId]) or 0
+		return math.max(localN, n)
+	end
+	return localN
+end
+
+rt.ownsMysteryGrant = function(item)
+	if type(item) ~= 'table' or item.OwnershipGated ~= true then
+		return false
+	end
+	local grant = tostring(item.GrantId or '')
+	local id = tostring(item.Id or '')
+	local data = rt.playerDataTable()
+	if type(data) ~= 'table' then
+		return false
+	end
+	local bags = {
+		data.Cosmetics,
+		data.OwnedCosmetics,
+		data.CosmeticInventory,
+		data.ClassItems,
+		data.OwnedClassItems,
+		data.ClassItemInventory,
+		data.OwnedEquipment,
+	}
+	for _, bag in ipairs(bags) do
+		if type(bag) == 'table' then
+			if (grant ~= '' and bag[grant]) or (id ~= '' and bag[id]) then
+				return true
+			end
+			for _, v in pairs(bag) do
+				if v == grant or v == id then
+					return true
+				end
+				if type(v) == 'table' then
+					local name = tostring(v.Id or v.Name or v.ItemName or v.GrantId or '')
+					if name == id or name == grant then
+						return true
+					end
+				end
+			end
+		end
+	end
+	return false
+end
+
+rt.mysteryBuyRemote = function()
+	if rt.mmBuyRF and rt.mmBuyRF.Parent then
+		return rt.mmBuyRF
+	end
+	if rt.mmRF and rt.mmRF.Parent then
+		local buy = rt.mmRF.Parent:FindFirstChild('BuyItem')
+		if buy and buy:IsA('RemoteFunction') then
+			rt.mmBuyRF = buy
+			return buy
+		end
+	end
+	local rf = RunLoops.knitRF and RunLoops.knitRF('MysteryMerchantService', 'BuyItem')
+	if rf then
+		rt.mmBuyRF = rf
+	end
+	return rf
+end
+
+rt.mysteryFailCodes = {
+	NO_STARS = true,
+	LIMIT_REACHED = true,
+	ALREADY_OWNED = true,
+	CLOSED = true,
+	STALE_STOCK = true,
+	GRANT_FAILED = true,
+	TOO_FAST = true,
+	ITEM_NOT_FOUND = true,
+	NO_CASH = true,
+	INVENTORY_FULL = true,
+}
+
+rt.mysteryItemLive = function(itemId)
+	itemId = tostring(itemId or '')
+	rt.mmLiveAt = 0
+	for _, row in ipairs(rt.mysteryMerchantStock()) do
+		if type(row) == 'table' and tostring(row.Id) == itemId then
+			return row
+		end
+	end
+	return nil
+end
+
+rt.decodeMysteryBuy = function(res)
+	if res == true then
+		return true
+	end
+	if res == false or res == nil then
+		return false, 'rejected'
+	end
+	if type(res) == 'string' then
+		local code = res:upper()
+		if rt.mysteryFailCodes[res] or rt.mysteryFailCodes[code] then
+			return false, res
+		end
+		if code:find('FAIL', 1, true) or code:find('STALE', 1, true) or code:find('LIMIT', 1, true) then
+			return false, res
+		end
+		if code == 'OK' or code == 'SUCCESS' or code:find('PURCHASE', 1, true) then
+			return true
+		end
+		return false, res
+	end
+	if type(res) == 'table' then
+		local code = res.Error or res.Code or res.Status or res.Message
+		if type(code) == 'string' and (rt.mysteryFailCodes[code] or rt.mysteryFailCodes[code:upper()]) then
+			return false, code
+		end
+		if res.Success == false or res.ok == false or res.Ok == false then
+			return false, code or 'rejected'
+		end
+		if res.Success == true or res.ok == true or res.Ok == true then
+			return true
+		end
+	end
+	return false, 'unknown'
+end
+
+rt.clickMysteryShopBuy = function(itemId)
+	itemId = tostring(itemId or '')
+	pcall(function()
+		if Gear and Gear.openMysteryShop then
+			Gear.openMysteryShop(true)
+		end
+	end)
+	local M
+	pcall(function()
+		local ps = LocalPlayer:FindFirstChild('PlayerScripts')
+		local mod = ps and ps:FindFirstChild('Client')
+		mod = mod and mod:FindFirstChild('UI')
+		mod = mod and mod:FindFirstChild('ItemShop')
+		if mod then
+			M = require(mod)
+		end
+	end)
+	if type(M) ~= 'table' then
+		return false, 'no ItemShop'
+	end
+	if type(M.SetMode) == 'function' then
+		pcall(function()
+			M.SetMode('MysteryMerchant')
+		end)
+	end
+	local row = type(M.Rows) == 'table' and M.Rows[itemId]
+	if typeof(row) == 'Instance' then
+		local btn = row:FindFirstChild('Selection_Button', true)
+		if btn then
+			clickGuiButton(btn)
+			task.wait(0.04)
+		end
+	end
+	if type(M.OnBuyClicked) == 'function' then
+		pcall(function()
+			M.OnBuyClicked()
+		end)
+		return true
+	end
+	local frame = LocalPlayer.PlayerGui:FindFirstChild('Main')
+	frame = frame and frame:FindFirstChild('Frames')
+	frame = frame and frame:FindFirstChild('ItemShop')
+	local buy = frame and frame:FindFirstChild('Buy')
+	if buy then
+		clickGuiButton(buy)
+		return true
+	end
+	return false, 'no buy button'
+end
+
+rt.buyMysteryItem = function(itemId, rotation)
+	itemId = tostring(itemId or '')
+	if itemId == '' then
+		return false, 'no id'
+	end
+	local function purchased()
+		local row = rt.mysteryItemLive(itemId)
+		return tonumber(row and row.Purchased) or 0
+	end
+	local before = purchased()
+	local live = rt.mmLive
+	if type(live) == 'table' and live.Rotation ~= nil then
+		rotation = live.Rotation
+	end
+	local lastErr
+	pcall(function()
+		local Knit = require(game:GetService('ReplicatedStorage').Packages.Knit)
+		local svc = Knit.GetService('MysteryMerchantService')
+		if type(svc) ~= 'table' or type(svc.BuyItem) ~= 'function' then
+			return
+		end
+		local p = svc.BuyItem(itemId, rotation)
+		if type(p) == 'table' and type(p.await) == 'function' then
+			local ok, res = pcall(function()
+				return p:await()
+			end)
+			if ok then
+				local good, err = rt.decodeMysteryBuy(res)
+				if not good then
+					lastErr = err
+				end
+			else
+				lastErr = res
+			end
+			return
+		end
+		if type(p) == 'table' and type(p.andThen) == 'function' then
+			local done, val
+			p:andThen(function(v)
+				done, val = true, v
+			end):catch(function(e)
+				done, val = true, e
+			end)
+			local t0 = os.clock()
+			while not done and os.clock() - t0 < 2 do
+				task.wait(0.03)
+			end
+			local good, err = rt.decodeMysteryBuy(val)
+			if not good then
+				lastErr = err or val
+			end
+		end
+	end)
+	if purchased() > before then
+		return true
+	end
+	local rf = rt.mysteryBuyRemote()
+	if rf then
+		local ok, res = pcall(function()
+			return rf:InvokeServer(itemId, rotation)
+		end)
+		if ok then
+			local good, err = rt.decodeMysteryBuy(res)
+			if not good then
+				lastErr = err
+			end
+		else
+			lastErr = res
+		end
+	end
+	if purchased() > before then
+		return true
+	end
+	local clicked, clickErr = rt.clickMysteryShopBuy(itemId)
+	if not clicked then
+		lastErr = clickErr or lastErr
+	end
+	task.wait(0.12)
+	if purchased() > before then
+		return true
+	end
+	return false, lastErr or 'not granted'
+end
+
+rt.wantedMysteryItems = function()
+	local v = Options.DLMysteryItems and Options.DLMysteryItems.Value
+	local map = {}
+	if type(v) == 'table' then
+		for k, val in pairs(v) do
+			if type(k) == 'string' and val == true then
+				map[k] = true
+			elseif type(val) == 'string' then
+				map[val] = true
+			end
+		end
+	elseif type(v) == 'string' and v ~= '' then
+		map[v] = true
+	end
+	return map
+end
+
+rt.wantedMysteryIds = function()
+	local names = rt.wantedMysteryItems()
+	local _, byName, byId = rt.mysteryMerchantPool()
+	local ids, keys = {}, {}
+	for name in pairs(names) do
+		keys[rt.normMysteryKey(name)] = true
+		local spec = byName[name]
+		if spec and spec.Id then
+			ids[tostring(spec.Id)] = spec
+		end
+	end
+	for name, spec in pairs(byName or {}) do
+		if type(spec) == 'table' and spec.Id then
+			local id = tostring(spec.Id)
+			if keys[rt.normMysteryKey(name)]
+				or keys[rt.normMysteryKey(id)]
+				or keys[rt.normMysteryKey(spec.GrantId)]
+			then
+				ids[id] = spec
+			end
+		end
+	end
+	for id, spec in pairs(byId or {}) do
+		if type(spec) == 'table' then
+			if keys[rt.normMysteryKey(id)] or keys[rt.normMysteryKey(spec.GrantId)] then
+				ids[tostring(id)] = spec
+			end
+		end
+	end
+	return ids
+end
+
+rt.setMysteryBuyLabel = function(text)
+	local lab = rt.mmBuyLabel
+	if lab and lab.SetText then
+		pcall(function()
+			lab:SetText(text)
+		end)
+	end
+end
+
+rt.mysteryAutoBuyTick = function()
+	if not on('DLMysteryAutoBuy') then
+		rt.setMysteryBuyLabel('Auto-buy: off')
+		return 4
+	end
+	local wantIds = rt.wantedMysteryIds()
+	if not next(wantIds) then
+		rt.setMysteryBuyLabel('Auto-buy: pick items')
+		return 4
+	end
+	local live = rt.mysteryShopLive()
+	local win = live
+	if type(win) ~= 'table' or win.Active ~= true then
+		win = rt.mysteryMerchantWindow()
+	end
+	if type(win) ~= 'table' or win.Active ~= true then
+		local untilArr = 0
+		if type(win) == 'table' then
+			untilArr = (tonumber(win.NextArrival) or 0) - rt.mysteryMerchantNow()
+			if untilArr < 0 then
+				untilArr = 0
+			end
+		end
+		rt.setMysteryBuyLabel(('Auto-buy: in %s'):format(rt.fmtClock(untilArr)))
+		return 6
+	end
+	local rotation = win.Rotation
+	if rt.mmBuyRot ~= rotation then
+		rt.mmBuyRot = rotation
+		rt.mmBought = {}
+		rt.mmBuyFail = {}
+	end
+	rt.mmBought = rt.mmBought or {}
+	rt.mmBuyFail = rt.mmBuyFail or {}
+	local stock = rt.mysteryMerchantStock()
+	local data = rt.playerDataTable()
+	local stars = tonumber(data and data.Stars) or 0
+	local boughtAny = 0
+	local watching = 0
+	for _, row in ipairs(stock) do
+		if type(row) == 'table' and row.Id then
+			local id = tostring(row.Id)
+			local spec = wantIds[id]
+			if spec then
+				watching += 1
+				local limit = tonumber(row.PurchaseLimit or spec.PurchaseLimit) or 1
+				local cost = tonumber(row.Cost or spec.Cost) or 0
+				local have = tonumber(row.Purchased)
+				if type(have) ~= 'number' then
+					have = rt.mysteryPurchasedCount(id, rotation)
+				end
+				local owned = row.Owned == true or rt.ownsMysteryGrant(spec)
+				if owned or have >= limit then
+					-- already owned or at this visit's cap
+				elseif cost > 0 and stars < cost then
+					rt.setMysteryBuyLabel(('Auto-buy: need %d★ for %s'):format(cost, rt.mysteryItemName(spec)))
+				elseif rt.mmBuyFail[id] and os.clock() - rt.mmBuyFail[id] < 1.2 then
+					-- brief retry gap
+				else
+					local got = 0
+					while have < limit do
+						if cost > 0 and stars < cost then
+							break
+						end
+						local ok, err = rt.buyMysteryItem(id, rotation)
+						if not ok then
+							rt.mmBuyFail[id] = os.clock()
+							if got == 0 then
+								Library:Notify(('Mystery buy failed: %s · %s'):format(
+									rt.mysteryItemName(spec),
+									tostring(err or 'rejected')
+								))
+							end
+							break
+						end
+						got += 1
+						have += 1
+						rt.mmBought[id] = have
+						if cost > 0 then
+							stars -= cost
+						end
+						task.wait(0.12)
+					end
+					if got > 0 then
+						boughtAny += got
+						rt.mmLiveAt = 0
+						Library:Notify(('Mystery buy: %s ×%d'):format(rt.mysteryItemName(spec), got))
+					end
+				end
+			end
+		end
+	end
+	local left = (tonumber(win.LeavesAt) or 0) - rt.mysteryMerchantNow()
+	if left < 0 then
+		left = 0
+	end
+	if boughtAny > 0 then
+		rt.setMysteryBuyLabel(('Auto-buy: HERE %s · bought %d'):format(rt.fmtClock(left), boughtAny))
+	elseif watching > 0 then
+		rt.setMysteryBuyLabel(('Auto-buy: HERE %s · %d in stock'):format(rt.fmtClock(left), watching))
+	else
+		rt.setMysteryBuyLabel(('Auto-buy: HERE %s · none of yours'):format(rt.fmtClock(left)))
+	end
+	return boughtAny > 0 and 0.25 or 0.4
+end
 
 -- "Gameplay Paused" is Roblox's own overlay, not this game's: CoreGui holds an empty
 -- RobloxNetworkPauseNotification ScreenGui and fills it in the moment replication
@@ -22904,6 +24218,11 @@ FarmBox:AddToggle('DLFarmRanged', {
 	Default = true,
 	Tooltip = 'Kill archers / mages / other ranged mobs before melee. Minibosses / bosses still win. Specials are not preferred.',
 })
+FarmBox:AddToggle('DLFarmPriorityShield', {
+	Text = 'Prefer shield mages',
+	Default = true,
+	Tooltip = 'Priority: Dark Acolyte / Orc+Goblin Shaman / Mage Student 2 (WardBarrier). Autofarm-wide — Challenge, Payload, and normal dungeons.',
+})
 FarmBox:AddToggle('DLAutoSpecial', {
 	Text = 'Auto summon special',
 	Default = false,
@@ -23311,6 +24630,14 @@ ReplayBox:AddDropdown('DLChallengeDifficulty', {
 		or { 'Easy', 'Normal', 'Hard', 'Nightmare' },
 	Default = 4,
 	Tooltip = 'Easy / Normal / Hard / Nightmare — RequestSelectDifficulty before pod queue.',
+})
+ReplayBox:AddSlider('DLChallengeStopWave', {
+	Text = 'Challenge stop wave',
+	Default = 300,
+	Min = 0,
+	Max = 500,
+	Rounding = 0,
+	Tooltip = 'Leave Challenge (farm + loop off, return lobby) when the HUD wave reaches this. 0 = never stop.',
 })
 ReplayBox:AddButton('Refresh challenge bosses', function()
 	local names = rt.ChallengeLoop and rt.ChallengeLoop.listBosses() or {}
@@ -23814,6 +25141,55 @@ shopToggle('DLShopRaid', 'Raid shop', 'RaidShop')
 shopToggle('DLShopItem', 'Item shop', 'ItemShop')
 shopToggle('DLShopStars', 'Stars shop', 'Stars_Shop')
 shopToggle('DLShopAppraisal', 'Appraisal shop', 'Appraisal')
+ShopsBox:AddButton('Mystery shop', function()
+	task.spawn(function()
+		Gear.toggleMysteryShop(false)
+	end)
+end)
+ShopsBox:AddLabel('Mystery shop = Item shop Stars tab (HERE on HUD when merchant is up).')
+
+rt.mmBox = ShopsTab:AddRightGroupbox('Mystery merchant')
+rt.mmBox:AddLabel('When the merchant is HERE, buy the items you pick from his pool.')
+rt.mmBox:AddToggle('DLMysteryAutoBuy', {
+	Text = 'Auto-buy selected items',
+	Default = false,
+	Tooltip = 'Buys each picked item from the live Mystery Merchant stock, up to that item\'s per-visit limit, while you have Stars.',
+}):OnChanged(function(v)
+	if v then
+		Library:Notify('Mystery auto-buy on')
+	else
+		Library:Notify('Mystery auto-buy off')
+	end
+	if rt.setMysteryBuyLabel then
+		rt.setMysteryBuyLabel(v and 'Auto-buy: on' or 'Auto-buy: off')
+	end
+end)
+do
+	local pool = (rt.mysteryMerchantPool and select(1, rt.mysteryMerchantPool())) or {}
+	rt.mmItemDrop = rt.mmBox:AddDropdown('DLMysteryItems', {
+		Text = 'Buy if in stock',
+		Values = (#pool > 0 and pool) or { 'Aspect Gem' },
+		Multi = true,
+		AllowNull = true,
+		Tooltip = 'His full catalog. Only items in this visit\'s 6-slot stock are purchased.',
+	})
+end
+rt.mmBuyLabel = rt.mmBox:AddLabel('Auto-buy: off')
+rt.mmBox:AddButton('Refresh pool', function()
+	rt.mmPoolNames, rt.mmPoolByName, rt.mmPoolById = nil, nil, nil
+	local names = select(1, rt.mysteryMerchantPool())
+	if rt.mmItemDrop and rt.mmItemDrop.SetValues then
+		rt.mmItemDrop:SetValues(names)
+	end
+	Library:Notify(('Mystery pool: %d items'):format(#names))
+end)
+rt.mmBox:AddButton('Buy now', function()
+	task.spawn(function()
+		rt.mmLiveAt = 0
+		rt.mmBuyFail = {}
+		pcall(rt.mysteryAutoBuyTick)
+	end)
+end)
 ShopsBox:AddToggle('DLShopAll', {
 	Text = 'All shops',
 	Default = false,
@@ -23855,7 +25231,7 @@ end)
 GearBox:AddToggle('DLInvPin', {
 	Text = 'Keep inventory open in dungeon',
 	Default = false,
-	Tooltip = 'Re-opens the real Inventory window (item grid) and hides the dungeon loot overlay so you can see what you own mid-run.',
+	Tooltip = 'Keeps the real Inventory window open mid-run (you can still switch Stat Upgrade / Loadouts / etc.). Hides the dungeon loot overlay.',
 }):OnChanged(function(v)
 	rt.invOpen = v
 	if v then
@@ -24513,5 +25889,20 @@ pcall(rt.bindCharHp, character())
 pcall(scanEsp)
 pcall(refreshHud)
 pcall(captureCollisionBaseline)
+task.spawn(function()
+	while currentInstance() do
+		local waitSec = 4
+		if on('DLMysteryAutoBuy') and type(rt.mysteryAutoBuyTick) == 'function' then
+			local ok, n = pcall(rt.mysteryAutoBuyTick)
+			if ok and type(n) == 'number' then
+				waitSec = n
+			else
+				waitSec = 0.5
+			end
+		end
+		task.wait(waitSec)
+	end
+end)
+
 Library:Notify('Dungeon Lootr ' .. DL_BUILD .. ' — Home toggles menu')
 print('[DL] helper loaded —', DL_BUILD)

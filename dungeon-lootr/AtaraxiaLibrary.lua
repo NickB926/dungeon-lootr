@@ -1344,7 +1344,7 @@ local function addButton(box, text, callback)
 	b.BackgroundColor3 = C.bg3
 	b.Text = tostring(text or 'Button')
 	b.TextColor3 = C.text
-	b.Font = Enum.Font.GothamMedium
+	b.Font = Enum.Font.SourceSans
 	b.TextSize = 12
 	b.AutoButtonColor = false
 	b.BorderSizePixel = 0
@@ -1460,7 +1460,7 @@ local function addInput(box, idx, opts)
 	boxIn.PlaceholderText = opts.Placeholder or ''
 	boxIn.PlaceholderColor3 = C.muted
 	boxIn.Text = tostring(opts.Default or '')
-	boxIn.Font = Enum.Font.GothamMedium
+	boxIn.Font = Enum.Font.SourceSans
 	boxIn.TextSize = 12
 	boxIn.ClearTextOnFocus = opts.ClearTextOnFocus == true
 	boxIn.TextXAlignment = Enum.TextXAlignment.Left
@@ -2026,7 +2026,7 @@ local function addLabel(box, text)
 		kp.BackgroundColor3 = C.bg3
 		kp.Text = key
 		kp.TextColor3 = C.text
-		kp.Font = Enum.Font.GothamBold
+		kp.Font = Enum.Font.SourceSansBold
 		kp.TextSize = 11
 		kp.AutoButtonColor = false
 		kp.BorderSizePixel = 0
@@ -2997,6 +2997,11 @@ function Library:CreateWindow(info)
 	local Window = {}
 	local tabOrder = 0
 	function Window:AddTab(name, _icon)
+		-- Same name = same tab. PlayerTools still calls AddTab('Settings') after
+		-- the library default Settings tab; a second rail button is not a new page.
+		if type(name) == 'string' and Library.Tabs[name] then
+			return Library.Tabs[name]
+		end
 		tabOrder += 1
 		local btn = Instance.new('TextButton')
 		btn.Name = name
