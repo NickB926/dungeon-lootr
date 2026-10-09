@@ -142,7 +142,7 @@ Library.ToggleKeybind = { Value = 'Home' }
 Library.Animations = Library.Animations or {}
 Library.Animations.TabSwitch = false
 
-local DL_BUILD = '1.0.103'
+local DL_BUILD = '1.0.104'
 getgenv().DLBuild = DL_BUILD
 -- Do NOT wipe DLShrineSkipKeys on every reload — that re-warps spent altars.
 
@@ -777,28 +777,12 @@ rt.mysteryMerchantWindow = function()
 end
 
 rt.mysteryShopLive = function()
-	local now = os.clock()
-	if type(rt.mmLive) == 'table' and now - (rt.mmLiveAt or 0) < 0.3 then
-		return rt.mmLive
+	-- GetShopInfo is ~1s on this game. Never InvokeServer on the farm/buy
+	-- thread — reuse the HUD's async cache (10s) and local GetClientWindow.
+	if type(rt.mmInfo) ~= 'table' or os.clock() - (rt.mmAt or 0) > 12 then
+		rt.refreshMysteryMerchant(false)
 	end
-	local rf = rt.mmRF
-	if not (rf and rf.Parent) then
-		rt.refreshMysteryMerchant(true)
-		rf = rt.mmRF
-	end
-	if rf and rf.Parent then
-		local ok, info = pcall(function()
-			return rf:InvokeServer()
-		end)
-		if ok and type(info) == 'table' then
-			rt.mmLive = info
-			rt.mmLiveAt = os.clock()
-			rt.mmInfo = info
-			rt.mmAt = os.clock()
-			return info
-		end
-	end
-	return rt.mmLive or rt.mysteryMerchantWindow()
+	return rt.mmInfo or rt.mysteryMerchantWindow()
 end
 
 rt.mysteryMerchantStock = function()
@@ -1701,41 +1685,80 @@ rt.applyOcclusion = function(enabled)
 	end)
 end
 
-local VFX_ROOTS = { 'Particles', 'SpellTelegraphs', 'ActiveProjectiles' }
 local function muteVfx()
 	if not on('DLMuteVfx') then
 		return
 	end
-	-- GetDescendants on Particles/SpellTelegraphs during Dark Professor
-	-- airstrikes allocated thousands of instances and spiked frames 100–300ms.
-	if farmBusy then
-		return
-	end
 	local now = os.clock()
-	if now - rt.muteVfx < 1.4 then
+	if now - (rt.muteVfx or 0) < 1.6 then
 		return
 	end
 	rt.muteVfx = now
-	local function muteKids(folder, depth)
-		if not folder or depth > 3 then
+	rt.vfxCache = rt.vfxCache or {}
+	local function muteInst(d)
+		if not d then
 			return
 		end
-		for _, d in ipairs(folder:GetChildren()) do
-			pcall(function()
-				if d:IsA('ParticleEmitter') or d:IsA('Trail') or d:IsA('Beam') or d:IsA('Fire') or d:IsA('Smoke') then
-					if d.Enabled then
-						d.Enabled = false
-					end
+		local ok, isFx = pcall(function()
+			return d:IsA('ParticleEmitter') or d:IsA('Trail') or d:IsA('Beam') or d:IsA('Fire') or d:IsA('Smoke')
+		end)
+		if not ok or not isFx then
+			return
+		end
+		rt.vfxCache[#rt.vfxCache + 1] = d
+		pcall(function()
+			if d.Enabled then
+				d.Enabled = false
+			end
+		end)
+	end
+	local function hookRoot(root)
+		if not root then
+			return
+		end
+		pcall(function()
+			for _, d in ipairs(root:GetDescendants()) do
+				muteInst(d)
+			end
+		end)
+		pcall(function()
+			root.DescendantAdded:Connect(function(d)
+				if on('DLMuteVfx') then
+					muteInst(d)
 				end
 			end)
-			if depth < 3 and (d:IsA('Folder') or d:IsA('Model') or d:IsA('BasePart')) then
-				muteKids(d, depth + 1)
+		end)
+	end
+	if not rt.vfxHooked then
+		rt.vfxHooked = true
+		for _, name in ipairs({ 'Particles', 'SpellTelegraphs', 'ActiveProjectiles' }) do
+			hookRoot(workspace:FindFirstChild(name))
+		end
+		for _, ch in ipairs(workspace:GetChildren()) do
+			if type(ch.Name) == 'string' and ch.Name:sub(1, 10) == 'Generated_' then
+				hookRoot(ch)
 			end
 		end
+		pcall(function()
+			workspace.ChildAdded:Connect(function(ch)
+				if type(ch.Name) == 'string' and ch.Name:sub(1, 10) == 'Generated_' then
+					hookRoot(ch)
+				end
+			end)
+		end)
 	end
-	for _, name in ipairs(VFX_ROOTS) do
-		muteKids(workspace:FindFirstChild(name), 1)
+	local live = {}
+	for _, d in ipairs(rt.vfxCache) do
+		if d and d.Parent then
+			live[#live + 1] = d
+			pcall(function()
+				if d.Enabled then
+					d.Enabled = false
+				end
+			end)
+		end
 	end
+	rt.vfxCache = live
 end
 
 local function wantedWalk()
@@ -20626,6 +20649,42 @@ rt.PayloadLoop = (function()
 		end
 	end
 
+	-- Feet on the lobby square. WarpIn is often a tall trigger; center+3 left
+	-- the rig hovering over the pad. firetouchinterest still owns occupancy.
+	local function padStandCFrame(root, pod, anchor)
+		local floor, floorTop = nil, math.huge
+		local function consider(p)
+			if not p or not p:IsA('BasePart') then
+				return
+			end
+			-- Wide squat parts are the visible square. Skip tall air volumes.
+			if p.Size.X < 3 or p.Size.Z < 3 or p.Size.Y > 8 then
+				return
+			end
+			local top = p.Position.Y + p.Size.Y * 0.5
+			if top < floorTop then
+				floor, floorTop = p, top
+			end
+		end
+		if pod:IsA('BasePart') then
+			consider(pod)
+		end
+		for _, p in ipairs(pod:GetDescendants()) do
+			consider(p)
+		end
+		if not floor then
+			floor, floorTop = anchor, anchor.Position.Y + anchor.Size.Y * 0.5
+		end
+		local char = root.Parent
+		local hum = char and char:FindFirstChildOfClass('Humanoid')
+		local hh = hum and hum.HipHeight
+		if type(hh) ~= 'number' or hh < 0.5 then
+			hh = type(rt._savedHip) == 'number' and rt._savedHip or 2
+		end
+		local hip = math.max(2.2, hh + root.Size.Y * 0.5)
+		return CFrame.new(anchor.Position.X, floorTop + hip, anchor.Position.Z)
+	end
+
 	local function standOnPayloadPod()
 		local lobby, pod = findPayloadPod()
 		if not pod then
@@ -20643,6 +20702,9 @@ rt.PayloadLoop = (function()
 		if not root then
 			return false, nil, nil
 		end
+		-- Farm look-up leaves HipHeight 0 + Physics, which floats the lobby sit.
+		rt._pitchHum = nil
+		pcall(rt.setFarmPitchHum, false)
 		-- Live probe: standing 1.6 studs on the pad still failed select until a
 		-- fresh CFrame onto WarpIn + firetouchinterest. Always re-seat.
 		-- Noclip / CanCollide=false also blocks server pad occupancy — and farm
@@ -20657,6 +20719,7 @@ rt.PayloadLoop = (function()
 				end
 			end
 		end)
+		local seat = padStandCFrame(root, pod, anchor)
 		local access = lobby and lobby:FindFirstChild('AccessZone')
 		if access and access:IsA('BasePart') and (root.Position - anchor.Position).Magnitude > 80 then
 			pcall(function()
@@ -20672,14 +20735,14 @@ rt.PayloadLoop = (function()
 		pcall(function()
 			root.AssemblyLinearVelocity = Vector3.zero
 			root.AssemblyAngularVelocity = Vector3.zero
-			root.CFrame = CFrame.new(anchor.Position + Vector3.new(0, 3, 0))
+			root.CFrame = seat
 		end)
 		pulsePodTouch(root, pod)
 		task.wait(0.08)
 		-- Re-assert seat — farm / physics can nudge HRP off in one frame.
 		pcall(function()
 			root.AssemblyLinearVelocity = Vector3.zero
-			root.CFrame = CFrame.new(anchor.Position + Vector3.new(0, 3, 0))
+			root.CFrame = padStandCFrame(root, pod, anchor)
 		end)
 		holdPodTouch(root, pod, true)
 		return true, root, pod
@@ -23439,10 +23502,11 @@ rt.mysteryFailCodes = {
 
 rt.mysteryItemLive = function(itemId)
 	itemId = tostring(itemId or '')
-	rt.mmLiveAt = 0
-	for _, row in ipairs(rt.mysteryMerchantStock()) do
-		if type(row) == 'table' and tostring(row.Id) == itemId then
-			return row
+	if type(rt.mmInfo) == 'table' and type(rt.mmInfo.Items) == 'table' then
+		for _, row in ipairs(rt.mmInfo.Items) do
+			if type(row) == 'table' and tostring(row.Id) == itemId then
+				return row
+			end
 		end
 	end
 	return nil
@@ -23485,6 +23549,9 @@ end
 
 rt.clickMysteryShopBuy = function(itemId)
 	itemId = tostring(itemId or '')
+	if farmBusy or LocalPlayer:GetAttribute('InDungeon') == true then
+		return false, 'no ui in dungeon'
+	end
 	pcall(function()
 		if Gear and Gear.openMysteryShop then
 			Gear.openMysteryShop(true)
@@ -23540,10 +23607,18 @@ rt.buyMysteryItem = function(itemId, rotation)
 	end
 	local function purchased()
 		local row = rt.mysteryItemLive(itemId)
-		return tonumber(row and row.Purchased) or 0
+		if row and type(row.Purchased) == 'number' then
+			return row.Purchased
+		end
+		return rt.mysteryPurchasedCount(itemId, rotation)
+	end
+	local function starsNow()
+		local data = rt.playerDataTable()
+		return tonumber(data and data.Stars) or 0
 	end
 	local before = purchased()
-	local live = rt.mmLive
+	local stars0 = starsNow()
+	local live = rt.mmInfo
 	if type(live) == 'table' and live.Rotation ~= nil then
 		rotation = live.Rotation
 	end
@@ -23586,7 +23661,7 @@ rt.buyMysteryItem = function(itemId, rotation)
 			end
 		end
 	end)
-	if purchased() > before then
+	if purchased() > before or starsNow() < stars0 then
 		return true
 	end
 	local rf = rt.mysteryBuyRemote()
@@ -23603,7 +23678,7 @@ rt.buyMysteryItem = function(itemId, rotation)
 			lastErr = res
 		end
 	end
-	if purchased() > before then
+	if purchased() > before or starsNow() < stars0 then
 		return true
 	end
 	local clicked, clickErr = rt.clickMysteryShopBuy(itemId)
@@ -23611,7 +23686,7 @@ rt.buyMysteryItem = function(itemId, rotation)
 		lastErr = clickErr or lastErr
 	end
 	task.wait(0.12)
-	if purchased() > before then
+	if purchased() > before or starsNow() < stars0 then
 		return true
 	end
 	return false, lastErr or 'not granted'
@@ -24902,7 +24977,10 @@ WorldBox:AddToggle('DLInvisicam', {
 	pcall(rt.applyOcclusion, v == true)
 	Library:Notify(v and 'Invisicam on' or 'Invisicam off')
 end)
-WorldBox:AddToggle('DLMuteVfx', { Text = 'Mute dungeon VFX' })
+WorldBox:AddToggle('DLMuteVfx', {
+	Text = 'Mute dungeon VFX',
+	Tooltip = 'Kills ParticleEmitters / Beams / Trails in the generated map (City of Mages has ~300+). Works mid-farm.',
+})
 WorldBox:AddLabel('Mutes Particles / telegraphs / projectiles. Does not fire remotes.')
 
 local SessionBox = WorldTab:AddRightGroupbox('Session')

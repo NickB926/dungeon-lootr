@@ -132,8 +132,10 @@ local Library = {
 	Toggles = {},
 	Tabs = {},
 	ActiveTab = nil,
-	MinSize = Vector2.new(880, 560),
-	OriginalMinSize = Vector2.new(880, 560),
+	-- Default open size vs resize floor (resize may go smaller than default).
+	DefaultSize = Vector2.new(880, 560),
+	MinSize = Vector2.new(560, 360),
+	OriginalMinSize = Vector2.new(560, 360),
 	DPIScale = 1,
 	Toggled = true,
 	Open = true,
@@ -1344,7 +1346,7 @@ local function addButton(box, text, callback)
 	b.BackgroundColor3 = C.bg3
 	b.Text = tostring(text or 'Button')
 	b.TextColor3 = C.text
-	b.Font = Enum.Font.SourceSans
+	b.Font = Enum.Font.GothamMedium
 	b.TextSize = 12
 	b.AutoButtonColor = false
 	b.BorderSizePixel = 0
@@ -1460,7 +1462,7 @@ local function addInput(box, idx, opts)
 	boxIn.PlaceholderText = opts.Placeholder or ''
 	boxIn.PlaceholderColor3 = C.muted
 	boxIn.Text = tostring(opts.Default or '')
-	boxIn.Font = Enum.Font.SourceSans
+	boxIn.Font = Enum.Font.GothamMedium
 	boxIn.TextSize = 12
 	boxIn.ClearTextOnFocus = opts.ClearTextOnFocus == true
 	boxIn.TextXAlignment = Enum.TextXAlignment.Left
@@ -2026,7 +2028,7 @@ local function addLabel(box, text)
 		kp.BackgroundColor3 = C.bg3
 		kp.Text = key
 		kp.TextColor3 = C.text
-		kp.Font = Enum.Font.SourceSansBold
+		kp.Font = Enum.Font.GothamBold
 		kp.TextSize = 11
 		kp.AutoButtonColor = false
 		kp.BorderSizePixel = 0
@@ -2739,11 +2741,18 @@ function Library:CreateWindow(info)
 	if type(info.Folder) == 'string' and info.Folder ~= '' then
 		self:SetFolder(info.Folder)
 	end
-	-- Floor size: scale-sized columns inside a ScrollingFrame collapse to ~0px otherwise.
-	local width = math.max(880, (info.Size and info.Size.X.Offset) or 880)
-	local height = math.max(560, (info.Size and info.Size.Y.Offset) or 560)
-	self.MinSize = Vector2.new(880, 560)
+	-- Open at DefaultSize; MinSize is the resize floor (smaller than default so the grip can shrink).
+	local defW = (self.DefaultSize and self.DefaultSize.X) or 880
+	local defH = (self.DefaultSize and self.DefaultSize.Y) or 560
+	local minW, minH = 560, 360
+	if typeof(info.MinSize) == 'Vector2' then
+		minW, minH = info.MinSize.X, info.MinSize.Y
+	end
+	local width = math.max(minW, (info.Size and info.Size.X.Offset) or defW)
+	local height = math.max(minH, (info.Size and info.Size.Y.Offset) or defH)
+	self.MinSize = Vector2.new(minW, minH)
 	self.OriginalMinSize = self.MinSize
+	self.DefaultSize = Vector2.new(defW, defH)
 
 	if self.ScreenGui then
 		pcall(function()
@@ -2962,25 +2971,96 @@ function Library:CreateWindow(info)
 	pages.Parent = body
 
 	local dragging, dragStart, startPos = false, nil, nil
+	local resizing, resizeStart, startSize = false, nil, nil
+	self.MainFrame = main
+	-- Resize floor (below default open size). Keep OriginalMinSize in sync.
+	self.MinSize = self.MinSize or Vector2.new(560, 360)
+	self.OriginalMinSize = self.MinSize
+
 	header.InputBegan:Connect(function(input)
 		if input.UserInputType == Enum.UserInputType.MouseButton1 then
 			if input.Position.X >= header.AbsolutePosition.X + header.AbsoluteSize.X - 90 then
 				return
 			end
 			dragging = true
+			resizing = false
 			dragStart = input.Position
 			startPos = main.Position
 		end
 	end)
+
+	-- Bottom-right grip: drag to resize the window.
+	local grip = Instance.new('TextButton')
+	grip.Name = 'ResizeGrip'
+	grip.Size = UDim2.fromOffset(22, 22)
+	grip.Position = UDim2.new(1, -24, 1, -24)
+	grip.BackgroundColor3 = C.bg3
+	grip.BackgroundTransparency = 0.15
+	grip.BorderSizePixel = 0
+	grip.Text = ''
+	grip.AutoButtonColor = false
+	grip.ZIndex = 80
+	grip.Parent = main
+	corner(grip, 4)
+	hairline(grip, 4)
+	do
+		local tip = Instance.new('TextLabel')
+		tip.BackgroundTransparency = 1
+		tip.Size = UDim2.fromScale(1, 1)
+		tip.Text = '⋰'
+		tip.TextColor3 = C.muted
+		tip.Font = Enum.Font.SourceSansBold
+		tip.TextSize = 16
+		tip.ZIndex = 81
+		tip.Parent = grip
+	end
+	grip.MouseEnter:Connect(function()
+		grip.BackgroundTransparency = 0
+		grip.BackgroundColor3 = C.bg2 or C.bg3
+	end)
+	grip.MouseLeave:Connect(function()
+		if not resizing then
+			grip.BackgroundTransparency = 0.15
+			grip.BackgroundColor3 = C.bg3
+		end
+	end)
+	grip.InputBegan:Connect(function(input)
+		if input.UserInputType ~= Enum.UserInputType.MouseButton1 then
+			return
+		end
+		resizing = true
+		dragging = false
+		resizeStart = input.Position
+		startSize = main.AbsoluteSize
+	end)
+
 	track(UserInputService.InputChanged:Connect(function(input)
-		if dragging and input.UserInputType == Enum.UserInputType.MouseMovement then
+		if input.UserInputType ~= Enum.UserInputType.MouseMovement then
+			return
+		end
+		if dragging then
 			local d = input.Position - dragStart
 			main.Position = UDim2.new(startPos.X.Scale, startPos.X.Offset + d.X, startPos.Y.Scale, startPos.Y.Offset + d.Y)
+		elseif resizing and resizeStart and startSize then
+			local d = input.Position - resizeStart
+			local min = Library.MinSize or Vector2.new(560, 360)
+			local cam = workspace.CurrentCamera
+			local view = cam and cam.ViewportSize or Vector2.new(1920, 1080)
+			local newW = math.clamp(math.floor(startSize.X + d.X + 0.5), min.X, math.max(min.X, math.floor(view.X - 24)))
+			local newH = math.clamp(math.floor(startSize.Y + d.Y + 0.5), min.Y, math.max(min.Y, math.floor(view.Y - 24)))
+			main.Size = UDim2.fromOffset(newW, newH)
+			local tab = Library.ActiveTab
+			if tab and type(tab.RefreshSides) == 'function' then
+				pcall(tab.RefreshSides, tab)
+			end
 		end
 	end))
 	track(UserInputService.InputEnded:Connect(function(input)
 		if input.UserInputType == Enum.UserInputType.MouseButton1 then
 			dragging = false
+			resizing = false
+			grip.BackgroundTransparency = 0.15
+			grip.BackgroundColor3 = C.bg3
 		end
 	end))
 
@@ -2997,8 +3077,7 @@ function Library:CreateWindow(info)
 	local Window = {}
 	local tabOrder = 0
 	function Window:AddTab(name, _icon)
-		-- Same name = same tab. PlayerTools still calls AddTab('Settings') after
-		-- the library default Settings tab; a second rail button is not a new page.
+		-- Same name = same tab. A second AddTab('Settings') must not spawn another rail button.
 		if type(name) == 'string' and Library.Tabs[name] then
 			return Library.Tabs[name]
 		end
