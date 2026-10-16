@@ -796,6 +796,195 @@ function Library:IsInvisicam()
 end
 
 ---------------------------------------------------------------------------
+-- Max camera zoom. Games reset CameraMaxZoomDistance, so this re-applies. Opt out:
+-- CreateWindow{ MaxZoom = false }. Persists in Ataraxia/maxzoom (default 3000).
+---------------------------------------------------------------------------
+local DEFAULT_MAX_ZOOM = 3000
+
+local MaxZoom = (function()
+	local api = {}
+	local FILE = 'Ataraxia/maxzoom'
+
+	local function clearConns()
+		local packs = getgenv().AtaraxiaMaxZoomConns
+		if type(packs) ~= 'table' then
+			getgenv().AtaraxiaMaxZoomConns = {}
+			return
+		end
+		for _, pack in ipairs(packs) do
+			for _, c in ipairs(pack) do
+				pcall(function()
+					c:Disconnect()
+				end)
+			end
+		end
+		getgenv().AtaraxiaMaxZoomConns = {}
+	end
+
+	local function readPrefs()
+		local on = true
+		local target = DEFAULT_MAX_ZOOM
+		if type(isfile) == 'function' and type(readfile) == 'function' then
+			local ok, exists = pcall(isfile, FILE)
+			if ok and exists then
+				local rok, body = pcall(readfile, FILE)
+				if rok and type(body) == 'string' then
+					local trimmed = tostring(body):gsub('%s+', '')
+					if trimmed:lower() == 'false' or trimmed:lower() == 'off' then
+						on = false
+					else
+						local n = tonumber(trimmed)
+						if n and n >= 0.5 then
+							target = n
+						end
+					end
+				end
+			end
+		end
+		return on, target
+	end
+
+	local function writeFile(on, target)
+		if type(writefile) ~= 'function' then
+			return
+		end
+		pcall(function()
+			if type(makefolder) == 'function' and type(isfolder) == 'function' and not isfolder('Ataraxia') then
+				makefolder('Ataraxia')
+			end
+		end)
+		if on then
+			pcall(writefile, FILE, tostring(target or DEFAULT_MAX_ZOOM))
+		else
+			pcall(writefile, FILE, 'false')
+		end
+	end
+
+	local function savedDistance()
+		if getgenv().AtaraxiaSavedMaxZoom == nil then
+			pcall(function()
+				getgenv().AtaraxiaSavedMaxZoom = LocalPlayer.CameraMaxZoomDistance
+			end)
+		end
+		return getgenv().AtaraxiaSavedMaxZoom or 128
+	end
+
+	local function targetDistance()
+		local t = getgenv().AtaraxiaMaxZoomTarget
+		if type(t) == 'number' and t >= 0.5 then
+			return t
+		end
+		return DEFAULT_MAX_ZOOM
+	end
+
+	local function apply(on)
+		pcall(function()
+			local want = on and targetDistance() or savedDistance()
+			if LocalPlayer.CameraMaxZoomDistance ~= want then
+				LocalPlayer.CameraMaxZoomDistance = want
+			end
+		end)
+	end
+
+	local function bindWatch()
+		clearConns()
+		if getgenv().AtaraxiaMaxZoomOn ~= true then
+			return
+		end
+		local pack = {}
+		pack[#pack + 1] = LocalPlayer:GetPropertyChangedSignal('CameraMaxZoomDistance'):Connect(function()
+			if getgenv().AtaraxiaMaxZoomOn ~= true then
+				return
+			end
+			apply(true)
+		end)
+		getgenv().AtaraxiaMaxZoomConns = { pack }
+	end
+
+	local function ensureCharAdded()
+		if getgenv().AtaraxiaMaxZoomCharAddedConn then
+			return
+		end
+		getgenv().AtaraxiaMaxZoomCharAddedConn = LocalPlayer.CharacterAdded:Connect(function()
+			if getgenv().AtaraxiaMaxZoomOn == true then
+				apply(true)
+			end
+		end)
+	end
+
+	function api.set(on, target)
+		local want = on == true
+		if want and type(target) == 'number' and target >= 0.5 then
+			getgenv().AtaraxiaMaxZoomTarget = target
+		elseif want and getgenv().AtaraxiaMaxZoomTarget == nil then
+			getgenv().AtaraxiaMaxZoomTarget = DEFAULT_MAX_ZOOM
+		end
+		local was = getgenv().AtaraxiaMaxZoomOn == true
+		getgenv().AtaraxiaMaxZoomOn = want
+		apply(want)
+		if want then
+			bindWatch()
+			ensureCharAdded()
+		else
+			clearConns()
+		end
+		if was ~= want then
+			writeFile(want, targetDistance())
+		end
+	end
+
+	function api.isOn()
+		return getgenv().AtaraxiaMaxZoomOn == true
+	end
+
+	function api.getTarget()
+		return targetDistance()
+	end
+
+	function api.tick()
+		if getgenv().AtaraxiaMaxZoomOn == true then
+			apply(true)
+		end
+	end
+
+	function api.ensure()
+		local on, target = readPrefs()
+		getgenv().AtaraxiaMaxZoomTarget = target
+		if on then
+			getgenv().AtaraxiaMaxZoomOn = true
+			apply(true)
+			bindWatch()
+			ensureCharAdded()
+		else
+			getgenv().AtaraxiaMaxZoomOn = false
+		end
+	end
+
+	return api
+end)()
+
+function Library:SetMaxZoom(on, distance)
+	if on == false or on == 'off' then
+		MaxZoom.set(false)
+	elseif type(on) == 'number' then
+		MaxZoom.set(true, on)
+	elseif distance and type(distance) == 'number' then
+		MaxZoom.set(on == true, distance)
+	else
+		MaxZoom.set(on ~= false)
+	end
+	return MaxZoom.isOn()
+end
+
+function Library:IsMaxZoom()
+	return MaxZoom.isOn()
+end
+
+function Library:GetMaxZoomTarget()
+	return MaxZoom.getTarget()
+end
+
+---------------------------------------------------------------------------
 -- Hide Roblox "Gameplay Paused". The engine stall is not switchable from Lua;
 -- this only keeps the CoreGui banner off. Opt out: CreateWindow{ HideGameplayPaused = false }.
 -- Persists in Ataraxia/nopause. Stays armed across Unload like Anti-AFK.
@@ -1196,8 +1385,10 @@ function Library:BuildSettingsTab(Window, info)
 
 	local scriptBox = tab:AddLeftGroupbox('Script')
 	scriptBox:AddLabel('Home hides/shows this window (same as PlayerTools).')
+	tab.ScriptBox = scriptBox
 
 	local profileBox = tab:AddRightGroupbox('Profiles')
+	tab.ProfileBox = profileBox
 
 	-- Script-specific rows (e.g. Auto inject) before shared chrome controls.
 	if type(info.SettingsExtras) == 'function' then
@@ -3207,6 +3398,9 @@ function Library:CreateWindow(info)
 	if info.Invisicam ~= false then
 		pcall(Occlusion.ensure)
 	end
+	if info.MaxZoom ~= false then
+		pcall(MaxZoom.ensure)
+	end
 	if info.HideGameplayPaused ~= false then
 		pcall(NoPause.ensure)
 	end
@@ -3221,6 +3415,7 @@ function Library:CreateWindow(info)
 			pcall(Library.Config.Tick)
 		end
 		pcall(Occlusion.tick)
+		pcall(MaxZoom.tick)
 	end))
 	return Window
 end

@@ -1,5 +1,5 @@
 {
-    "version":  "1.0.104",
+    "version":  "1.0.105",
     "message":  "dedicated Challenge pack combat then chests",
     "files":  [
                   "dungeon-lootr/launch.lua",
